@@ -1,4 +1,4 @@
-   # Time Series Prediction Project
+   # Joint Angle Prediction Project
 
    ## Overview
 
