@@ -12,22 +12,21 @@
    - Visualization of results through heatmaps and plots
 
    ## Directory Structure
-project/
-│
-├── new/
-│ ├── models/
-│ │ ├── base_lstm.py
-│ │ ├── deep_lstm.py
-│ │ ├── tcn.py
-│ │ ├── transformer.py
-│ │ └── unsupervised_transformer.py
-│ ├── utils/
-│ │ ├── data.py
-│ │ └── metrics.py
-│ ├── correlation.py
-│ └── train.py
-│
-└── README.md
+   
+- **new/**: Contains the main project files and subdirectories.
+  - **models/**: Implementation of various machine learning models.
+    - `base_lstm.py`: Base implementation of an LSTM model.
+    - `deep_lstm.py`: Deep LSTM model implementation.
+    - `tcn.py`: Temporal Convolutional Network (TCN) model implementation.
+    - `transformer.py`: Transformer model implementation.
+    - `unsupervised_transformer.py`: Transformer model designed for unsupervised learning.
+  - **utils/**: Utility scripts for data handling and performance metrics.
+    - `data.py`: Functions for data preprocessing and loading.
+    - `metrics.py`: Functions to calculate evaluation metrics.
+  - `correlation.py`: Script for analyzing correlations in the dataset.
+  - `train.py`: Main script to train and evaluate models.
+
+- **README.md**: Documentation for the project.
 
    ## Requirements
 
