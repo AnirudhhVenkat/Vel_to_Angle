@@ -94,6 +94,14 @@ def objective(trial, model_name, base_config, trial_number, total_trials):
             'nhead': trial.suggest_categorical('nhead', [4, 8, 16]),
             'num_layers': trial.suggest_int('num_layers', 2, 6)
         })
+    elif model_name == 'tcn':
+        hp_config.update({
+            'hidden_sizes': [
+                trial.suggest_int(f'hidden_size_{i}', 64, 512, step=64)
+                for i in range(3)
+            ],
+            'kernel_size': trial.suggest_categorical('kernel_size', [3, 5, 7])
+        })
     else:
         hp_config.update({
             'hidden_sizes': [
@@ -113,7 +121,9 @@ def objective(trial, model_name, base_config, trial_number, total_trials):
             'output_size': 18,
             'dropout': hp_config['dropout'],
             **(({'nhead': hp_config['nhead'], 'num_layers': hp_config['num_layers']} 
-                if model_name == 'transformer' else {}))
+                if model_name == 'transformer' else {})),
+            **(({'kernel_size': hp_config['kernel_size']}
+                if model_name == 'tcn' else {}))
         }
     })
     
@@ -123,6 +133,10 @@ def objective(trial, model_name, base_config, trial_number, total_trials):
             final_val_loss = train_unsupervised_transformer(config)
         else:
             final_val_loss = train_model(model_name, config)
+        
+        if final_val_loss is None:
+            raise ValueError("Training returned None")
+        
         return final_val_loss
     except Exception as e:
         print(f"Trial failed: {e}")
@@ -131,35 +145,21 @@ def objective(trial, model_name, base_config, trial_number, total_trials):
 def train_model(model_name, config):
     try:
         start_time = time.time()
-        # Create descriptive name with hyperparameters
         model_desc = get_model_name(model_name, config)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         run_name = f"{model_desc}_{timestamp}"
         
-        # Initialize wandb with new run
         wandb.init(project="joint_angle_prediction", name=run_name, config=config, reinit=True)
         
-        # Create model save directory with clear architecture-based organization
         save_dir = Path('best_models')
         save_dir.mkdir(parents=True, exist_ok=True)
         
         model_save_path = save_dir / f'{model_desc}_best.pth'
         
-        # Load and prepare data with validation
-        try:
-            train_loader, val_loader, test_loader = prepare_data(config)
-            print(f"Data loaded successfully. Training batches: {len(train_loader)}, "
-                  f"Validation batches: {len(val_loader)}, Test batches: {len(test_loader)}")
-        except Exception as e:
-            print(f"Failed to prepare data: {str(e)}")
-            raise
-
-        # Validate batch size
-        if config['batch_size'] > len(train_loader.dataset):
-            raise ValueError(f"Batch size ({config['batch_size']}) larger than dataset "
-                           f"size ({len(train_loader.dataset)})")
-
-        # Initialize model
+        train_loader, val_loader, test_loader = prepare_data(config)
+        if not train_loader or not val_loader or not test_loader:
+            raise ValueError("Data loaders are empty or not initialized properly.")
+        
         model_classes = {
             'base_lstm': base_lstm.LSTMModel,
             'deep_lstm': deep_lstm.DeepLSTM,
@@ -167,56 +167,29 @@ def train_model(model_name, config):
             'tcn': tcn.TCNModel
         }
         
-        # Update transformer model initialization to set norm_first to False
         if model_name == 'transformer':
             config['model_params']['norm_first'] = False
-        
-        # Remove norm_first from config before model initialization
-        if model_name == 'transformer':
             if 'norm_first' in config['model_params']:
                 del config['model_params']['norm_first']
         
-        # Initialize model with validation
-        try:
-            model = model_classes[model_name](**config['model_params'])
-            model = model.to(config['device'])
-            print(f"Model initialized successfully on {config['device']}")
-        except Exception as e:
-            print(f"Failed to initialize model: {str(e)}")
-            raise
+        model = model_classes[model_name](**config['model_params'])
+        model = model.to(config['device'])
         
-        # Use DataParallel for multi-GPU support
         if torch.cuda.device_count() > 1:
-            print(f"Using {torch.cuda.device_count()} GPUs")
             model = torch.nn.DataParallel(model)
         
-        # Initialize loss function and optimizer
-        criterion = nn.MSELoss()  # Replace CustomLoss with simple MSE
+        criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'])
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, 
-            mode='min', 
-            factor=0.5, 
-            patience=5
-        )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
         
-        # Training loop
         initial_epochs = config['initial_epochs']
         patience = config['patience']
         best_loss = float('inf')
         epochs_no_improve = 0
-
-        # Store best model state
         best_model_state = None
         best_epoch = 0
-        
-        # Add gradient clipping
         max_grad_norm = 1.0
         
-        # Initialize validation loss with infinity
-        best_loss = float('inf')
-        
-        # Perform initial validation before training
         model.eval()
         initial_val_loss = 0.0
         with torch.no_grad():
@@ -226,7 +199,6 @@ def train_model(model_name, config):
                 loss = criterion(outputs, targets)
                 initial_val_loss += loss.item()
         initial_val_loss /= len(val_loader)
-        print(f"Initial validation loss: {initial_val_loss}")
         best_loss = initial_val_loss
         
         total_batches = len(train_loader) * config['num_epochs']
@@ -234,15 +206,11 @@ def train_model(model_name, config):
         total_processed_batches = 0
         
         for epoch in range(config['num_epochs']):
-            epoch_start = time.time()
-            # Training phase
             model.train()
             train_loss = 0.0
             num_batches = len(train_loader)
             
-            # Add progress bar for batches
-            pbar = tqdm(enumerate(train_loader), total=num_batches, 
-                       desc=f'Epoch {epoch+1}/{config["num_epochs"]}')
+            pbar = tqdm(enumerate(train_loader), total=num_batches, desc=f'Epoch {epoch+1}/{config["num_epochs"]}')
             
             for batch_idx, (inputs, targets) in pbar:
                 inputs, targets = inputs.to(config['device']), targets.to(config['device'])
@@ -251,20 +219,17 @@ def train_model(model_name, config):
                 loss = criterion(outputs, targets)
                 loss.backward()
                 
-                # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 
                 optimizer.step()
                 train_loss += loss.item()
                 
-                # Update total progress
                 total_processed_batches += 1
                 elapsed_total = time.time() - global_start_time
                 batches_per_second = total_processed_batches / elapsed_total
                 remaining_batches = total_batches - total_processed_batches
                 eta_seconds = remaining_batches / batches_per_second
                 
-                # Update progress bar with both epoch and total progress
                 elapsed = time.time() - epoch_start
                 epoch_progress = (batch_idx + 1) / num_batches
                 eta = elapsed / epoch_progress * (1 - epoch_progress)
@@ -274,16 +239,13 @@ def train_model(model_name, config):
                     'total_eta': str(timedelta(seconds=int(eta_seconds)))
                 })
             
-            # Calculate average training loss
             train_loss /= num_batches
             
-            # Validation phase
             model.eval()
             val_loss = 0.0
             val_metrics = defaultdict(float)
             num_batches = 0
             
-            # Get current learning rate
             current_lr = optimizer.param_groups[0]['lr']
             
             with torch.no_grad():
@@ -293,37 +255,24 @@ def train_model(model_name, config):
                     loss = criterion(outputs, targets)
                     val_loss += loss.item()
                     
-                    # Calculate all metrics for this batch
                     batch_metrics = calculate_metrics(outputs, targets)
                     for k, v in batch_metrics.items():
                         val_metrics[k] += v
                     num_batches += 1
             
-            # Average the metrics
             val_loss /= num_batches
             for k in val_metrics:
                 val_metrics[k] /= num_batches
             
-            # Log all metrics
             metrics_log = {
                 'train_loss': train_loss,
                 'val_loss': val_loss,
                 'learning_rate': current_lr,
-                **{f'val_{k}': v for k, v in val_metrics.items()}  # This logs val_mse, val_rmse, val_mae, val_mape, val_r2, val_dtw
+                **{f'val_{k}': v for k, v in val_metrics.items()}
             }
             wandb.log(metrics_log)
             
-            # Print comprehensive metrics
-            print(f'Epoch {epoch+1}:')
-            print(f'Training Loss: {train_loss:.4f}')
-            print(f'Validation Loss: {val_loss:.4f}')
-            print('Validation Metrics:')
-            for k, v in val_metrics.items():
-                print(f'  {k}: {v:.4f}')
-            print(f'Learning Rate: {current_lr:.6f}')
-            
-            # Use combined metric for early stopping
-            validation_score = val_loss * (1 + (1 - val_metrics['r2']))  # Penalize both high loss and low R²
+            validation_score = val_loss * (1 + (1 - val_metrics['r2']))
             
             if validation_score < best_loss:
                 best_loss = validation_score
@@ -344,10 +293,11 @@ def train_model(model_name, config):
                     print('Early stopping!')
                     break
         
-        # Load best model state for final evaluation
+        if best_model_state is None:
+            raise ValueError("No valid model state was saved during training.")
+        
         model.load_state_dict(best_model_state['model_state_dict'])
         
-        # Test
         model.eval()
         test_loss = 0.0
         all_predictions = []
@@ -364,24 +314,16 @@ def train_model(model_name, config):
         test_loss /= len(test_loader)
         print(f'Test Loss: {test_loss}')
 
-        # Concatenate all predictions and targets
         all_predictions = np.concatenate(all_predictions, axis=0)
         all_targets = np.concatenate(all_targets, axis=0)
         
-        # Now save the model and create plots after training is complete
-        # torch.save(best_model_state, model_save_path)
         print(f"\nSaved best model from epoch {best_epoch+1} for {model_name} (val_loss: {best_loss:.4f})")
         
-        # Create and save plots
         plot_paths = plot_predictions(all_predictions, all_targets, model_name, best_epoch)
         
-        # Save final results
         results_dir = Path(f'C:/Users/bidayelab/vel_to_angle_project/new/results/{model_name}')
         results_dir.mkdir(parents=True, exist_ok=True)
-        # np.save(results_dir / 'predictions.npy', all_predictions)
-        # np.save(results_dir / 'targets.npy', all_targets)
 
-        # Log final metrics to wandb, only include plots if they exist
         final_metrics = {'test_loss': test_loss}
         if plot_paths:
             for i, path in enumerate(plot_paths):
@@ -390,7 +332,7 @@ def train_model(model_name, config):
         
     except Exception as e:
         print(f"Training failed: {str(e)}")
-        raise
+        return float('inf')
 
     return best_loss
 
@@ -466,7 +408,7 @@ def train_unsupervised_transformer(config):
         
     except Exception as e:
         print(f"Error during model training: {e}")
-        return float('inf')
+        return float('inf')  # Return a high loss value on failure
 
 # ...existing code...
 
@@ -495,9 +437,9 @@ if __name__ == "__main__":
     }
 
     # Run optimization for each model
-    model_names = ['base_lstm', 
-                   'deep_lstm', 
-                   'transformer', 
+    model_names = [#'base_lstm', 
+                   #'deep_lstm', 
+                   #'transformer', 
                    'tcn',
                    'unsupervised_transformer']
     total_models = len(model_names)
