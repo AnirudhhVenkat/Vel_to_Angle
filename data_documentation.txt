@@ -1,0 +1,58 @@
+Data Structure Documentation
+==========================
+
+Input Features (15 total)
+------------------------
+1. Original Velocities:
+   - x_vel: X-axis velocity
+   - y_vel: Y-axis velocity
+   - z_vel: Z-axis velocity
+
+2. Moving Averages (strongest predictors):
+   - x_vel_ma5: 5-frame moving average of X velocity
+   - x_vel_ma10: 10-frame moving average of X velocity
+   - x_vel_ma20: 20-frame moving average of X velocity
+   - y_vel_ma5: 5-frame moving average of Y velocity
+   - y_vel_ma10: 10-frame moving average of Y velocity
+   - y_vel_ma20: 20-frame moving average of Y velocity
+   - z_vel_ma5: 5-frame moving average of Z velocity
+   - z_vel_ma10: 10-frame moving average of Z velocity
+   - z_vel_ma20: 20-frame moving average of Z velocity
+
+3. Derived Velocities:
+   - velocity_magnitude: Total velocity magnitude (sqrt(x² + y² + z²))
+   - xy_velocity: Planar velocity in XY plane (sqrt(x² + y²))
+   - xz_velocity: Planar velocity in XZ plane (sqrt(x² + z²))
+
+Output Joint Angles (6 total)
+---------------------------
+1. L2B_rot: Left leg 2B rotation (-0.54 to -0.58 correlation with z-velocity)
+2. R3A_rot: Right leg 3A rotation (0.51 to 0.57 correlation with z-velocity)
+3. R3A_flex: Right leg 3A flexion (0.45 to 0.49 correlation with z-velocity)
+4. R1B_rot: Right leg 1B rotation (-0.42 to -0.44 correlation with x-velocity)
+5. R2B_rot: Right leg 2B rotation (-0.44 to -0.47 correlation with z-velocity)
+6. L3A_rot: Left leg 3A rotation
+
+Data Structure
+-------------
+- Window Size: 200 frames
+- Trial Size: 600 frames
+- Input Shape: (batch_size, 200, 15)
+- Output Shape: (batch_size, 6)
+
+Data Processing
+--------------
+1. Features are calculated from raw velocities
+2. All features are standardized using z-score normalization
+3. Data is split into trials of 600 frames
+4. Windows of 200 frames are created within each trial
+5. Each window predicts the joint angles at its last frame
+6. Data is split into train/validation/test sets with random permutation
+
+Model Training
+-------------
+- Batch sizes: 16, 32, 64, or 128
+- Learning rate range: 1e-4 to 1e-2
+- Early stopping with patience
+- Models save their best state based on validation loss
+- Predictions are plotted for visualization after training 

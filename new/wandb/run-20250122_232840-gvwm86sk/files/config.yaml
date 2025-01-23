@@ -1,0 +1,102 @@
+_wandb:
+    value:
+        cli_version: 0.19.2
+        m: []
+        python_version: 3.9.19
+        t:
+            "1":
+                - 1
+                - 5
+                - 35
+                - 53
+                - 55
+            "2":
+                - 1
+                - 5
+                - 35
+                - 53
+                - 55
+            "3":
+                - 2
+                - 13
+                - 16
+                - 23
+                - 55
+            "4": 3.9.19
+            "5": 0.19.2
+            "8":
+                - 3
+                - 5
+            "12": 0.19.2
+            "13": windows-amd64
+augment:
+    value: false
+batch_size:
+    value: 64
+data_path:
+    value: Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv
+device:
+    value: cuda
+dropout:
+    value: 0.1069288471113738
+finetune_epochs:
+    value: 100
+gradient_accumulation_steps:
+    value: 4
+gradient_clip:
+    value: 1.4577134188907799
+initial_epochs:
+    value: 120
+label_smoothing:
+    value: 0.1
+learning_rate:
+    value: 7.677942007947872e-05
+model_params:
+    value:
+        dropout: 0.1069288471113738
+        hidden_sizes:
+            - 512
+            - 384
+            - 512
+        input_size: 15
+        nhead: 8
+        num_layers: 3
+        output_size: 15
+        pos_encoding: learned
+n_folds:
+    value: 5
+noise_level:
+    value: 0.1
+num_epochs:
+    value: 100
+num_workers:
+    value: 8
+patience:
+    value: 15
+persistent_workers:
+    value: true
+pin_memory:
+    value: true
+prefetch_factor:
+    value: 2
+pretrain_epochs:
+    value: 50
+pretrain_params:
+    value:
+        gradient_clip: 1.4577134188907799
+        label_smoothing: 0.009870721357773327
+        layer_norm_eps: 2.4632473669097744e-06
+        warmup_epochs: 4
+        weight_decay: 3.7819321756802976e-05
+pretrain_path:
+    value: Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv
+split_ratio:
+    value: 0.8
+test_size:
+    value: 7200
+warmup_epochs:
+    value: 4
+weight_decay:
+    value: 0.01
+window_size:
+    value: 200
