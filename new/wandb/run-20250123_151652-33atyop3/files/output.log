@@ -55,3 +55,8 @@ Epoch 17/50
 Loss: 0.0877 (New best)
 Time: 109.9s
 Learning rate: 9.11e-05
+
+Epoch 18/50
+Loss: 0.0867 (New best)
+Time: 111.0s
+Learning rate: 8.86e-05
