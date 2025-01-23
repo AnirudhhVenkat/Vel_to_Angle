@@ -1,0 +1,16 @@
+Run Name: unsupervised_transformer_h512_d0.1069288471113738_head8_l3_20250122_232840
+Hidden Size: 512
+Number of Heads: 8
+Number of Layers: 3
+Dropout: 0.1069288471113738
+Learning Rate: 7.677942007947872e-05
+Batch Size: 64
+
+Training Results:
+Best Pretrain Loss: 0.08484996345119378
+Best Pretrain Epoch: 47
+Best Finetune Loss: 0.31957262182415885
+Best Finetune Epoch: 93
+Test MSE: 0.33023330569267273
+Test MAE: 0.33767402172088623
+Test R2: 0.6870473940326898

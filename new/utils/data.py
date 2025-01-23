@@ -17,289 +17,251 @@ class TimeSeriesDataset(Dataset):
     def __getitem__(self, idx):
         return self.features[idx], self.targets[idx]
 
-def remove_stepcycle_predictions(df, joint_angles, velocity):
-    terms = []
-    if joint_angles:
-        terms.extend(['D_flex', 'ball', '_r', 'cycle', 'tnum', 'fnum', 'flynum', 'SF', 'pos', '_x', '_y', '_z', 'rot', 'abduct'])
-    if velocity:
-        terms.extend(['D_flex', 'ball', '_r', 'cycle', 'genotype', 'SF', 'pos', '_x', '_y', '_z'])
-    
-    for term in terms:
-        cols = [c for c in df.columns if c.endswith(term)]
-        df = df.drop(columns=cols)
-    return df
-
-def filter_frames(df, f_0=400, f_f=1000, f_trl=1400):
-    return df.loc[((df['fnum'] % f_trl) >= f_0) & ((df['fnum'] % f_trl) < f_f)].copy()
-
-def z_scoring(df):
-    for column in df.columns:
-        if column not in ['x_vel', 'y_vel', 'z_vel']:
-            df[column] = stats.zscore(df[column])
-    return df
-
-def create_lagged_features(data, features, lag):
-    df = data.copy()
-    for feature in features:
-        df[f'{feature}_lag_{lag}'] = df[feature].shift(lag)
-        df = df.drop(columns=[f'{feature}'])
-    df.dropna(inplace=True)  
-    return df
-
-def calculate_accelerations(velocities, chunk_size=600, dt=1):
-    num_chunks = velocities.shape[0] // chunk_size
-    accelerations = []
-    for i in range(num_chunks):
-        chunk = velocities[i * chunk_size: (i + 1) * chunk_size]
-        accel_chunk = np.diff(chunk, axis=0) / dt
-        accelerations.append(accel_chunk)
-    return np.vstack(accelerations)
-
-def trim_output_data(output_data, chunk_size=600):
-    num_chunks = output_data.shape[0] // chunk_size
-    trimmed_output = []
-    for i in range(num_chunks):
-        chunk = output_data[i * chunk_size: (i + 1) * chunk_size]
-        trimmed_chunk = chunk[1:]
-        trimmed_output.append(trimmed_chunk)
-    return np.vstack(trimmed_output)
-
-def split_into_trials(data, trial_size=600):
-    """Split data into trials of fixed size, discarding incomplete trials"""
-    num_complete_trials = len(data) // trial_size
-    return [data[i*trial_size:(i+1)*trial_size] for i in range(num_complete_trials)]
+def filter_frames(df):
+    """Filter frames efficiently using numpy operations"""
+    f_0, f_f, f_trl = 400, 1000, 1400
+    mask = ((df['fnum'].values % f_trl) >= f_0) & ((df['fnum'].values % f_trl) < f_f)
+    return df[mask]
 
 def create_past_windows_per_trial(trials, targets, window_size, stride=1):
-    """Create windows within each trial, ensuring no overlap between trials"""
+    """Create windows within each trial using numpy operations"""
     X, y = [], []
     
-    # Print debug info
-    print(f"Number of trials: {len(trials)}")
-    print(f"Trial shape: {trials[0].shape if len(trials) > 0 else 'No trials'}")
+    # Pre-allocate lists with estimated size
+    total_windows = sum((len(trial) - window_size) // stride + 1 for trial in trials)
+    X = np.zeros((total_windows, window_size, trials[0].shape[1]), dtype=np.float32)
+    y = np.zeros((total_windows, targets[0].shape[1]), dtype=np.float32)
     
-    for trial, target in tqdm(zip(trials, targets), desc="Processing trials", total=len(trials)):
-        # Ensure trial length is sufficient
+    current_idx = 0
+    for trial, target in zip(trials, targets):
         if len(trial) <= window_size:
-            print(f"Warning: Trial length {len(trial)} is <= window size {window_size}")
             continue
             
-        # Create windows within this trial
-        num_windows = (len(trial) - window_size) // stride
-        
+        num_windows = (len(trial) - window_size) // stride + 1
         for i in range(num_windows):
             start_idx = i * stride
             end_idx = start_idx + window_size
             
-            # Ensure we don't exceed trial boundaries
             if end_idx >= len(trial):
                 break
                 
-            window = trial[start_idx:end_idx]
-            target_window = target[end_idx-1]  # Use last frame as target
-            
-            # Validate shapes
-            if window.shape[0] != window_size:
-                print(f"Warning: Invalid window shape {window.shape}")
-                continue
-                
-            X.append(window)
-            y.append(target_window)
+            X[current_idx] = trial[start_idx:end_idx]
+            y[current_idx] = target[end_idx-1]
+            current_idx += 1
     
-    # Convert to arrays and validate
-    X = np.array(X)
-    y = np.array(y)
-    
-    print(f"Created {len(X)} windows")
-    print(f"Window shape: {X.shape}")
-    print(f"Target shape: {y.shape}")
-    
-    return X, y
+    return X[:current_idx], y[:current_idx]
 
-def create_past_windows(features, targets, window_size):
-    X, y = [], []
-    for i in tqdm(range(len(features) - window_size)):
-        X.append(features[i:i + window_size])
-        y.append(targets[i + window_size])
-    return np.array(X), np.array(y)
+def calculate_angular_velocities(velocities):
+    """
+    Calculate angular velocities from velocity components.
+    
+    Args:
+        velocities: numpy array of shape (n_frames, 3) containing [x_vel, y_vel, z_vel]
+    
+    Returns:
+        Dictionary containing angular velocities
+    """
+    try:
+        # Ensure input is float32
+        velocities = velocities.astype(np.float32)
+        
+        # Calculate angles at each timestep
+        xy_angles = np.arctan2(velocities[:, 1], velocities[:, 0])  # y_vel/x_vel
+        xz_angles = np.arctan2(velocities[:, 2], velocities[:, 0])  # z_vel/x_vel
+        yz_angles = np.arctan2(velocities[:, 2], velocities[:, 1])  # z_vel/y_vel
+        
+        # Calculate angular velocities (rate of change of angles)
+        xy_angular_vel = np.diff(xy_angles, prepend=xy_angles[0])
+        xz_angular_vel = np.diff(xz_angles, prepend=xz_angles[0])
+        yz_angular_vel = np.diff(yz_angles, prepend=yz_angles[0])
+        
+        # Handle discontinuities in angular velocities
+        xy_angular_vel = np.where(abs(xy_angular_vel) > np.pi, 
+                                xy_angular_vel - np.sign(xy_angular_vel) * 2 * np.pi, 
+                                xy_angular_vel)
+        xz_angular_vel = np.where(abs(xz_angular_vel) > np.pi,
+                                xz_angular_vel - np.sign(xz_angular_vel) * 2 * np.pi,
+                                xz_angular_vel)
+        yz_angular_vel = np.where(abs(yz_angular_vel) > np.pi,
+                                yz_angular_vel - np.sign(yz_angular_vel) * 2 * np.pi,
+                                yz_angular_vel)
+        
+        # Apply smoothing to reduce noise
+        window_size = 5
+        xy_angular_vel = pd.Series(xy_angular_vel).rolling(window=window_size, min_periods=1, center=True).mean().values
+        xz_angular_vel = pd.Series(xz_angular_vel).rolling(window=window_size, min_periods=1, center=True).mean().values
+        yz_angular_vel = pd.Series(yz_angular_vel).rolling(window=window_size, min_periods=1, center=True).mean().values
+        
+        # Ensure all outputs are float32
+        return {
+            'xy_angular_vel': xy_angular_vel.astype(np.float32),
+            'xz_angular_vel': xz_angular_vel.astype(np.float32),
+            'yz_angular_vel': yz_angular_vel.astype(np.float32)
+        }
+    except Exception as e:
+        print(f"Error calculating angular velocities: {e}")
+        # Return zero velocities as fallback
+        zeros = np.zeros(len(velocities), dtype=np.float32)
+        return {
+            'xy_angular_vel': zeros,
+            'xz_angular_vel': zeros,
+            'yz_angular_vel': zeros
+        }
 
 def prepare_data(config):
-    # Load data with error handling
-    try:
-        # First try with default engine
-        df = pd.read_csv(config['data_path'])
-    except Exception as e:
-        print(f"First attempt to read CSV failed, trying with python engine... Error: {e}")
-        try:
-            # Try with python engine
-            df = pd.read_csv(config['data_path'], engine='python')
-        except Exception as e:
-            print(f"Second attempt failed. Error: {e}")
-            # Try reading with different encoding
-            try:
-                df = pd.read_csv(config['data_path'], engine='python', encoding='utf-8-sig')
-            except Exception as e:
-                print(f"Third attempt with utf-8-sig encoding failed. Error: {e}")
-                try:
-                    df = pd.read_csv(config['data_path'], engine='python', encoding='latin1')
-                except Exception as e:
-                    print(f"Fourth attempt with latin1 encoding failed. Error: {e}")
-                    print(f"All attempts failed. Please check if the file exists and is not corrupted.")
-                    print(f"File path: {os.path.abspath(config['data_path'])}")
-                    raise e
-
-    print(f"Successfully loaded data with shape: {df.shape}")
-    print(f"Columns: {df.columns.tolist()}")
+    """
+    Prepare data for model training with enhanced features.
     
-    # Remove unwanted columns if they exist
-    columns_to_drop = ['genotype']
-    df = df.drop(columns=[col for col in columns_to_drop if col in df.columns])
-    
-    # Reset index without adding it as a column
-    df = df.reset_index(drop=True)
-
-    # Process data
-    df = filter_frames(df)
-    df = df.reset_index(drop=True)
-    df = remove_stepcycle_predictions(df, joint_angles=True, velocity=False)
-    df = df.drop(columns=['index']) if 'index' in df.columns else df
-    df = z_scoring(df)
-
-    # Calculate accelerations
-    df['x_acc'] = df['x_vel'].diff().fillna(0)
-    df['y_acc'] = df['y_vel'].diff().fillna(0)
-    df['z_acc'] = df['z_vel'].diff().fillna(0)
-
-    # Create features and targets
-    features = ['x_vel', 'y_vel', 'z_vel', 'x_acc', 'y_acc', 'z_acc']
-    X = df[features].values
-    y = df.drop(columns=features).values
-
-    # Split data into trials of 600 frames
-    trial_size = 600  # Fixed trial size
-    X_trials = split_into_trials(X, trial_size)
-    y_trials = split_into_trials(y, trial_size)
-
-    if len(X_trials) == 0:
-        raise ValueError("No complete trials created. Check data length and trial size.")
-
-    # Create windows within trials
-    window_size = config['window_size']
-    if window_size >= trial_size:
-        raise ValueError(f"Window size ({window_size}) must be less than trial size ({trial_size})")
-
-    X, y = create_past_windows_per_trial(X_trials, y_trials, window_size)
-
-    # Validate resulting data
-    if len(X) == 0 or len(y) == 0:
-        raise ValueError("No windows created. Check window_size and stride parameters.")
-
-    # Calculate split sizes
-    split_ratio = config.get('split_ratio', 0.8)
-    total_samples = len(X)
-    split_index = int(total_samples * split_ratio)
-    test_size = min(config.get('test_size', 7200), total_samples - split_index)
-
-    print(f"Total samples: {total_samples}")
-    print(f"Train split: {split_index}")
-    print(f"Test size: {test_size}")
-
-    # Split data
-    X_train = X[:split_index]
-    y_train = y[:split_index]
-    X_val = X[split_index:-test_size]
-    y_val = y[split_index:-test_size]
-    X_test = X[-test_size:]
-    y_test = y[-test_size:]
-
-    # Validate split sizes
-    for name, data in [("Train", X_train), ("Val", X_val), ("Test", X_test)]:
-        print(f"{name} set size: {len(data)}")
-        if len(data) == 0:
-            raise ValueError(f"Empty {name} set after splitting")
-
-    # Validate data after creating windows
-    if len(X) == 0 or len(y) == 0:
-        raise ValueError("No data samples generated after creating windows")
+    Args:
+        config: Dictionary containing configuration parameters
         
-    # Validate split sizes
-    split_index = int(len(X) * split_ratio)
-    test_size = min(config['test_size'], len(X) - split_index)
-    if split_index <= 0 or test_size <= 0:
-        raise ValueError(f"Invalid split sizes. Total samples: {len(X)}, "
-                       f"Split index: {split_index}, Test size: {test_size}")
-
-    # Split data with validation
-    X_train, X_val = X[:split_index], X[split_index:-test_size]
-    y_train, y_val = y[:split_index], y[split_index:-test_size]
-    X_test = X[-test_size:]
-    y_test = y[-test_size:]
-
-    # Validate tensor creation
-    if len(X_train) == 0 or len(X_val) == 0 or len(X_test) == 0:
-        raise ValueError(f"Empty dataset after splitting. Train: {len(X_train)}, "
-                       f"Val: {len(X_val)}, Test: {len(X_test)}")
-
-    # Create tensors with validation
+    Returns:
+        train_loader, val_loader, test_loader: DataLoader objects for training, validation and testing
+    """
     try:
-        X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
-        y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
-        X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
-        y_val_tensor = torch.tensor(y_val, dtype=torch.float32)
-        X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
-        y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
+        # Load data
+        velocity_cols = ['x_vel', 'y_vel', 'z_vel']
+        joint_cols = ['L2B_rot', 'R3A_rot', 'R3A_flex', 'R1B_rot', 'R2B_rot', 'L3A_rot']
+        
+        df = pd.read_csv(
+            config['data_path'],
+            usecols=velocity_cols + joint_cols,
+            dtype={col: np.float32 for col in velocity_cols + joint_cols},
+            engine='python'
+        )
+        
+        # Calculate enhanced features
+        velocities = df[velocity_cols].values.astype(np.float32)
+        features_dict = {}
+        
+        # 1. Moving averages (9 features)
+        window_sizes = [5, 10, 20]
+        for w in window_sizes:
+            for i, vel_col in enumerate(velocity_cols):
+                ma = pd.Series(velocities[:, i]).rolling(window=w, min_periods=1).mean().values
+                features_dict[f'{vel_col}_ma{w}'] = ma.astype(np.float32)
+        
+        # 2. Velocity magnitude (1 feature)
+        velocity_magnitude = np.sqrt(np.sum(velocities**2, axis=1))
+        features_dict['velocity_magnitude'] = velocity_magnitude.astype(np.float32)
+        
+        # 3. Planar velocities (2 features)
+        xy_velocity = np.sqrt(velocities[:, 0]**2 + velocities[:, 1]**2)
+        xz_velocity = np.sqrt(velocities[:, 0]**2 + velocities[:, 2]**2)
+        features_dict['xy_velocity'] = xy_velocity.astype(np.float32)
+        features_dict['xz_velocity'] = xz_velocity.astype(np.float32)
+        
+        # 4. Original velocities (3 features)
+        for i, col in enumerate(velocity_cols):
+            features_dict[col] = velocities[:, i]
+        
+        # 5. Angular velocities (optional - 3 features)
+        if config.get('use_angular_velocities', False):
+            angular_vel_features = calculate_angular_velocities(velocities)
+            features_dict.update(angular_vel_features)
+        
+        # Convert to DataFrame and standardize
+        features_df = pd.DataFrame(features_dict)
+        
+        # Print feature names and count for verification
+        print("\nFeature list:")
+        for i, feature in enumerate(features_dict.keys(), 1):
+            print(f"{i}. {feature}")
+        print(f"\nTotal features: {len(features_dict)}")
+        
+        # Verify feature count
+        expected_features = 18 if config.get('use_angular_velocities', False) else 15
+        assert len(features_dict) == expected_features, f"Expected {expected_features} features, but got {len(features_dict)}"
+        
+        # Standardize features and targets
+        features = stats.zscore(features_df.values, axis=0).astype(np.float32)
+        targets = stats.zscore(df[joint_cols].values, axis=0).astype(np.float32)
+        
+        # Split into trials
+        trial_size = 600
+        num_trials = len(features) // trial_size
+        print(f"\nNumber of trials: {num_trials}")
+        
+        X_trials = [features[i*trial_size:(i+1)*trial_size] for i in range(num_trials)]
+        y_trials = [targets[i*trial_size:(i+1)*trial_size] for i in range(num_trials)]
+        
+        # Create windows within trials
+        window_size = config['window_size']
+        X, y = create_past_windows_per_trial(X_trials, y_trials, window_size)
+        print(f"Created windows with shapes: X={X.shape}, y={y.shape}")
+        
+        # Split into train, validation, and test sets
+        total_samples = len(X)
+        test_size = min(config['test_size'], int(total_samples * 0.2))
+        train_val_size = total_samples - test_size
+        train_size = int(train_val_size * config['split_ratio'])
+        val_size = train_val_size - train_size
+        
+        # Create indices for splitting
+        indices = np.random.permutation(total_samples)
+        train_indices = indices[:train_size]
+        val_indices = indices[train_size:train_size+val_size]
+        test_indices = indices[train_size+val_size:]
+        
+        # Split the data
+        X_train = X[train_indices]
+        y_train = y[train_indices]
+        X_val = X[val_indices]
+        y_val = y[val_indices]
+        X_test = X[test_indices]
+        y_test = y[test_indices]
+        
+        print("\nData split sizes:")
+        print(f"Train: {len(X_train)} sequences")
+        print(f"Validation: {len(X_val)} sequences")
+        print(f"Test: {len(X_test)} sequences")
+        print(f"\nSequence shapes:")
+        print(f"Input shape (batch, seq_len, features): {X_train.shape}")
+        print(f"Output shape (batch, num_joints): {y_train.shape}")
+        
+        # Convert to PyTorch tensors and create datasets
+        train_dataset = TimeSeriesDataset(
+            torch.FloatTensor(X_train),
+            torch.FloatTensor(y_train)
+        )
+        val_dataset = TimeSeriesDataset(
+            torch.FloatTensor(X_val),
+            torch.FloatTensor(y_val)
+        )
+        test_dataset = TimeSeriesDataset(
+            torch.FloatTensor(X_test),
+            torch.FloatTensor(y_test)
+        )
+        
+        # Create data loaders
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=config['batch_size'],
+            shuffle=True,
+            num_workers=0
+        )
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=config['batch_size'],
+            shuffle=False,
+            num_workers=0
+        )
+        test_loader = DataLoader(
+            test_dataset, 
+            batch_size=config['batch_size'],
+            shuffle=False,
+            num_workers=0
+        )
+
+        # Verify data loader shapes
+        for inputs, targets in train_loader:
+            print(f"\nBatch shapes:")
+            print(f"Input batch shape: {inputs.shape}")
+            print(f"Target batch shape: {targets.shape}")
+            break
+
+        return train_loader, val_loader, test_loader
+
     except Exception as e:
-        raise ValueError(f"Failed to create tensors: {str(e)}")
-
-    # Data augmentation
-    def augment_batch(X, y):
-        if config['augment']:
-            noise = torch.randn_like(X) * config['noise_level']
-            X = X + noise
-        return X, y
-
-    # Create tensors on CPU first
-    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
-    y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
-    X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
-    y_val_tensor = torch.tensor(y_val, dtype=torch.float32)
-    X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
-    y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
-
-    # Create datasets with CPU tensors
-    train_dataset = TimeSeriesDataset(X_train_tensor, y_train_tensor)
-    val_dataset = TimeSeriesDataset(X_val_tensor, y_val_tensor)
-    test_dataset = TimeSeriesDataset(X_test_tensor, y_test_tensor)
-
-    # Apply augmentation to training data if enabled
-    if config['augment']:
-        X_train_tensor, y_train_tensor = augment_batch(X_train_tensor, y_train_tensor)
-
-    # Create data loaders with pin_memory=True
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=config['batch_size'],
-        shuffle=True,
-        pin_memory=True if torch.cuda.is_available() else False,
-        num_workers=0  # Add this to avoid potential multiprocessing issues
-    )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=config['batch_size'],
-        shuffle=False,
-        pin_memory=True if torch.cuda.is_available() else False,
-        num_workers=0
-    )
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=config['batch_size'],
-        shuffle=False,
-        pin_memory=True if torch.cuda.is_available() else False,
-        num_workers=0
-    )
-
-    # Validate data loaders
-    if len(train_loader) == 0 or len(val_loader) == 0 or len(test_loader) == 0:
-        raise ValueError(f"Empty DataLoader detected. Train: {len(train_loader)}, "
-                       f"Val: {len(val_loader)}, Test: {len(test_loader)}")
-
-    return train_loader, val_loader, test_loader
+        print(f"Error in prepare_data: {e}")
+        return None, None, None

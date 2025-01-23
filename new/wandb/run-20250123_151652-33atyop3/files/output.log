@@ -1,0 +1,52 @@
+
+Feature list:
+1. x_vel_ma5
+2. y_vel_ma5
+3. z_vel_ma5
+4. x_vel_ma10
+5. y_vel_ma10
+6. z_vel_ma10
+7. x_vel_ma20
+8. y_vel_ma20
+9. z_vel_ma20
+10. velocity_magnitude
+11. xy_velocity
+12. xz_velocity
+13. x_vel
+14. y_vel
+15. z_vel
+
+Total features: 15
+
+Number of trials: 812
+Created windows with shapes: X=(324800, 200, 15), y=(324800, 6)
+
+Data split sizes:
+Train: 254080 sequences
+Validation: 63520 sequences
+Test: 7200 sequences
+
+Sequence shapes:
+Input shape (batch, seq_len, features): (254080, 200, 15)
+Output shape (batch, num_joints): (254080, 6)
+
+Batch shapes:
+Input batch shape: torch.Size([128, 200, 15])
+Target batch shape: torch.Size([128, 6])
+
+Starting pretraining phase...
+C:\Users\bidayelab\Vel_to_Angle\new\train.py:919: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+Training with early stopping (patience=10 epochs)
+Total steps: 99250, Using OneCycle: True
+Pretraining Epochs:   4%| | 2/50 [04:51<1:26:16, 107.84s/it, loss=0.2445, avg_loss=0.26
+
+Epoch 1/50
+Loss: 0.6477 (New best)
+Time: 105.3s
+Learning rate: 7.83e-06
+
+Epoch 2/50
+Loss: 0.3573 (New best)
+Time: 109.6s
+Learning rate: 1.85e-05
