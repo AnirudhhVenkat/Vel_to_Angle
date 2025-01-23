@@ -1,0 +1,29 @@
+2025-01-23 10:41:25,531 INFO    MainThread:22240 [wandb_setup.py:_flush():68] Current SDK version is 0.19.2
+2025-01-23 10:41:25,531 INFO    MainThread:22240 [wandb_setup.py:_flush():68] Configure stats pid to 22240
+2025-01-23 10:41:25,531 INFO    MainThread:22240 [wandb_setup.py:_flush():68] Loading settings from C:\Users\bidayelab\.config\wandb\settings
+2025-01-23 10:41:25,531 INFO    MainThread:22240 [wandb_setup.py:_flush():68] Loading settings from C:\Users\bidayelab\Vel_to_Angle\new\wandb\settings
+2025-01-23 10:41:25,531 INFO    MainThread:22240 [wandb_setup.py:_flush():68] Loading settings from environment variables
+2025-01-23 10:41:25,531 INFO    MainThread:22240 [wandb_init.py:_log_setup():523] Logging user logs to C:\Users\bidayelab\Vel_to_Angle\new\wandb\run-20250123_104125-tomf8y6h\logs\debug.log
+2025-01-23 10:41:25,531 INFO    MainThread:22240 [wandb_init.py:_log_setup():524] Logging internal logs to C:\Users\bidayelab\Vel_to_Angle\new\wandb\run-20250123_104125-tomf8y6h\logs\debug-internal.log
+2025-01-23 10:41:25,531 INFO    MainThread:22240 [wandb_init.py:init():641] calling init triggers
+2025-01-23 10:41:25,531 INFO    MainThread:22240 [wandb_init.py:init():647] wandb.init called with sweep_config: {}
+config: {'data_path': 'Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv', 'pretrain_path': 'Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv', 'window_size': 200, 'split_ratio': 0.8, 'test_size': 7200, 'augment': False, 'noise_level': 0.1, 'n_folds': 5, 'device': device(type='cuda'), 'initial_epochs': 120, 'patience': 15, 'num_epochs': 100, 'pretrain_epochs': 50, 'finetune_epochs': 100, 'batch_size': 128, 'num_workers': 8, 'pin_memory': True, 'persistent_workers': True, 'prefetch_factor': 2, 'gradient_accumulation_steps': 4, 'warmup_epochs': 4, 'weight_decay': 0.01, 'label_smoothing': 0.1, 'learning_rate': 0.00012975381369387435, 'dropout': 0.3788244048801772, 'gradient_clip': 1.6866324797850238, 'model_params': {'input_size': 15, 'hidden_sizes': [768, 512, 384], 'dropout': 0.3788244048801772, 'nhead': 8, 'num_layers': 6, 'pos_encoding': 'sinusoidal', 'output_size': 15}, 'pretrain_params': {'warmup_epochs': 4, 'gradient_clip': 1.6866324797850238, 'weight_decay': 9.838927235024054e-06, 'label_smoothing': 0.09230100071103596, 'layer_norm_eps': 9.238997624771951e-07}}
+2025-01-23 10:41:25,531 INFO    MainThread:22240 [wandb_init.py:init():674] starting backend
+2025-01-23 10:41:25,766 INFO    MainThread:22240 [wandb_init.py:init():678] sending inform_init request
+2025-01-23 10:41:25,795 INFO    MainThread:22240 [backend.py:_multiprocessing_setup():104] multiprocessing start_methods=spawn, using: spawn
+2025-01-23 10:41:25,798 INFO    MainThread:22240 [wandb_init.py:init():693] backend started and connected
+2025-01-23 10:41:25,800 INFO    MainThread:22240 [wandb_init.py:init():786] updated telemetry
+2025-01-23 10:41:25,859 INFO    MainThread:22240 [wandb_init.py:init():818] communicating run to backend with 90.0 second timeout
+2025-01-23 10:41:26,134 INFO    MainThread:22240 [wandb_init.py:init():868] starting run threads in backend
+2025-01-23 10:41:26,318 INFO    MainThread:22240 [wandb_run.py:_console_start():2415] atexit reg
+2025-01-23 10:41:26,318 INFO    MainThread:22240 [wandb_run.py:_redirect():2265] redirect: wrap_raw
+2025-01-23 10:41:26,319 INFO    MainThread:22240 [wandb_run.py:_redirect():2330] Wrapping output streams.
+2025-01-23 10:41:26,319 INFO    MainThread:22240 [wandb_run.py:_redirect():2355] Redirects installed.
+2025-01-23 10:41:26,321 INFO    MainThread:22240 [wandb_init.py:init():910] run started, returning control to user process
+2025-01-23 15:16:50,874 INFO    MainThread:22240 [wandb_run.py:_finish():2140] finishing run anirudhhvenkat-max-planck-florida-institute-for-neuroscience/joint_angle_prediction/tomf8y6h
+2025-01-23 15:16:50,874 INFO    MainThread:22240 [wandb_run.py:_atexit_cleanup():2380] got exitcode: 0
+2025-01-23 15:16:50,874 INFO    MainThread:22240 [wandb_run.py:_restore():2362] restore
+2025-01-23 15:16:50,875 INFO    MainThread:22240 [wandb_run.py:_restore():2368] restore done
+2025-01-23 15:16:52,873 INFO    MainThread:22240 [wandb_run.py:_footer_history_summary_info():3984] rendering history
+2025-01-23 15:16:52,873 INFO    MainThread:22240 [wandb_run.py:_footer_history_summary_info():4016] rendering summary
+2025-01-23 15:16:52,873 INFO    MainThread:22240 [wandb_run.py:_footer_sync_info():3945] logging synced files

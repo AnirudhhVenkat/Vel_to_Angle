@@ -1,0 +1,750 @@
+
+Feature list:
+1. x_vel_ma5
+2. y_vel_ma5
+3. z_vel_ma5
+4. x_vel_ma10
+5. y_vel_ma10
+6. z_vel_ma10
+7. x_vel_ma20
+8. y_vel_ma20
+9. z_vel_ma20
+10. velocity_magnitude
+11. xy_velocity
+12. xz_velocity
+13. x_vel
+14. y_vel
+15. z_vel
+
+Total features: 15
+
+Number of trials: 812
+Created windows with shapes: X=(324800, 200, 15), y=(324800, 6)
+
+Data split sizes:
+Train: 254080 sequences
+Validation: 63520 sequences
+Test: 7200 sequences
+
+Sequence shapes:
+Input shape (batch, seq_len, features): (254080, 200, 15)
+Output shape (batch, num_joints): (254080, 6)
+
+Batch shapes:
+Input batch shape: torch.Size([64, 200, 15])
+Target batch shape: torch.Size([64, 6])
+
+Starting pretraining phase...
+C:\Users\bidayelab\Vel_to_Angle\new\train.py:918: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+Training with early stopping (patience=10 epochs)
+Total steps: 198500, Using OneCycle: True
+Pretraining Epochs:  12%| | 6/50 [14:10<1:29:05, 121.48s/it, loss=0.1698, avg_loss=0.10
+
+Epoch 1/50
+Loss: 0.5210 (New best)
+Time: 122.3s
+Learning rate: 1.02e-05
+
+Epoch 2/50
+Loss: 0.2870 (New best)
+Time: 121.5s
+Learning rate: 2.40e-05
+
+Epoch 3/50
+Loss: 0.1983 (New best)
+Time: 122.3s
+Learning rate: 4.47e-05
+
+Epoch 4/50
+Loss: 0.1578 (New best)
+Time: 121.7s
+Learning rate: 6.91e-05
+
+Epoch 5/50
+Loss: 0.1305 (New best)
+Time: 120.3s
+Learning rate: 9.35e-05
+
+Epoch 6/50
+Loss: 0.1140 (New best)
+Time: 121.7s
+Learning rate: 1.14e-04
+
+Epoch 7/50
+Loss: 0.1035 (New best)
+Time: 120.9s
+Learning rate: 1.28e-04
+
+Epoch 8/50
+Loss: 0.0984 (New best)
+Time: 120.8s
+Learning rate: 1.33e-04
+
+Epoch 9/50
+Loss: 0.0951 (New best)
+Time: 120.9s
+Learning rate: 1.33e-04
+
+Epoch 10/50
+Loss: 0.0925 (New best)
+Time: 120.4s
+Learning rate: 1.32e-04
+
+Epoch 11/50
+Loss: 0.0902 (New best)
+Time: 121.3s
+Learning rate: 1.31e-04
+
+Epoch 12/50
+Loss: 0.0890 (New best)
+Time: 120.6s
+Learning rate: 1.30e-04
+
+Epoch 13/50
+Loss: 0.0878 (New best)
+Time: 120.7s
+Learning rate: 1.28e-04
+
+Epoch 14/50
+Loss: 0.0868 (New best)
+Time: 121.7s
+Learning rate: 1.26e-04
+
+Epoch 15/50
+Loss: 0.0862 (New best)
+Time: 120.8s
+Learning rate: 1.24e-04
+
+Epoch 16/50
+Loss: 0.0857 (New best)
+Time: 121.3s
+Learning rate: 1.21e-04
+
+Epoch 17/50
+Loss: 0.0850 (New best)
+Time: 120.7s
+Learning rate: 1.18e-04
+
+Epoch 18/50
+Loss: 0.0845 (New best)
+Time: 121.4s
+Learning rate: 1.15e-04
+
+Epoch 19/50
+Loss: 0.0841 (New best)
+Time: 120.9s
+Learning rate: 1.12e-04
+
+Epoch 20/50
+Loss: 0.0837 (New best)
+Time: 120.7s
+Learning rate: 1.08e-04
+
+Epoch 21/50
+Loss: 0.0834 (New best)
+Time: 120.8s
+Learning rate: 1.04e-04
+
+Epoch 22/50
+Loss: 0.0831 (New best)
+Time: 120.2s
+Learning rate: 9.96e-05
+
+Epoch 23/50
+Loss: 0.0829 (New best)
+Time: 119.9s
+Learning rate: 9.52e-05
+
+Epoch 24/50
+Loss: 0.0827 (New best)
+Time: 121.5s
+Learning rate: 9.07e-05
+
+Epoch 25/50
+Loss: 0.0823 (New best)
+Time: 120.6s
+Learning rate: 8.60e-05
+
+Epoch 26/50
+Loss: 0.0822 (New best)
+Time: 121.1s
+Learning rate: 8.12e-05
+
+Epoch 27/50
+Loss: 0.0820 (New best)
+Time: 120.4s
+Learning rate: 7.63e-05
+
+Epoch 28/50
+Loss: 0.0818 (New best)
+Time: 121.1s
+Learning rate: 7.14e-05
+
+Epoch 29/50
+Loss: 0.0816 (New best)
+Time: 121.1s
+Learning rate: 6.64e-05
+
+Epoch 30/50
+Loss: 0.0815 (New best)
+Time: 120.4s
+Learning rate: 6.15e-05
+
+Epoch 31/50
+Loss: 0.0814 (New best)
+Time: 121.6s
+Learning rate: 5.65e-05
+
+Epoch 32/50
+Loss: 0.0813 (New best)
+Time: 121.0s
+Learning rate: 5.16e-05
+
+Epoch 33/50
+Loss: 0.0811 (New best)
+Time: 120.7s
+Learning rate: 4.68e-05
+
+Epoch 34/50
+Loss: 0.0810 (New best)
+Time: 120.7s
+Learning rate: 4.22e-05
+
+Epoch 35/50
+Loss: 0.0809 (New best)
+Time: 120.6s
+Learning rate: 3.76e-05
+
+Epoch 36/50
+Loss: 0.0808 (New best)
+Time: 121.0s
+Learning rate: 3.32e-05
+
+Epoch 37/50
+Loss: 0.0808 (New best)
+Time: 120.5s
+Learning rate: 2.90e-05
+
+Epoch 38/50
+Loss: 0.0807 (New best)
+Time: 120.8s
+Learning rate: 2.50e-05
+
+Epoch 39/50
+Loss: 0.0805 (New best)
+Time: 121.6s
+Learning rate: 2.12e-05
+
+Epoch 40/50
+Loss: 0.0806 (No improvement: 1)
+Time: 122.7s
+Learning rate: 1.77e-05
+
+Epoch 41/50
+Loss: 0.0805 (New best)
+Time: 121.8s
+Learning rate: 1.45e-05
+
+Epoch 42/50
+Loss: 0.0805 (No improvement: 1)
+Time: 120.7s
+Learning rate: 1.15e-05
+
+Epoch 43/50
+Loss: 0.0804 (New best)
+Time: 120.5s
+Learning rate: 8.90e-06
+
+Epoch 44/50
+Loss: 0.0803 (New best)
+Time: 121.1s
+Learning rate: 6.58e-06
+
+Epoch 45/50
+Loss: 0.0803 (No improvement: 1)
+Time: 121.3s
+Learning rate: 4.59e-06
+
+Epoch 46/50
+Loss: 0.0803 (No improvement: 2)
+Time: 121.6s
+Learning rate: 2.95e-06
+
+Epoch 47/50
+Loss: 0.0803 (No improvement: 3)
+Time: 121.1s
+Learning rate: 1.67e-06
+
+Epoch 48/50
+Loss: 0.0803 (New best)
+Time: 121.2s
+Learning rate: 7.42e-07
+
+Epoch 49/50
+Loss: 0.0803 (No improvement: 1)
+Time: 119.7s
+Learning rate: 1.86e-07
+
+Epoch 50/50
+Loss: 0.0803 (New best)
+Time: 119.7s
+Learning rate: 5.31e-10
+
+Restored best model from epoch 50
+Best loss: 0.0803
+
+Pretraining completed with best loss: 0.0803 at epoch 49
+
+Saving pretrained model state...
+Pretrained state keys: dict_keys(['running_mean', 'running_var', 'num_batches_tracked', 'input_norm.weight', 'input_norm.bias', 'input_projection.weight', 'input_projection.bias', 'pos_encoder.pe', 'transformer_encoder.layers.0.self_attn.in_proj_weight', 'transformer_encoder.layers.0.self_attn.in_proj_bias', 'transformer_encoder.layers.0.self_attn.out_proj.weight', 'transformer_encoder.layers.0.self_attn.out_proj.bias', 'transformer_encoder.layers.0.linear1.weight', 'transformer_encoder.layers.0.linear1.bias', 'transformer_encoder.layers.0.linear2.weight', 'transformer_encoder.layers.0.linear2.bias', 'transformer_encoder.layers.0.norm1.weight', 'transformer_encoder.layers.0.norm1.bias', 'transformer_encoder.layers.0.norm2.weight', 'transformer_encoder.layers.0.norm2.bias', 'transformer_encoder.layers.1.self_attn.in_proj_weight', 'transformer_encoder.layers.1.self_attn.in_proj_bias', 'transformer_encoder.layers.1.self_attn.out_proj.weight', 'transformer_encoder.layers.1.self_attn.out_proj.bias', 'transformer_encoder.layers.1.linear1.weight', 'transformer_encoder.layers.1.linear1.bias', 'transformer_encoder.layers.1.linear2.weight', 'transformer_encoder.layers.1.linear2.bias', 'transformer_encoder.layers.1.norm1.weight', 'transformer_encoder.layers.1.norm1.bias', 'transformer_encoder.layers.1.norm2.weight', 'transformer_encoder.layers.1.norm2.bias', 'transformer_encoder.layers.2.self_attn.in_proj_weight', 'transformer_encoder.layers.2.self_attn.in_proj_bias', 'transformer_encoder.layers.2.self_attn.out_proj.weight', 'transformer_encoder.layers.2.self_attn.out_proj.bias', 'transformer_encoder.layers.2.linear1.weight', 'transformer_encoder.layers.2.linear1.bias', 'transformer_encoder.layers.2.linear2.weight', 'transformer_encoder.layers.2.linear2.bias', 'transformer_encoder.layers.2.norm1.weight', 'transformer_encoder.layers.2.norm1.bias', 'transformer_encoder.layers.2.norm2.weight', 'transformer_encoder.layers.2.norm2.bias', 'output_projection.weight', 'output_projection.bias'])
+
+Saving pretrained model...
+Saved pretrained model to: models\trials\unsupervised_transformer_h768_d0.2429534782122855_head8_l5_20250123_043655\pretrained_model.pth
+
+Initializing finetuning model...
+
+Transferring pretrained weights...
+Keys to transfer: dict_keys(['running_mean', 'running_var', 'num_batches_tracked', 'input_norm.weight', 'input_norm.bias', 'input_projection.weight', 'input_projection.bias', 'pos_encoder.pe', 'transformer_encoder.layers.0.self_attn.in_proj_weight', 'transformer_encoder.layers.0.self_attn.in_proj_bias', 'transformer_encoder.layers.0.self_attn.out_proj.weight', 'transformer_encoder.layers.0.self_attn.out_proj.bias', 'transformer_encoder.layers.0.linear1.weight', 'transformer_encoder.layers.0.linear1.bias', 'transformer_encoder.layers.0.linear2.weight', 'transformer_encoder.layers.0.linear2.bias', 'transformer_encoder.layers.0.norm1.weight', 'transformer_encoder.layers.0.norm1.bias', 'transformer_encoder.layers.0.norm2.weight', 'transformer_encoder.layers.0.norm2.bias', 'transformer_encoder.layers.1.self_attn.in_proj_weight', 'transformer_encoder.layers.1.self_attn.in_proj_bias', 'transformer_encoder.layers.1.self_attn.out_proj.weight', 'transformer_encoder.layers.1.self_attn.out_proj.bias', 'transformer_encoder.layers.1.linear1.weight', 'transformer_encoder.layers.1.linear1.bias', 'transformer_encoder.layers.1.linear2.weight', 'transformer_encoder.layers.1.linear2.bias', 'transformer_encoder.layers.1.norm1.weight', 'transformer_encoder.layers.1.norm1.bias', 'transformer_encoder.layers.1.norm2.weight', 'transformer_encoder.layers.1.norm2.bias', 'transformer_encoder.layers.2.self_attn.in_proj_weight', 'transformer_encoder.layers.2.self_attn.in_proj_bias', 'transformer_encoder.layers.2.self_attn.out_proj.weight', 'transformer_encoder.layers.2.self_attn.out_proj.bias', 'transformer_encoder.layers.2.linear1.weight', 'transformer_encoder.layers.2.linear1.bias', 'transformer_encoder.layers.2.linear2.weight', 'transformer_encoder.layers.2.linear2.bias', 'transformer_encoder.layers.2.norm1.weight', 'transformer_encoder.layers.2.norm1.bias', 'transformer_encoder.layers.2.norm2.weight', 'transformer_encoder.layers.2.norm2.bias'])
+Target model keys: odict_keys(['running_mean', 'running_var', 'num_batches_tracked', 'input_norm.weight', 'input_norm.bias', 'input_projection.weight', 'input_projection.bias', 'pos_encoder.pe', 'transformer_encoder.layers.0.self_attn.in_proj_weight', 'transformer_encoder.layers.0.self_attn.in_proj_bias', 'transformer_encoder.layers.0.self_attn.out_proj.weight', 'transformer_encoder.layers.0.self_attn.out_proj.bias', 'transformer_encoder.layers.0.linear1.weight', 'transformer_encoder.layers.0.linear1.bias', 'transformer_encoder.layers.0.linear2.weight', 'transformer_encoder.layers.0.linear2.bias', 'transformer_encoder.layers.0.norm1.weight', 'transformer_encoder.layers.0.norm1.bias', 'transformer_encoder.layers.0.norm2.weight', 'transformer_encoder.layers.0.norm2.bias', 'transformer_encoder.layers.1.self_attn.in_proj_weight', 'transformer_encoder.layers.1.self_attn.in_proj_bias', 'transformer_encoder.layers.1.self_attn.out_proj.weight', 'transformer_encoder.layers.1.self_attn.out_proj.bias', 'transformer_encoder.layers.1.linear1.weight', 'transformer_encoder.layers.1.linear1.bias', 'transformer_encoder.layers.1.linear2.weight', 'transformer_encoder.layers.1.linear2.bias', 'transformer_encoder.layers.1.norm1.weight', 'transformer_encoder.layers.1.norm1.bias', 'transformer_encoder.layers.1.norm2.weight', 'transformer_encoder.layers.1.norm2.bias', 'transformer_encoder.layers.2.self_attn.in_proj_weight', 'transformer_encoder.layers.2.self_attn.in_proj_bias', 'transformer_encoder.layers.2.self_attn.out_proj.weight', 'transformer_encoder.layers.2.self_attn.out_proj.bias', 'transformer_encoder.layers.2.linear1.weight', 'transformer_encoder.layers.2.linear1.bias', 'transformer_encoder.layers.2.linear2.weight', 'transformer_encoder.layers.2.linear2.bias', 'transformer_encoder.layers.2.norm1.weight', 'transformer_encoder.layers.2.norm1.bias', 'transformer_encoder.layers.2.norm2.weight', 'transformer_encoder.layers.2.norm2.bias', 'output_projection.weight', 'output_projection.bias'])
+
+Transferred pretrained weights:
+Missing keys: ['output_projection.weight', 'output_projection.bias']
+Unexpected keys: []
+
+Verifying weight transfer...
+Successfully transferred weights for input_norm.weight
+Successfully transferred weights for input_norm.bias
+Successfully transferred weights for input_projection.weight
+Successfully transferred weights for input_projection.bias
+Successfully transferred weights for transformer_encoder.layers.0.self_attn.in_proj_weight
+Successfully transferred weights for transformer_encoder.layers.0.self_attn.in_proj_bias
+Successfully transferred weights for transformer_encoder.layers.0.self_attn.out_proj.weight
+Successfully transferred weights for transformer_encoder.layers.0.self_attn.out_proj.bias
+Successfully transferred weights for transformer_encoder.layers.0.linear1.weight
+Successfully transferred weights for transformer_encoder.layers.0.linear1.bias
+Successfully transferred weights for transformer_encoder.layers.0.linear2.weight
+Successfully transferred weights for transformer_encoder.layers.0.linear2.bias
+Successfully transferred weights for transformer_encoder.layers.0.norm1.weight
+Successfully transferred weights for transformer_encoder.layers.0.norm1.bias
+Successfully transferred weights for transformer_encoder.layers.0.norm2.weight
+Successfully transferred weights for transformer_encoder.layers.0.norm2.bias
+Successfully transferred weights for transformer_encoder.layers.1.self_attn.in_proj_weight
+Successfully transferred weights for transformer_encoder.layers.1.self_attn.in_proj_bias
+Successfully transferred weights for transformer_encoder.layers.1.self_attn.out_proj.weight
+Successfully transferred weights for transformer_encoder.layers.1.self_attn.out_proj.bias
+Successfully transferred weights for transformer_encoder.layers.1.linear1.weight
+Successfully transferred weights for transformer_encoder.layers.1.linear1.bias
+Successfully transferred weights for transformer_encoder.layers.1.linear2.weight
+Successfully transferred weights for transformer_encoder.layers.1.linear2.bias
+Successfully transferred weights for transformer_encoder.layers.1.norm1.weight
+Successfully transferred weights for transformer_encoder.layers.1.norm1.bias
+Successfully transferred weights for transformer_encoder.layers.1.norm2.weight
+Successfully transferred weights for transformer_encoder.layers.1.norm2.bias
+Successfully transferred weights for transformer_encoder.layers.2.self_attn.in_proj_weight
+Successfully transferred weights for transformer_encoder.layers.2.self_attn.in_proj_bias
+Successfully transferred weights for transformer_encoder.layers.2.self_attn.out_proj.weight
+Successfully transferred weights for transformer_encoder.layers.2.self_attn.out_proj.bias
+Successfully transferred weights for transformer_encoder.layers.2.linear1.weight
+Successfully transferred weights for transformer_encoder.layers.2.linear1.bias
+Successfully transferred weights for transformer_encoder.layers.2.linear2.weight
+Successfully transferred weights for transformer_encoder.layers.2.linear2.bias
+Successfully transferred weights for transformer_encoder.layers.2.norm1.weight
+Successfully transferred weights for transformer_encoder.layers.2.norm1.bias
+Successfully transferred weights for transformer_encoder.layers.2.norm2.weight
+Successfully transferred weights for transformer_encoder.layers.2.norm2.bias
+
+Initializing finetuning...
+C:\Users\bidayelab\Vel_to_Angle\new\train.py:1059: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+Starting finetuning with early stopping (patience=15 epochs)
+Using gradient accumulation steps: 4
+Total optimization steps: 99200
+Finetuning Epochs: 100%|█| 100/100 [3:24:29<00:00, 122.70s/it, train_mse=0.2324, train_
+
+Finetuning completed in 12269.8s
+Best validation MSE: 0.2449 at epoch 96
+
+Finetuning completed with best loss: 0.2449 at epoch 95
+
+Generating predictions:
+Window size: 200
+Chunk size: 600
+C:\Users\bidayelab\Vel_to_Angle\new\train.py:682: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+
+Prediction shape: (7200, 6)
+Target shape: (7200, 6)
+Total frames: 7200
+Number of chunks: 12
+
+Plotting predictions:
+Total timesteps: 7200
+Section size: 600
+Number of sections: 12
+
+Section 1:
+Start index: 0
+End index: 600
+Section length: 600
+
+Section 2:
+Start index: 600
+End index: 1200
+Section length: 600
+
+Section 3:
+Start index: 1200
+End index: 1800
+Section length: 600
+
+Section 4:
+Start index: 1800
+End index: 2400
+Section length: 600
+
+Section 5:
+Start index: 2400
+End index: 3000
+Section length: 600
+
+Section 6:
+Start index: 3000
+End index: 3600
+Section length: 600
+
+Section 7:
+Start index: 3600
+End index: 4200
+Section length: 600
+
+Section 8:
+Start index: 4200
+End index: 4800
+Section length: 600
+
+Section 9:
+Start index: 4800
+End index: 5400
+Section length: 600
+
+Section 10:
+Start index: 5400
+End index: 6000
+Section length: 600
+
+Section 11:
+Start index: 6000
+End index: 6600
+Section length: 600
+
+Section 12:
+Start index: 6600
+End index: 7200
+Section length: 600
+
+Section 1:
+Start index: 0
+End index: 600
+Section length: 600
+
+Section 2:
+Start index: 600
+End index: 1200
+Section length: 600
+
+Section 3:
+Start index: 1200
+End index: 1800
+Section length: 600
+
+Section 4:
+Start index: 1800
+End index: 2400
+Section length: 600
+
+Section 5:
+Start index: 2400
+End index: 3000
+Section length: 600
+
+Section 6:
+Start index: 3000
+End index: 3600
+Section length: 600
+
+Section 7:
+Start index: 3600
+End index: 4200
+Section length: 600
+
+Section 8:
+Start index: 4200
+End index: 4800
+Section length: 600
+
+Section 9:
+Start index: 4800
+End index: 5400
+Section length: 600
+
+Section 10:
+Start index: 5400
+End index: 6000
+Section length: 600
+
+Section 11:
+Start index: 6000
+End index: 6600
+Section length: 600
+
+Section 12:
+Start index: 6600
+End index: 7200
+Section length: 600
+
+Section 1:
+Start index: 0
+End index: 600
+Section length: 600
+
+Section 2:
+Start index: 600
+End index: 1200
+Section length: 600
+
+Section 3:
+Start index: 1200
+End index: 1800
+Section length: 600
+
+Section 4:
+Start index: 1800
+End index: 2400
+Section length: 600
+
+Section 5:
+Start index: 2400
+End index: 3000
+Section length: 600
+
+Section 6:
+Start index: 3000
+End index: 3600
+Section length: 600
+
+Section 7:
+Start index: 3600
+End index: 4200
+Section length: 600
+
+Section 8:
+Start index: 4200
+End index: 4800
+Section length: 600
+
+Section 9:
+Start index: 4800
+End index: 5400
+Section length: 600
+
+Section 10:
+Start index: 5400
+End index: 6000
+Section length: 600
+
+Section 11:
+Start index: 6000
+End index: 6600
+Section length: 600
+
+Section 12:
+Start index: 6600
+End index: 7200
+Section length: 600
+
+Section 1:
+Start index: 0
+End index: 600
+Section length: 600
+
+Section 2:
+Start index: 600
+End index: 1200
+Section length: 600
+
+Section 3:
+Start index: 1200
+End index: 1800
+Section length: 600
+
+Section 4:
+Start index: 1800
+End index: 2400
+Section length: 600
+
+Section 5:
+Start index: 2400
+End index: 3000
+Section length: 600
+
+Section 6:
+Start index: 3000
+End index: 3600
+Section length: 600
+
+Section 7:
+Start index: 3600
+End index: 4200
+Section length: 600
+
+Section 8:
+Start index: 4200
+End index: 4800
+Section length: 600
+
+Section 9:
+Start index: 4800
+End index: 5400
+Section length: 600
+
+Section 10:
+Start index: 5400
+End index: 6000
+Section length: 600
+
+Section 11:
+Start index: 6000
+End index: 6600
+Section length: 600
+
+Section 12:
+Start index: 6600
+End index: 7200
+Section length: 600
+
+Section 1:
+Start index: 0
+End index: 600
+Section length: 600
+
+Section 2:
+Start index: 600
+End index: 1200
+Section length: 600
+
+Section 3:
+Start index: 1200
+End index: 1800
+Section length: 600
+
+Section 4:
+Start index: 1800
+End index: 2400
+Section length: 600
+
+Section 5:
+Start index: 2400
+End index: 3000
+Section length: 600
+
+Section 6:
+Start index: 3000
+End index: 3600
+Section length: 600
+
+Section 7:
+Start index: 3600
+End index: 4200
+Section length: 600
+
+Section 8:
+Start index: 4200
+End index: 4800
+Section length: 600
+
+Section 9:
+Start index: 4800
+End index: 5400
+Section length: 600
+
+Section 10:
+Start index: 5400
+End index: 6000
+Section length: 600
+
+Section 11:
+Start index: 6000
+End index: 6600
+Section length: 600
+
+Section 12:
+Start index: 6600
+End index: 7200
+Section length: 600
+
+Section 1:
+Start index: 0
+End index: 600
+Section length: 600
+
+Section 2:
+Start index: 600
+End index: 1200
+Section length: 600
+
+Section 3:
+Start index: 1200
+End index: 1800
+Section length: 600
+
+Section 4:
+Start index: 1800
+End index: 2400
+Section length: 600
+
+Section 5:
+Start index: 2400
+End index: 3000
+Section length: 600
+
+Section 6:
+Start index: 3000
+End index: 3600
+Section length: 600
+
+Section 7:
+Start index: 3600
+End index: 4200
+Section length: 600
+
+Section 8:
+Start index: 4200
+End index: 4800
+Section length: 600
+
+Section 9:
+Start index: 4800
+End index: 5400
+Section length: 600
+
+Section 10:
+Start index: 5400
+End index: 6000
+Section length: 600
+
+Section 11:
+Start index: 6000
+End index: 6600
+Section length: 600
+
+Section 12:
+Start index: 6600
+End index: 7200
+Section length: 600
+
+Saving models for this trial...
+Saved final best finetuned model for trial to: models\trials\unsupervised_transformer_h768_d0.2429534782122855_head8_l5_20250123_043655\final_best_finetuned_model_trial.pth
+Saved prediction plots to: models\trials\unsupervised_transformer_h768_d0.2429534782122855_head8_l5_20250123_043655\plots
+
+Saved trial models and config to: models\trials\unsupervised_transformer_h768_d0.2429534782122855_head8_l5_20250123_043655

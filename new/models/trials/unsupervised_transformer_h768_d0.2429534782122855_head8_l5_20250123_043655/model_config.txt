@@ -1,0 +1,16 @@
+Run Name: unsupervised_transformer_h768_d0.2429534782122855_head8_l5_20250123_043655
+Hidden Size: 768
+Number of Heads: 8
+Number of Layers: 5
+Dropout: 0.2429534782122855
+Learning Rate: 0.0001328446991066863
+Batch Size: 64
+
+Training Results:
+Best Pretrain Loss: 0.08026489437949522
+Best Pretrain Epoch: 49
+Best Finetune Loss: 0.24491113867207198
+Best Finetune Epoch: 95
+Test MSE: 0.2536762058734894
+Test MAE: 0.2841438949108124
+Test R2: 0.7611998502798104
