@@ -1,11 +1,19 @@
 import torch
 import torch.nn as nn
 import math
+import torch.utils.checkpoint
 import copy
 import wandb
 import numpy as np
 from collections import defaultdict
 from tqdm import tqdm
+import torch.amp  # Add explicit import for amp
+import traceback  # Add traceback import
+from contextlib import nullcontext  # Add nullcontext import
+
+if __name__ == '__main__':
+    # Set multiprocessing start method
+    torch.multiprocessing.set_start_method('spawn', force=True)
 
 def check_gpu():
     """Check if GPU is available and print device information."""
@@ -19,125 +27,162 @@ def check_gpu():
     return device
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
+    def __init__(self, d_model, dropout=0.1, max_len=2000):
         super().__init__()
-        pe = torch.zeros(max_len, d_model)
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, 1, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        return x + self.pe[:, :x.size(1)]
+        # x shape: [batch_size, seq_len, d_model]
+        # Need shape: [seq_len, batch_size, d_model]
+        x = x.transpose(0, 1)
+        x = x + self.pe[:x.size(0)]
+        # Return to: [batch_size, seq_len, d_model]
+        return self.dropout(x.transpose(0, 1))
 
 class UnsupervisedTransformerModel(nn.Module):
-    def __init__(self, input_size, hidden_size, nhead, num_layers, output_size=None, dropout=0.1):
-        super().__init__()
-        self.input_size = input_size
-        self.output_size = output_size if output_size is not None else input_size
+    def __init__(self, input_size, hidden_size=512, nhead=8, num_layers=4, dropout=0.1):
+        super(UnsupervisedTransformerModel, self).__init__()
         
-        # Input standardization with larger epsilon
-        self.register_buffer('running_mean', torch.zeros(input_size))
-        self.register_buffer('running_var', torch.ones(input_size))
-        self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
+        # Input embedding
+        self.input_embedding = nn.Linear(input_size, hidden_size)
         
-        # Layer normalization with larger epsilon for stability
-        self.input_norm = nn.LayerNorm(input_size, eps=1e-2)
+        # Positional encoding is learned
+        self.pos_encoder = nn.Parameter(torch.randn(1, 1000, hidden_size))  # Max sequence length of 1000
         
-        # Reduce hidden size and ensure it's even for attention heads
-        hidden_size = min(hidden_size, 256)
-        if hidden_size % 8 != 0:
-            hidden_size = (hidden_size // 8) * 8
-        
-        # Input projection with very conservative initialization
-        self.input_projection = nn.Linear(input_size, hidden_size)
-        nn.init.xavier_uniform_(self.input_projection.weight, gain=0.1)
-        nn.init.zeros_(self.input_projection.bias)
-        
-        # Positional encoding
-        self.pos_encoder = PositionalEncoding(hidden_size)
-        
-        # Transformer encoder with conservative settings
-        encoder_layer = nn.TransformerEncoderLayer(
+        # Transformer encoder
+        encoder_layers = nn.TransformerEncoderLayer(
             d_model=hidden_size,
-            nhead=8,  # Fixed number of heads for stability
-            dim_feedforward=2*hidden_size,  # Standard ratio
-            dropout=0.1,  # Fixed dropout
-            batch_first=True,
-            norm_first=False  # Changed to False to avoid nested tensor warning
+            nhead=nhead,
+            dim_feedforward=hidden_size * 4,
+            dropout=dropout,
+            batch_first=True
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, min(num_layers, 3))
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
         
-        # Output projection with conservative initialization
-        self.output_projection = nn.Linear(hidden_size, self.output_size)
-        nn.init.xavier_uniform_(self.output_projection.weight, gain=0.1)
-        nn.init.zeros_(self.output_projection.bias)
+        # Output layers for pretraining (reconstruct input) and finetuning (predict angles)
+        self.pretraining_output = nn.Linear(hidden_size, input_size)  # Reconstruct input features
+        self.finetuning_output = nn.Linear(hidden_size, 18)  # Predict 18 flexion angles
         
-        # Initialize epsilon for numerical stability
-        self.eps = 1e-2
+        # Training mode flag
+        self.pretraining = True
+        
+    def forward(self, x):
+        """
+        Forward pass of the model.
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, input_size)
+        Returns:
+            Output tensor of shape (batch_size, seq_len, output_size)
+            where output_size is input_size during pretraining or 18 during finetuning
+        """
+        # Input embedding
+        x = self.input_embedding(x)
+        
+        # Add positional encoding
+        seq_len = x.size(1)
+        x = x + self.pos_encoder[:, :seq_len, :]
+        
+        # Transformer encoder
+        x = self.transformer_encoder(x)
+        
+        # Output layer based on mode
+        if self.pretraining:
+            return self.pretraining_output(x)  # Reconstruct input
+        else:
+            return self.finetuning_output(x)  # Predict angles
+    
+    def set_pretraining(self, mode=True):
+        """Set the model to pretraining or finetuning mode."""
+        self.pretraining = mode
+        self.train()  # Ensure model is in training mode
+
+class LearnablePositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=2000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        self.pe = nn.Parameter(torch.zeros(1, max_len, d_model))
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize with scaled positional encodings"""
+        position = torch.arange(self.pe.size(1)).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.pe.size(2), 2) * (-math.log(10000.0) / self.pe.size(2)))
+        self.pe.data[0, :, 0::2] = torch.sin(position * div_term)
+        self.pe.data[0, :, 1::2] = torch.cos(position * div_term)
+        self.pe.data = self.pe.data / math.sqrt(self.pe.size(-1))
     
     def forward(self, x):
-        # Input checks and standardization
-        if self.training:
-            with torch.no_grad():
-                mean = x.mean(dim=(0, 1))
-                var = x.var(dim=(0, 1), unbiased=False) + self.eps
-                self.running_mean = self.running_mean * 0.9 + mean * 0.1
-                self.running_var = self.running_var * 0.9 + var * 0.1
-                self.num_batches_tracked += 1
-                x = (x - mean[None, None, :]) / (torch.sqrt(var[None, None, :] + self.eps))
-        else:
-            x = (x - self.running_mean[None, None, :]) / (torch.sqrt(self.running_var[None, None, :] + self.eps))
-        
-        # Apply transformations with safety checks
-        x = torch.clamp(x, min=-2, max=2)
-        x = self.input_norm(x)
-        x = torch.clamp(x, min=-2, max=2)
-        
-        x = self.input_projection(x)
-        x = torch.nn.functional.relu(x)
-        x = torch.clamp(x, min=-2, max=2)
-        
-        x = self.pos_encoder(x)
-        x = torch.clamp(x, min=-2, max=2)
-        
-        # Create attention mask (not padding mask)
-        mask = None  # Let transformer handle attention internally
-        
-        x = self.transformer_encoder(x, mask=mask)
-        x = torch.clamp(x, min=-2, max=2)
-        
-        if self.output_size == self.input_size:
-            output = self.output_projection(x)
-        else:
-            x = torch.nn.functional.adaptive_avg_pool1d(x.transpose(1, 2), 1).squeeze(-1)
-            output = self.output_projection(x)
-        
-        output = torch.clamp(output, min=-2, max=2)
-        return output
+        """Add learnable positional encoding to input"""
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
 
-def pretrain_transformer(model, dataloader, criterion, optimizer, device, num_epochs=10, patience=10):
+class EnhancedTransformerEncoderLayer(nn.TransformerEncoderLayer):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1, batch_first=True):
+        super().__init__(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=batch_first
+        )
+        # Add layer scale parameters
+        self.layer_scale_1 = nn.Parameter(torch.ones(1) * 0.1)
+        self.layer_scale_2 = nn.Parameter(torch.ones(1) * 0.1)
+        
+    def forward(self, src):
+        """Forward pass with pre-norm architecture and scaled residuals"""
+        # Pre-norm attention block
+        x = src
+        attn = self.self_attn(
+            self.norm1(x), 
+            self.norm1(x), 
+            self.norm1(x)
+        )[0]
+        x = x + self.dropout1(attn) * self.layer_scale_1
+        
+        # Pre-norm feedforward block
+        ff = self.linear2(
+            self.dropout(
+                self.activation(
+                    self.linear1(self.norm2(x))
+                )
+            )
+        )
+        x = x + self.dropout2(ff) * self.layer_scale_2
+        
+        return x
+
+def pretrain_transformer(model, train_loader, val_loader, device, num_epochs=10, patience=10):
     """Pretrain transformer model in an unsupervised manner by reconstructing input sequences."""
     model.train()
-    best_loss = float('inf')
-    best_epoch = -1
-    best_model_state = model.state_dict()
-    train_losses = []
-    patience_counter = 0
     
-    # Add gradient clipping
-    max_grad_norm = 1.0
+    # Use L1Loss (MAE) for both pretraining and finetuning
+    criterion = nn.L1Loss()
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=1e-4,
+        weight_decay=0.01
+    )
     
-    # Add learning rate scheduler
+    # Add learning rate scheduler with adjusted patience
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=patience//2, 
+        optimizer, mode='min', factor=0.5, patience=patience//3,
         verbose=True, min_lr=1e-6
     )
     
-    print(f"Training with early stopping (patience={patience} epochs)")
-    print(f"Gradient clipping at {max_grad_norm}")
+    best_val_loss = float('inf')
+    best_model_state = None
+    best_epoch = -1
+    epochs_no_improve = 0
+    
+    # Add gradient clipping
+    max_grad_norm = 0.5  # Reduced from 1.0 for shorter sequences
     
     # Initialize wandb logging group
     if wandb.run is not None:
@@ -146,123 +191,169 @@ def pretrain_transformer(model, dataloader, criterion, optimizer, device, num_ep
     # Create progress bar for epochs
     epoch_pbar = tqdm(range(num_epochs), desc='Pretraining')
     
-    for epoch in epoch_pbar:
-        epoch_loss = 0
-        model.train()
-        
-        # Enable automatic mixed precision
-        scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
-        
-        # Process batches without progress bar
-        for batch in dataloader:
-            # Handle both tuple and tensor inputs
-            if isinstance(batch, (tuple, list)):
-                inputs = batch[0]
-            else:
-                inputs = batch
-                
-            inputs = inputs.to(device)
-            optimizer.zero_grad()
-            
-            # Use automatic mixed precision if available
-            if scaler is not None:
-                with torch.amp.autocast(device_type='cuda'):
-                    outputs = model(inputs)
-                    loss = criterion(outputs, inputs)
-                
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                outputs = model(inputs)
-                loss = criterion(outputs, inputs)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                optimizer.step()
-            
-            epoch_loss += loss.item()
-            
-            # Free up memory
-            del outputs, loss
-            if scaler is not None:
-                torch.cuda.empty_cache()
-        
-        avg_epoch_loss = epoch_loss / len(dataloader)
-        train_losses.append(avg_epoch_loss)
-        
-        # Update learning rate scheduler
-        scheduler.step(avg_epoch_loss)
-        
-        # Track best loss and epoch, save model state
-        if avg_epoch_loss < best_loss:
-            best_loss = avg_epoch_loss
-            best_epoch = epoch
-            best_model_state = copy.deepcopy(model.state_dict())
-            status = "(New best)"
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            status = f"(No improvement: {patience_counter})"
-        
-        # Update progress bar
-        epoch_pbar.set_postfix({
-            'loss': f'{avg_epoch_loss:.4f}',
-            'best': f'{best_loss:.4f}',
-            'lr': f'{optimizer.param_groups[0]["lr"]:.2e}',
-            'status': status
-        })
-        
-        # Log epoch metrics to wandb
-        if wandb.run is not None:
-            wandb.log({
-                'pretrain/epoch': epoch,
-                'pretrain/loss': avg_epoch_loss,
-                'pretrain/best_loss': best_loss,
-                'pretrain/learning_rate': optimizer.param_groups[0]['lr']
-            })
-        
-        # Early stopping
-        if patience_counter >= patience:
-            print(f"\nEarly stopping triggered after {epoch+1} epochs")
-            break
+    # Initialize AMP
+    use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
     
-    # Restore best model state
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        print(f"\nPretraining completed. Best loss: {best_loss:.4f} at epoch {best_epoch+1}")
-    
-    return best_loss, best_epoch
-
-def finetune_transformer(model, train_loader, val_loader, criterion, optimizer, device, num_epochs=100, patience=10):
-    """Finetune transformer model on labeled data with early stopping."""
     try:
-        model.to(device)
-        best_val_loss = float('inf')
-        best_model_state = None
-        epochs_without_improvement = 0
-        
-        # Initialize gradient scaler with new API
-        scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
-        
-        # Add gradient clipping
-        max_grad_norm = 0.5
-        
-        print(f"\nStarting finetuning:")
-        print(f"Number of epochs: {num_epochs}")
-        print(f"Early stopping patience: {patience}")
-        print(f"Gradient clipping: {max_grad_norm}")
-        print(f"Train loader size: {len(train_loader)}")
-        print(f"Validation loader size: {len(val_loader)}")
-        
-        # Create progress bar for epochs
-        epoch_pbar = tqdm(range(num_epochs), desc='Finetuning')
-        
         for epoch in epoch_pbar:
             # Training phase
             model.train()
-            train_loss = 0
+            train_loss = 0.0
+            num_batches = 0
+            
+            for batch in train_loader:
+                # Handle both tuple and tensor inputs
+                if isinstance(batch, (tuple, list)):
+                    inputs = batch[0]
+                else:
+                    inputs = batch
+                    
+                inputs = inputs.to(device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                
+                # Use AMP context manager if available
+                with torch.cuda.amp.autocast() if use_amp else nullcontext():
+                    outputs = model(inputs)
+                    loss = criterion(outputs, inputs)
+                
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    optimizer.step()
+                
+                train_loss += loss.item()
+                num_batches += 1
+                
+                # Free up memory
+                del outputs, loss
+                if use_amp:
+                    torch.cuda.empty_cache()
+            
+            avg_train_loss = train_loss / num_batches
+            
+            # Validation phase
+            model.eval()
+            val_loss = 0.0
+            num_val_batches = 0
+            
+            with torch.no_grad():
+                with torch.cuda.amp.autocast() if use_amp else nullcontext():
+                    for batch in val_loader:
+                        # Handle both tuple and tensor inputs
+                        if isinstance(batch, (tuple, list)):
+                            inputs = batch[0]
+                        else:
+                            inputs = batch
+                            
+                        inputs = inputs.to(device, non_blocking=True)
+                        outputs = model(inputs)
+                        loss = criterion(outputs, inputs)
+                        val_loss += loss.item()
+                        num_val_batches += 1
+                        
+                        del outputs, loss
+                        if use_amp:
+                            torch.cuda.empty_cache()
+            
+            avg_val_loss = val_loss / num_val_batches
+            
+            # Update learning rate scheduler based on validation loss
+            scheduler.step(avg_val_loss)
+            
+            # Update progress bar
+            epoch_pbar.set_postfix({
+                'train_loss': f'{avg_train_loss:.4f}',
+                'val_loss': f'{avg_val_loss:.4f}',
+                'best': f'{best_val_loss:.4f}',
+                'lr': f'{optimizer.param_groups[0]["lr"]:.2e}',
+                'no_improve': epochs_no_improve
+            })
+            
+            # Log metrics
+            if wandb.run is not None:
+                wandb.log({
+                    'pretrain/train_loss': avg_train_loss,
+                    'pretrain/val_loss': avg_val_loss,
+                    'pretrain/learning_rate': optimizer.param_groups[0]['lr'],
+                    'pretrain/epoch': epoch
+                })
+            
+            # Check for improvement
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                best_model_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
+                best_epoch = epoch
+                epochs_no_improve = 0
+                print(f"\nNew best model found at epoch {epoch+1} with validation loss: {best_val_loss:.4f}")
+            else:
+                epochs_no_improve += 1
+                
+                # Early stopping
+                if epochs_no_improve >= patience:
+                    print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+                    break
+        
+        # After training loop, ensure we have a model state to return
+        if best_model_state is None:
+            print("\nWarning: No best model state was saved during training")
+            best_model_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
+        else:
+            print(f"\nPretraining completed. Best loss: {best_val_loss:.4f} at epoch {best_epoch+1}")
+        
+        return best_val_loss, best_epoch, best_model_state
+        
+    except Exception as e:
+        print(f"Error during pretraining: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
+        # Ensure we still return something valid even if training fails
+        current_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
+        return float('inf'), -1, current_state
+
+def finetune_transformer(model, train_loader, val_loader, device, num_epochs=100, patience=10):
+    """Finetune transformer model for joint angle prediction."""
+    print("\nStarting finetuning...")
+    
+    # Use L1Loss (MAE) for both pretraining and finetuning
+    criterion = nn.L1Loss()
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=1e-4,
+        weight_decay=0.01
+    )
+    
+    # Initialize learning rate scheduler with adjusted patience
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=patience//3,
+        verbose=True, min_lr=1e-6
+    )
+    
+    # For monitoring only
+    mse_criterion = nn.MSELoss()
+    
+    # Initialize tracking variables
+    best_val_mae = float('inf')
+    best_model_state = None
+    best_epoch = 0
+    epochs_no_improve = 0
+    
+    # Initialize AMP
+    use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    
+    try:
+        for epoch in tqdm(range(num_epochs), desc="Finetuning"):
+            # Training phase
+            model.train()
+            train_mae = 0.0
+            train_mse = 0.0
+            num_batches = 0
             
             for inputs, targets in train_loader:
                 inputs = inputs.to(device, non_blocking=True)
@@ -270,94 +361,117 @@ def finetune_transformer(model, train_loader, val_loader, criterion, optimizer, 
                 
                 optimizer.zero_grad(set_to_none=True)
                 
-                # Mixed precision training
-                if scaler is not None:
-                    with torch.amp.autocast(device_type='cuda'):
-                        outputs = model(inputs)
-                        loss = criterion(outputs, targets)
-                    
-                    scaler.scale(loss).backward()
+                # Forward pass with AMP
+                with torch.cuda.amp.autocast() if use_amp else nullcontext():
+                    outputs = model(inputs)
+                    mae = criterion(outputs, targets)  # Primary loss (MAE)
+                    mse = mse_criterion(outputs, targets)  # For monitoring
+                
+                if use_amp:
+                    scaler.scale(mae).backward()
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    mae.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
                     optimizer.step()
                 
-                train_loss += loss.item()
+                train_mae += mae.item()
+                train_mse += mse.item()
+                num_batches += 1
                 
                 # Clean up memory
-                del outputs, loss
-                torch.cuda.empty_cache()
+                del outputs, mae, mse
+                if use_amp:
+                    torch.cuda.empty_cache()
             
-            avg_train_loss = train_loss / len(train_loader)
+            avg_train_mae = train_mae / num_batches
+            avg_train_mse = train_mse / num_batches
             
             # Validation phase
             model.eval()
-            val_loss = 0
+            val_mae = 0.0
+            val_mse = 0.0
+            num_val_batches = 0
             
-            with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
-                for inputs, targets in val_loader:
-                    inputs = inputs.to(device, non_blocking=True)
-                    targets = targets.to(device, non_blocking=True)
-                    
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
-                    val_loss += loss.item()
-                    
-                    del outputs, loss
-                    torch.cuda.empty_cache()
+            with torch.no_grad():
+                with torch.cuda.amp.autocast() if use_amp else nullcontext():
+                    for inputs, targets in val_loader:
+                        inputs = inputs.to(device, non_blocking=True)
+                        targets = targets.to(device, non_blocking=True)
+                        outputs = model(inputs)
+                        
+                        mae = criterion(outputs, targets)
+                        mse = mse_criterion(outputs, targets)
+                        
+                        val_mae += mae.item()
+                        val_mse += mse.item()
+                        num_val_batches += 1
+                        
+                        del outputs, mae, mse
+                        if use_amp:
+                            torch.cuda.empty_cache()
             
-            avg_val_loss = val_loss / len(val_loader)
+            avg_val_mae = val_mae / num_val_batches
+            avg_val_mse = val_mse / num_val_batches
             
-            # Early stopping check
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                best_model_state = copy.deepcopy(model.state_dict())
-                epochs_without_improvement = 0
-                status = "✓"
-            else:
-                epochs_without_improvement += 1
-                status = f"✗ ({epochs_without_improvement})"
+            # Update learning rate scheduler based on validation MAE
+            scheduler.step(avg_val_mae)
             
             # Update progress bar
-            epoch_pbar.set_postfix({
-                'train': f'{avg_train_loss:.4f}',
-                'val': f'{avg_val_loss:.4f}',
-                'best': f'{best_val_loss:.4f}',
-                'status': status
+            tqdm.set_postfix({
+                'train_mae': f'{avg_train_mae:.4f}',
+                'val_mae': f'{avg_val_mae:.4f}',
+                'best': f'{best_val_mae:.4f}',
+                'lr': f'{optimizer.param_groups[0]["lr"]:.2e}',
+                'no_improve': epochs_no_improve
             })
             
-            # Log to wandb if available
+            # Log metrics
             if wandb.run is not None:
                 wandb.log({
-                    'finetune/epoch': epoch,
-                    'finetune/train_loss': avg_train_loss,
-                    'finetune/val_loss': avg_val_loss,
-                    'finetune/best_val_loss': best_val_loss
+                    'finetune/train_mae': avg_train_mae,
+                    'finetune/train_mse': avg_train_mse,
+                    'finetune/val_mae': avg_val_mae,
+                    'finetune/val_mse': avg_val_mse,
+                    'finetune/learning_rate': optimizer.param_groups[0]['lr'],
+                    'finetune/epoch': epoch
                 })
             
-            # Early stopping
-            if epochs_without_improvement >= patience:
-                print(f"\nEarly stopping triggered after {epoch+1} epochs")
-                break
+            # Check for improvement
+            if avg_val_mae < best_val_mae:
+                best_val_mae = avg_val_mae
+                best_model_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
+                best_epoch = epoch
+                epochs_no_improve = 0
+                print(f"\nNew best model found at epoch {epoch+1} with validation MAE: {best_val_mae:.4f}")
+            else:
+                epochs_no_improve += 1
+                
+                # Early stopping
+                if epochs_no_improve >= patience:
+                    print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+                    break
         
-        # Restore best model
-        if best_model_state is not None:
+        # After training loop, ensure we have a model state to return
+        if best_model_state is None:
+            print("\nWarning: No best model state was saved during training")
+            best_model_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
+        else:
             model.load_state_dict(best_model_state)
-            print(f"\nRestored best model with validation loss: {best_val_loss:.4f}")
+            print(f"\nFinetuning completed. Best MAE: {best_val_mae:.4f} at epoch {best_epoch+1}")
         
-        return best_val_loss, epoch, model
+        return best_val_mae, best_epoch, model
         
     except Exception as e:
-        print(f"\nError in finetune_transformer: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return float('inf'), -1, None
+        print(f"Error during finetuning: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
+        # Ensure we still return something valid even if training fails
+        current_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
+        model.load_state_dict(current_state)
+        return float('inf'), -1, model
 
 def train_model(model_params, train_loader, val_loader=None, num_epochs=50):
     """Train the transformer model with the given parameters."""

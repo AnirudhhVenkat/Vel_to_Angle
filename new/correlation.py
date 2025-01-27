@@ -9,128 +9,129 @@ from pathlib import Path
 from utils.data import filter_frames
 
 def calculate_enhanced_features(df):
-    """Calculate enhanced motion features from velocity data."""
+    """Calculate enhanced features including lagged velocities."""
+    features = pd.DataFrame()
+    
     # Original velocities
-    velocity_cols = ['x_vel', 'y_vel', 'z_vel']
-    velocities = df[velocity_cols].values
+    features['x_vel'] = df['x_vel']
+    features['y_vel'] = df['y_vel']
+    features['z_vel'] = df['z_vel']
     
-    # 1. Total velocity magnitude
-    velocity_magnitude = np.sqrt(np.sum(velocities**2, axis=1))
-    df['velocity_magnitude'] = velocity_magnitude
+    # Add lagged velocities (both positive and negative lags)
+    lag_values = [1, 2, 3, 5, 10, 20]  # Different lag amounts
     
-    # 2. Accelerations
-    accelerations = np.diff(velocities, axis=0, prepend=velocities[0:1])
-    acc_cols = ['x_acc', 'y_acc', 'z_acc']
-    for col, acc_array in zip(acc_cols, accelerations.T):
-        df[col] = acc_array
+    for lag in lag_values:
+        # Forward lags (future values)
+        features[f'x_vel_lag_plus_{lag}'] = df['x_vel'].shift(-lag)
+        features[f'y_vel_lag_plus_{lag}'] = df['y_vel'].shift(-lag)
+        features[f'z_vel_lag_plus_{lag}'] = df['z_vel'].shift(-lag)
+        
+        # Backward lags (past values)
+        features[f'x_vel_lag_minus_{lag}'] = df['x_vel'].shift(lag)
+        features[f'y_vel_lag_minus_{lag}'] = df['y_vel'].shift(lag)
+        features[f'z_vel_lag_minus_{lag}'] = df['z_vel'].shift(lag)
     
-    # 3. Jerk (rate of change of acceleration)
-    jerk = np.diff(accelerations, axis=0, prepend=accelerations[0:1])
-    jerk_cols = ['x_jerk', 'y_jerk', 'z_jerk']
-    for col, jerk_array in zip(jerk_cols, jerk.T):
-        df[col] = jerk_array
+    # Calculate moving averages
+    windows = [5, 10, 20]
+    for window in windows:
+        features[f'x_vel_ma{window}'] = df['x_vel'].rolling(window=window, center=True).mean()
+        features[f'y_vel_ma{window}'] = df['y_vel'].rolling(window=window, center=True).mean()
+        features[f'z_vel_ma{window}'] = df['z_vel'].rolling(window=window, center=True).mean()
     
-    # 4. Moving averages for trend detection
-    window_sizes = [5, 10, 20]
-    for w in window_sizes:
-        for i, vel_col in enumerate(velocity_cols):
-            ma = pd.Series(velocities[:, i]).rolling(window=w, min_periods=1).mean().values
-            df[f'{vel_col}_ma{w}'] = ma
+    # Calculate derived velocities
+    features['velocity_magnitude'] = np.sqrt(
+        df['x_vel']**2 + df['y_vel']**2 + df['z_vel']**2
+    )
+    features['xy_velocity'] = np.sqrt(
+        df['x_vel']**2 + df['y_vel']**2
+    )
+    features['xz_velocity'] = np.sqrt(
+        df['x_vel']**2 + df['z_vel']**2
+    )
     
-    # 5. Planar velocities
-    df['xy_velocity'] = np.sqrt(velocities[:, 0]**2 + velocities[:, 1]**2)
-    df['yz_velocity'] = np.sqrt(velocities[:, 1]**2 + velocities[:, 2]**2)
-    df['xz_velocity'] = np.sqrt(velocities[:, 0]**2 + velocities[:, 2]**2)
+    # Calculate accelerations using central difference
+    dt = 1/60  # Assuming 60Hz sampling rate
     
-    # 6. Angular velocities
-    # Calculate angles at each timestep
-    xy_angles = np.arctan2(velocities[:, 1], velocities[:, 0])  # y_vel/x_vel
-    xz_angles = np.arctan2(velocities[:, 2], velocities[:, 0])  # z_vel/x_vel
-    yz_angles = np.arctan2(velocities[:, 2], velocities[:, 1])  # z_vel/y_vel
+    # Initialize acceleration arrays with zeros
+    accelerations = np.zeros_like(df['x_vel'])
     
-    # Calculate angular velocities (rate of change of angles)
-    xy_angular_vel = np.diff(xy_angles, prepend=xy_angles[0])
-    xz_angular_vel = np.diff(xz_angles, prepend=xz_angles[0])
-    yz_angular_vel = np.diff(yz_angles, prepend=yz_angles[0])
+    # Calculate accelerations using central difference (more accurate than forward difference)
+    accelerations[1:-1] = (df['x_vel'].values[2:] - df['x_vel'].values[:-2]) / (2 * dt)
+    features['x_acc'] = accelerations
     
-    # Handle discontinuities in angular velocities
-    xy_angular_vel = np.where(abs(xy_angular_vel) > np.pi, 
-                           xy_angular_vel - np.sign(xy_angular_vel) * 2 * np.pi, 
-                           xy_angular_vel)
-    xz_angular_vel = np.where(abs(xz_angular_vel) > np.pi,
-                           xz_angular_vel - np.sign(xz_angular_vel) * 2 * np.pi,
-                           xz_angular_vel)
-    yz_angular_vel = np.where(abs(yz_angular_vel) > np.pi,
-                           yz_angular_vel - np.sign(yz_angular_vel) * 2 * np.pi,
-                           yz_angular_vel)
+    accelerations[1:-1] = (df['y_vel'].values[2:] - df['y_vel'].values[:-2]) / (2 * dt)
+    features['y_acc'] = accelerations
     
-    # Apply smoothing to reduce noise
-    window_size = 5
-    xy_angular_vel = pd.Series(xy_angular_vel).rolling(window=window_size, min_periods=1, center=True).mean().values
-    xz_angular_vel = pd.Series(xz_angular_vel).rolling(window=window_size, min_periods=1, center=True).mean().values
-    yz_angular_vel = pd.Series(yz_angular_vel).rolling(window=window_size, min_periods=1, center=True).mean().values
+    accelerations[1:-1] = (df['z_vel'].values[2:] - df['z_vel'].values[:-2]) / (2 * dt)
+    features['z_acc'] = accelerations
     
-    df['xy_angular_vel'] = xy_angular_vel
-    df['xz_angular_vel'] = xz_angular_vel
-    df['yz_angular_vel'] = yz_angular_vel
+    # Calculate total acceleration magnitude
+    features['acceleration_magnitude'] = np.sqrt(
+        features['x_acc']**2 + features['y_acc']**2 + features['z_acc']**2
+    )
     
-    # 7. Direction changes
-    velocity_directions = np.sum(velocities[1:] * velocities[:-1], axis=1)
-    velocity_directions = np.pad(velocity_directions, (1,0), mode='edge')
-    df['velocity_direction_change'] = velocity_directions
+    # Calculate jerk (derivative of acceleration)
+    jerk = np.zeros_like(accelerations)
+    jerk[1:-1] = (features['acceleration_magnitude'].values[2:] - 
+                  features['acceleration_magnitude'].values[:-2]) / (2 * dt)
+    features['jerk_magnitude'] = jerk
     
-    # 8. Phase information
-    df['phase'] = (df['fnum'].values % 1400) / 1400
+    # Handle NaN values at trial boundaries
+    # First, identify trial boundaries
+    trial_size = 600  # After filtering (1000 - 400 = 600)
+    num_trials = len(df) // trial_size
     
-    return df
+    for trial in range(num_trials):
+        start_idx = trial * trial_size
+        end_idx = (trial + 1) * trial_size
+        
+        # Forward fill within each trial
+        features.iloc[start_idx:end_idx] = features.iloc[start_idx:end_idx].fillna(method='ffill')
+        # Backward fill within each trial
+        features.iloc[start_idx:end_idx] = features.iloc[start_idx:end_idx].fillna(method='bfill')
+    
+    return features
 
 def load_data(file_path):
     """Load and preprocess the dataset from a CSV file efficiently."""
     try:
-        # Load only the columns we need
-        # First, read just one row to get column names
-        df_sample = pd.read_csv(file_path, nrows=1)
-        
-        # Identify relevant columns
-        velocity_cols = ['x_vel', 'y_vel', 'z_vel']
-        joint_cols = [col for col in df_sample.columns 
-                     if col.endswith(('_flex', '_rot', '_abduct'))]
-        frame_cols = ['fnum']  # needed for filter_frames
-        
-        usecols = velocity_cols + joint_cols + frame_cols
-        
-        # Load data with optimizations
-        df = pd.read_csv(
-            file_path,
-            usecols=usecols,
-            dtype={col: np.float32 for col in usecols if col != 'fnum'},
-            engine='python',  # Use python engine for better compatibility
-        )
+        # Load the full data first to get all columns
+        df = pd.read_csv(file_path)
         print(f"Raw data loaded successfully with shape: {df.shape}")
         
-        # Apply preprocessing steps
-        df = filter_frames(df)
-        if 'index' in df.columns:
-            df = df.drop(columns=['index'])
+        # Filter frames 400-1000 from each trial
+        trial_size = 1400
+        num_trials = len(df) // trial_size
+        
+        filtered_rows = []
+        for trial in range(num_trials):
+            start_idx = trial * trial_size + 400
+            end_idx = trial * trial_size + 1000
+            filtered_rows.append(df.iloc[start_idx:end_idx])
+        
+        df = pd.concat(filtered_rows, axis=0, ignore_index=True)
+        print(f"Filtered data to frames 400-1000, new shape: {df.shape}")
         
         # Calculate enhanced features
-        df = calculate_enhanced_features(df)
+        enhanced_features = calculate_enhanced_features(df)
         
-        # Get all input feature columns
-        input_cols = [col for col in df.columns if col not in joint_cols and col != 'fnum']
+        # Merge enhanced features with joint angles
+        joint_cols = [col for col in df.columns if col.endswith(('_flex', '_rot', '_abduct'))]
+        
+        # Create final dataframe with both features and joint angles
+        final_df = pd.concat([enhanced_features, df[joint_cols]], axis=1)
         
         # Calculate z-scores efficiently
-        df[joint_cols] = df[joint_cols].apply(stats.zscore)
-        df[input_cols] = df[input_cols].apply(stats.zscore)
+        feature_cols = [col for col in enhanced_features.columns]
+        final_df[feature_cols] = final_df[feature_cols].apply(stats.zscore)
+        final_df[joint_cols] = final_df[joint_cols].apply(stats.zscore)
         
-        # Drop the frame number column as it's no longer needed
-        df = df.drop(columns=['fnum'])
+        print(f"Final preprocessed data shape: {final_df.shape}")
+        return final_df
         
-        print(f"Preprocessed data shape: {df.shape}")
-        return df
     except Exception as e:
         print(f"Error loading/preprocessing data: {e}")
-        return None
+        raise  # Re-raise the exception for better error tracking
 
 def compute_correlation(df):
     """Compute the correlation matrix between inputs and outputs."""

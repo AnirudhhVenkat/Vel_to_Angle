@@ -3,13 +3,19 @@ import numpy as np
 from scipy import stats
 from tqdm import tqdm
 import torch
-from torch.utils.data import DataLoader, TensorDataset, Dataset
+from torch.utils.data import (
+    DataLoader, 
+    TensorDataset, 
+    Dataset,
+    random_split
+)
 import os
+from sklearn.preprocessing import StandardScaler
 
 class TimeSeriesDataset(Dataset):
     def __init__(self, features, targets):
-        self.features = features
-        self.targets = targets
+        self.features = torch.FloatTensor(features)
+        self.targets = torch.FloatTensor(targets)
         
     def __len__(self):
         return len(self.features)
@@ -18,50 +24,81 @@ class TimeSeriesDataset(Dataset):
         return self.features[idx], self.targets[idx]
 
 def filter_frames(df):
-    """Filter frames efficiently using numpy operations"""
-    f_0, f_f, f_trl = 400, 1000, 1400
-    mask = ((df['fnum'].values % f_trl) >= f_0) & ((df['fnum'].values % f_trl) < f_f)
-    return df[mask]
-
-def create_past_windows_per_trial(trials, targets, window_size, stride=1):
-    """Create windows within each trial using numpy operations"""
-    X, y = [], []
+    """Filter frames to only include frames 400-1000 from each trial."""
+    # Get trial indices (assuming 1400 frames per trial)
+    trial_size = 1400
+    num_trials = len(df) // trial_size
     
-    # Pre-allocate lists with estimated size
-    total_windows = sum((len(trial) - window_size) // stride + 1 for trial in trials)
+    # Create a mask for frames 400-1000 in each trial
+    mask = np.zeros(len(df), dtype=bool)
+    for trial in range(num_trials):
+        start_idx = trial * trial_size + 400
+        end_idx = trial * trial_size + 1000
+        mask[start_idx:end_idx] = True
+    
+    # Apply the mask
+    filtered_df = df[mask].copy()
+    print(f"Filtered data from {len(df)} to {len(filtered_df)} frames")
+    return filtered_df
+
+def create_past_windows_per_trial(trials, targets, window_size):
+    """Create windows within each trial using a stride of 1.
+    
+    Args:
+        trials: List of trial features, each of shape (trial_length, num_features)
+        targets: List of trial targets, each of shape (trial_length, num_targets)
+        window_size: Size of each window
+    
+    Returns:
+        X: Windowed features of shape (num_windows, window_size, num_features)
+        y: Windowed targets of shape (num_windows, window_size, num_targets)
+    """
+    # Calculate total windows with stride of 1
+    total_windows = sum(max(0, len(trial) - window_size + 1) for trial in trials)
     X = np.zeros((total_windows, window_size, trials[0].shape[1]), dtype=np.float32)
-    y = np.zeros((total_windows, targets[0].shape[1]), dtype=np.float32)
+    y = np.zeros((total_windows, window_size, targets[0].shape[1]), dtype=np.float32)
     
     current_idx = 0
     for trial, target in zip(trials, targets):
-        if len(trial) <= window_size:
+        if len(trial) < window_size:
             continue
             
-        num_windows = (len(trial) - window_size) // stride + 1
+        # Use stride of 1 for overlapping windows
+        num_windows = len(trial) - window_size + 1
         for i in range(num_windows):
-            start_idx = i * stride
+            start_idx = i  # Stride of 1
             end_idx = start_idx + window_size
             
-            if end_idx >= len(trial):
+            if end_idx > len(trial):
                 break
                 
             X[current_idx] = trial[start_idx:end_idx]
-            y[current_idx] = target[end_idx-1]
+            y[current_idx] = target[start_idx:end_idx]
             current_idx += 1
     
     return X[:current_idx], y[:current_idx]
 
 def calculate_angular_velocities(velocities):
-    """
-    Calculate angular velocities from velocity components.
+    """Calculate angular velocities from velocity components.
     
     Args:
         velocities: numpy array of shape (n_frames, 3) containing [x_vel, y_vel, z_vel]
     
     Returns:
         Dictionary containing angular velocities
+    
+    Raises:
+        ValueError: If input data is invalid or calculation fails
     """
     try:
+        # Input validation
+        if not isinstance(velocities, np.ndarray):
+            raise ValueError("Input must be a numpy array")
+        if velocities.shape[1] != 3:
+            raise ValueError(f"Expected 3 velocity components, got {velocities.shape[1]}")
+        if not np.isfinite(velocities).all():
+            raise ValueError("Input contains non-finite values")
+            
         # Ensure input is float32
         velocities = velocities.astype(np.float32)
         
@@ -88,9 +125,18 @@ def calculate_angular_velocities(velocities):
         
         # Apply smoothing to reduce noise
         window_size = 5
-        xy_angular_vel = pd.Series(xy_angular_vel).rolling(window=window_size, min_periods=1, center=True).mean().values
-        xz_angular_vel = pd.Series(xz_angular_vel).rolling(window=window_size, min_periods=1, center=True).mean().values
-        yz_angular_vel = pd.Series(yz_angular_vel).rolling(window=window_size, min_periods=1, center=True).mean().values
+        xy_angular_vel = pd.Series(xy_angular_vel).rolling(window=window_size, min_periods=window_size, center=True).mean().values
+        xz_angular_vel = pd.Series(xz_angular_vel).rolling(window=window_size, min_periods=window_size, center=True).mean().values
+        yz_angular_vel = pd.Series(yz_angular_vel).rolling(window=window_size, min_periods=window_size, center=True).mean().values
+        
+        # Handle NaN values from rolling mean
+        xy_angular_vel = pd.Series(xy_angular_vel).fillna(method='ffill').fillna(method='bfill').values
+        xz_angular_vel = pd.Series(xz_angular_vel).fillna(method='ffill').fillna(method='bfill').values
+        yz_angular_vel = pd.Series(yz_angular_vel).fillna(method='ffill').fillna(method='bfill').values
+        
+        # Verify no NaN values remain
+        if not np.isfinite([xy_angular_vel, xz_angular_vel, yz_angular_vel]).all():
+            raise ValueError("Non-finite values in calculated angular velocities")
         
         # Ensure all outputs are float32
         return {
@@ -99,169 +145,322 @@ def calculate_angular_velocities(velocities):
             'yz_angular_vel': yz_angular_vel.astype(np.float32)
         }
     except Exception as e:
-        print(f"Error calculating angular velocities: {e}")
-        # Return zero velocities as fallback
-        zeros = np.zeros(len(velocities), dtype=np.float32)
-        return {
-            'xy_angular_vel': zeros,
-            'xz_angular_vel': zeros,
-            'yz_angular_vel': zeros
-        }
+        raise ValueError(f"Error calculating angular velocities: {str(e)}")
 
-def prepare_data(config):
-    """
-    Prepare data for model training with enhanced features.
+def calculate_enhanced_features(data, config):
+    """Calculate enhanced features from raw velocities, focusing on most informative features.
     
     Args:
-        config: Dictionary containing configuration parameters
-        
+        data: DataFrame containing raw data
+        config: Configuration dictionary with optional parameters:
+            - window_sizes: List of window sizes for moving averages [default: [5, 10, 20]]
+            - min_periods: Minimum periods for moving averages [default: None (use window size)]
+    
     Returns:
-        train_loader, val_loader, test_loader: DataLoader objects for training, validation and testing
+        DataFrame with enhanced features
     """
-    try:
-        # Load data
-        velocity_cols = ['x_vel', 'y_vel', 'z_vel']
-        joint_cols = ['L2B_rot', 'R3A_rot', 'R3A_flex', 'R1B_rot', 'R2B_rot', 'L3A_rot']
+    # Get configuration parameters
+    window_sizes = config.get('window_sizes', [5, 10, 20])
+    min_periods = config.get('min_periods', None)  # If None, will use window size
+    
+    # First reshape data into trials to handle boundaries correctly
+    trial_length = 600  # After filtering (frames 400-1000, so 600 frames per trial)
+    num_trials = len(data) // trial_length
+    
+    # Verify data length is multiple of trial_length
+    if len(data) % trial_length != 0:
+        raise ValueError(f"Data length ({len(data)}) is not a multiple of trial_length ({trial_length})")
+    
+    features_list = []
+    
+    # Process each trial separately to avoid boundary effects
+    for trial in range(num_trials):
+        start_idx = trial * trial_length
+        end_idx = (trial + 1) * trial_length
+        trial_data = data.iloc[start_idx:end_idx].copy()
         
-        df = pd.read_csv(
-            config['data_path'],
-            usecols=velocity_cols + joint_cols,
-            dtype={col: np.float32 for col in velocity_cols + joint_cols},
-            engine='python'
+        # Check for NaN values in raw data
+        if trial_data[['x_vel', 'y_vel', 'z_vel']].isna().any().any():
+            raise ValueError(f"NaN values found in raw velocities for trial {trial}")
+        
+        trial_features = pd.DataFrame()
+        
+        # Original velocities
+        trial_features['x_vel'] = trial_data['x_vel']
+        trial_features['z_vel'] = trial_data['z_vel']
+        
+        # Moving averages for x and z velocities
+        for window in window_sizes:
+            # Use window size as min_periods if not specified
+            periods = min_periods if min_periods is not None else window
+            
+            # Calculate moving averages within trial boundaries
+            trial_features[f'x_vel_ma{window}'] = (
+                trial_data['x_vel']
+                .rolling(window=window, center=True, min_periods=periods)
+                .mean()
+            )
+            trial_features[f'z_vel_ma{window}'] = (
+                trial_data['z_vel']
+                .rolling(window=window, center=True, min_periods=periods)
+                .mean()
+            )
+        
+        # Combined velocity features
+        trial_features['velocity_magnitude'] = np.sqrt(
+            trial_data['x_vel']**2 + 
+            trial_data['y_vel']**2 + 
+            trial_data['z_vel']**2
+        )
+        trial_features['xz_velocity'] = np.sqrt(
+            trial_data['x_vel']**2 + 
+            trial_data['z_vel']**2
         )
         
-        # Calculate enhanced features
-        velocities = df[velocity_cols].values.astype(np.float32)
-        features_dict = {}
+        # Handle any NaN values at edges
+        trial_features = trial_features.fillna(method='ffill').fillna(method='bfill')
         
-        # 1. Moving averages (9 features)
-        window_sizes = [5, 10, 20]
-        for w in window_sizes:
-            for i, vel_col in enumerate(velocity_cols):
-                ma = pd.Series(velocities[:, i]).rolling(window=w, min_periods=1).mean().values
-                features_dict[f'{vel_col}_ma{w}'] = ma.astype(np.float32)
-        
-        # 2. Velocity magnitude (1 feature)
-        velocity_magnitude = np.sqrt(np.sum(velocities**2, axis=1))
-        features_dict['velocity_magnitude'] = velocity_magnitude.astype(np.float32)
-        
-        # 3. Planar velocities (2 features)
-        xy_velocity = np.sqrt(velocities[:, 0]**2 + velocities[:, 1]**2)
-        xz_velocity = np.sqrt(velocities[:, 0]**2 + velocities[:, 2]**2)
-        features_dict['xy_velocity'] = xy_velocity.astype(np.float32)
-        features_dict['xz_velocity'] = xz_velocity.astype(np.float32)
-        
-        # 4. Original velocities (3 features)
-        for i, col in enumerate(velocity_cols):
-            features_dict[col] = velocities[:, i]
-        
-        # 5. Angular velocities (optional - 3 features)
-        if config.get('use_angular_velocities', False):
-            angular_vel_features = calculate_angular_velocities(velocities)
-            features_dict.update(angular_vel_features)
-        
-        # Convert to DataFrame and standardize
-        features_df = pd.DataFrame(features_dict)
-        
-        # Print feature names and count for verification
-        print("\nFeature list:")
-        for i, feature in enumerate(features_dict.keys(), 1):
-            print(f"{i}. {feature}")
-        print(f"\nTotal features: {len(features_dict)}")
-        
-        # Verify feature count
-        expected_features = 18 if config.get('use_angular_velocities', False) else 15
-        assert len(features_dict) == expected_features, f"Expected {expected_features} features, but got {len(features_dict)}"
-        
-        # Standardize features and targets
-        features = stats.zscore(features_df.values, axis=0).astype(np.float32)
-        targets = stats.zscore(df[joint_cols].values, axis=0).astype(np.float32)
-        
-        # Split into trials
-        trial_size = 600
-        num_trials = len(features) // trial_size
-        print(f"\nNumber of trials: {num_trials}")
-        
-        X_trials = [features[i*trial_size:(i+1)*trial_size] for i in range(num_trials)]
-        y_trials = [targets[i*trial_size:(i+1)*trial_size] for i in range(num_trials)]
-        
-        # Create windows within trials
-        window_size = config['window_size']
-        X, y = create_past_windows_per_trial(X_trials, y_trials, window_size)
-        print(f"Created windows with shapes: X={X.shape}, y={y.shape}")
-        
-        # Split into train, validation, and test sets
-        total_samples = len(X)
-        test_size = min(config['test_size'], int(total_samples * 0.2))
-        train_val_size = total_samples - test_size
-        train_size = int(train_val_size * config['split_ratio'])
-        val_size = train_val_size - train_size
-        
-        # Create indices for splitting
-        indices = np.random.permutation(total_samples)
-        train_indices = indices[:train_size]
-        val_indices = indices[train_size:train_size+val_size]
-        test_indices = indices[train_size+val_size:]
-        
-        # Split the data
-        X_train = X[train_indices]
-        y_train = y[train_indices]
-        X_val = X[val_indices]
-        y_val = y[val_indices]
-        X_test = X[test_indices]
-        y_test = y[test_indices]
-        
-        print("\nData split sizes:")
-        print(f"Train: {len(X_train)} sequences")
-        print(f"Validation: {len(X_val)} sequences")
-        print(f"Test: {len(X_test)} sequences")
-        print(f"\nSequence shapes:")
-        print(f"Input shape (batch, seq_len, features): {X_train.shape}")
-        print(f"Output shape (batch, num_joints): {y_train.shape}")
-        
-        # Convert to PyTorch tensors and create datasets
-        train_dataset = TimeSeriesDataset(
-            torch.FloatTensor(X_train),
-            torch.FloatTensor(y_train)
-        )
-        val_dataset = TimeSeriesDataset(
-            torch.FloatTensor(X_val),
-            torch.FloatTensor(y_val)
-        )
-        test_dataset = TimeSeriesDataset(
-            torch.FloatTensor(X_test),
-            torch.FloatTensor(y_test)
-        )
-        
-        # Create data loaders
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=config['batch_size'],
-            shuffle=True,
-            num_workers=0
-        )
-        val_loader = DataLoader(
-            val_dataset, 
-            batch_size=config['batch_size'],
-            shuffle=False,
-            num_workers=0
-        )
-        test_loader = DataLoader(
-            test_dataset, 
-            batch_size=config['batch_size'],
-            shuffle=False,
-            num_workers=0
-        )
+        features_list.append(trial_features)
+    
+    # Concatenate all trials
+    features = pd.concat(features_list, axis=0, ignore_index=True)
+    
+    # Verify no NaN values were introduced
+    if features.isna().any().any():
+        raise ValueError("NaN values found in calculated features")
+    
+    # List of features in the order we want
+    all_features = [
+        # Z-velocity features (strongest correlations)
+        'z_vel', 'z_vel_ma5', 'z_vel_ma10', 'z_vel_ma20',
+        # X-velocity features (moderate correlations)
+        'x_vel', 'x_vel_ma5', 'x_vel_ma10', 'x_vel_ma20',
+        # Combined velocities
+        'velocity_magnitude', 'xz_velocity'
+    ]
+    
+    # Verify all expected features are present
+    missing_features = set(all_features) - set(features.columns)
+    if missing_features:
+        raise ValueError(f"Missing features: {missing_features}")
+    
+    return features[all_features]
 
-        # Verify data loader shapes
-        for inputs, targets in train_loader:
-            print(f"\nBatch shapes:")
-            print(f"Input batch shape: {inputs.shape}")
-            print(f"Target batch shape: {targets.shape}")
-            break
+def prepare_data(config):
+    """Prepare data for training, validation, and testing.
+    
+    Args:
+        config: Configuration dictionary containing:
+            - data_path: Path to data file
+            - use_windows: Whether to use windowed data (default: False)
+            - window_size: Size of windows if use_windows is True (default: 50)
+            - Other standard config parameters...
+    
+    Returns:
+        train_loader, val_loader, test_loader: DataLoaders for each split
+        feature_scaler, target_scaler: Fitted scalers for features and targets
+    """
+    # Set random seed for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # Get configuration parameters
+    norm_strategy = config.get('normalization', 'standard')
+    use_windows = config.get('use_windows', False)  # Default to False - only use windows when explicitly requested
+    window_size = config.get('window_size', 50) if use_windows else None
+    
+    if norm_strategy not in ['standard', 'minmax']:
+        raise ValueError(f"Unknown normalization strategy: {norm_strategy}")
+    
+    # Load data
+    data = pd.read_csv(config['data_path'])
+    
+    # Filter for P9RT genotype
+    print(f"Total samples before filtering: {len(data)}")
+    data = data[data['genotype'] == 'P9RT'].copy()
+    print(f"Total samples after filtering for P9RT: {len(data)}")
+    
+    if len(data) == 0:
+        raise ValueError("No data found for genotype P9RT")
+    
+    # Filter frames to only include frames 400-1000 from each trial
+    data = filter_frames(data)
+    
+    # Verify data exists and has expected columns
+    if data.empty:
+        raise ValueError("Empty dataset")
+    
+    required_columns = ['x_vel', 'y_vel', 'z_vel'] + config['joint_angle_columns']
+    missing_columns = set(required_columns) - set(data.columns)
+    if missing_columns:
+        raise ValueError(f"Missing required columns: {missing_columns}")
+    
+    # Calculate enhanced features
+    features = calculate_enhanced_features(data, config)
+    
+    # Select only the specified velocity features
+    selected_features = config['velocity_features']
+    if not all(feat in features.columns for feat in selected_features):
+        raise ValueError("Not all specified velocity features are available")
+    features = features[selected_features]
+    
+    # Select only the specified joint angles
+    joint_angles = data[config['joint_angle_columns']]
+    
+    # Use correct trial length after filtering (600 frames per trial)
+    trial_length = 600  # After filtering frames 400-1000
+    num_trials = len(features) // trial_length
+    
+    # Verify data length
+    if len(features) % trial_length != 0:
+        raise ValueError(f"Data length ({len(features)}) is not a multiple of trial_length ({trial_length})")
+    
+    print(f"\nTotal number of trials: {num_trials}")
+    
+    # Create trial indices and shuffle
+    trial_indices = np.arange(num_trials)
+    np.random.seed(42)  # For reproducible splits
+    np.random.shuffle(trial_indices)
+    
+    # Fixed test size of 12 trials
+    test_trials = 12
+    
+    # Ensure we have enough trials
+    if num_trials < 24:  # Need at least 24 trials (12 test + minimum for train/val)
+        raise ValueError(f"Not enough trials ({num_trials}). Need at least 24 trials for proper splitting.")
+    
+    # Calculate remaining trials for train/val
+    remaining_trials = num_trials - test_trials
+    train_trials = int(0.8 * remaining_trials)  # 80% of remaining for training
+    val_trials = remaining_trials - train_trials  # Rest for validation
+    
+    # Split indices
+    train_indices = trial_indices[:train_trials]
+    val_indices = trial_indices[train_trials:train_trials + val_trials]
+    test_indices = trial_indices[-test_trials:]  # Take last 12 trials for test
+    
+    print(f"\nNumber of trials in each split:")
+    print(f"Train: {len(train_indices)} trials")
+    print(f"Val: {len(val_indices)} trials")
+    print(f"Test: {len(test_indices)} trials (fixed at 12)")
+    
+    # Reshape to trials
+    features_array = features.values.reshape(num_trials, trial_length, -1)
+    targets_array = joint_angles.values.reshape(num_trials, trial_length, -1)
+    
+    print(f"\nTrial shape: {features_array.shape}")
+    print(f"Number of input features: {features_array.shape[-1]}")
+    print(f"Number of target joints: {targets_array.shape[-1]}")
+    
+    # Standardize features and targets using only training data
+    feature_scaler = StandardScaler()
+    target_scaler = StandardScaler()
+    
+    # Fit scalers on training data only
+    train_features_2d = features_array[train_indices].reshape(-1, features_array.shape[-1])
+    train_targets_2d = targets_array[train_indices].reshape(-1, targets_array.shape[-1])
+    
+    # Check for NaN or infinite values before scaling
+    if np.any(~np.isfinite(train_features_2d)):
+        raise ValueError("Non-finite values found in training features")
+    if np.any(~np.isfinite(train_targets_2d)):
+        raise ValueError("Non-finite values found in training targets")
+    
+    feature_scaler.fit(train_features_2d)
+    target_scaler.fit(train_targets_2d)
+    
+    # Transform all data
+    features_array_scaled = np.zeros_like(features_array)
+    targets_array_scaled = np.zeros_like(targets_array)
+    
+    # Apply scaling to each split separately
+    for trial_idx in range(num_trials):
+        features_array_scaled[trial_idx] = feature_scaler.transform(features_array[trial_idx])
+        targets_array_scaled[trial_idx] = target_scaler.transform(targets_array[trial_idx])
+    
+    # Check for NaN or infinite values after scaling
+    if np.any(~np.isfinite(features_array_scaled)):
+        raise ValueError("Non-finite values found after scaling features")
+    if np.any(~np.isfinite(targets_array_scaled)):
+        raise ValueError("Non-finite values found after scaling targets")
+    
+    # Create datasets for each split
+    train_features = features_array_scaled[train_indices]
+    train_targets = targets_array_scaled[train_indices]
+    val_features = features_array_scaled[val_indices]
+    val_targets = targets_array_scaled[val_indices]
+    test_features = features_array_scaled[test_indices]
+    test_targets = targets_array_scaled[test_indices]
+    
+    if use_windows:
+        print(f"\nCreating windowed datasets with window_size={window_size}")
+        # Create windows for each split
+        train_features, train_targets = create_past_windows_per_trial(
+            train_features, train_targets, window_size
+        )
+        val_features, val_targets = create_past_windows_per_trial(
+            val_features, val_targets, window_size
+        )
+        test_features, test_targets = create_past_windows_per_trial(
+            test_features, test_targets, window_size
+        )
+        print("\nWindow dataset sizes (windows x window_size x features):")
+    else:
+        print("\nUsing full sequences (no windowing)")
+        print("\nDataset sizes (trials x frames x features):")
+    
+    # Convert to tensors
+    train_features = torch.FloatTensor(train_features)
+    train_targets = torch.FloatTensor(train_targets)
+    val_features = torch.FloatTensor(val_features)
+    val_targets = torch.FloatTensor(val_targets)
+    test_features = torch.FloatTensor(test_features)
+    test_targets = torch.FloatTensor(test_targets)
+    
+    print(f"Train: {train_features.shape}")
+    print(f"Val: {val_features.shape}")
+    print(f"Test: {test_features.shape}")
+    
+    # Create datasets
+    train_dataset = TensorDataset(train_features, train_targets)
+    val_dataset = TensorDataset(val_features, val_targets)
+    test_dataset = TensorDataset(test_features, test_targets)
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        pin_memory=True
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        pin_memory=True
+    )
+    
+    return train_loader, val_loader, test_loader, feature_scaler, target_scaler
 
-        return train_loader, val_loader, test_loader
-
-    except Exception as e:
-        print(f"Error in prepare_data: {e}")
-        return None, None, None
+def create_windows(features, targets, window_size):
+    """Create non-overlapping windows from features and targets."""
+    num_trials, trial_length, num_features = features.shape
+    num_windows = trial_length // window_size
+    
+    # Reshape to create windows
+    windowed_features = features[:, :num_windows * window_size].reshape(
+        num_trials * num_windows, window_size, num_features
+    )
+    windowed_targets = targets[:, :num_windows * window_size].reshape(
+        num_trials * num_windows, window_size, -1
+    )
+    
+    return windowed_features, windowed_targets

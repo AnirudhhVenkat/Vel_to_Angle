@@ -44,10 +44,9 @@ class TransformerModel(nn.Module):
         encoder_layers = nn.TransformerEncoderLayer(
             d_model=self.hidden_size,
             nhead=nhead,
-            dim_feedforward=self.hidden_size * 2,  # Reduced from 4x to 2x
+            dim_feedforward=self.hidden_size * 2,
             dropout=dropout,
             batch_first=True
-            # Remove norm_first parameter as it's not supported in some PyTorch versions
         )
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layers, 
@@ -55,7 +54,7 @@ class TransformerModel(nn.Module):
             norm=nn.LayerNorm(self.hidden_size)
         )
         
-        # Progressive output projection
+        # Progressive output projection for each timestep
         projection_layers = []
         prev_size = self.hidden_size
         for hidden_size in reversed(hidden_sizes[:-1]):
@@ -73,7 +72,7 @@ class TransformerModel(nn.Module):
         
         # Initialize parameters with smaller values
         self._init_parameters()
-
+    
     def _init_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
@@ -97,10 +96,8 @@ class TransformerModel(nn.Module):
         # Apply transformer encoder with padding mask
         x = self.transformer_encoder(x, src_key_padding_mask=padding_mask)
         
-        # Take mean of sequence for more stable training
-        x = x.mean(dim=1)
-        
-        # Project to output dimension
+        # Project each timestep to output dimension
+        # Shape: (batch, seq_len, hidden_size) -> (batch, seq_len, output_size)
         output = self.output_projection(x)
         
         return output
