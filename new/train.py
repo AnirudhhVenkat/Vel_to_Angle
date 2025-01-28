@@ -1063,12 +1063,9 @@ def train_unsupervised_transformer(config):
                     batch_features = batch_features.float().to(device)
                     batch_targets = batch_targets.float().to(device)
                     
-                    with torch.cuda.amp.autocast(device_type='cuda', enabled=use_amp):
+                    with torch.cuda.amp.autocast(enabled=use_amp):
                         outputs = model(batch_features)
-                        if model.pretraining:
-                            loss, l1_loss, dtw_loss = combined_loss(outputs, batch_features)
-                        else:
-                            loss, l1_loss, dtw_loss = combined_loss(outputs, batch_targets)
+                        loss = dtw_criterion(outputs, batch_targets)
                     
                     val_losses.append(loss.item())
                     val_l1_losses.append(l1_loss.item())
@@ -1156,34 +1153,23 @@ def train_unsupervised_transformer(config):
         model.set_pretraining(False)
         
         # Generate and save final predictions plot
-        all_predictions = []
-        all_targets = []
-        
-        with torch.no_grad():
-            for batch_features, batch_targets in test_loader:
-                batch_features = batch_features.float()
-                if torch.cuda.is_available():
-                    batch_features = batch_features.cuda()
-                
-                outputs = model(batch_features)
-                predictions = outputs.cpu().numpy()
-                targets = batch_targets.numpy()
-                
-                all_predictions.append(predictions)
-                all_targets.append(targets)
-        
-        all_predictions = np.concatenate(all_predictions, axis=0)
-        all_targets = np.concatenate(all_targets, axis=0)
-        
-        # Plot and save final predictions
         metrics = plot_predictions(
-            all_predictions, 
-            all_targets, 
+            test_predictions, 
+            test_targets, 
             joint_names=config['joint_angle_columns'],
             model_name=model_name,
             use_windows=config['use_windows'],
             window_size=config['window_size']
         )
+        
+        # Log final metrics
+        log_wandb({
+            'test/loss': test_loss,
+            'test/metrics': metrics,
+            'training/total_epochs': config['num_epochs'],
+            'training/best_epoch': best_finetune_epoch,
+            'training/best_val_loss': best_finetune_loss,
+        })
         
         # Save final model and results
         final_results = {
@@ -1348,6 +1334,9 @@ def objective_unsupervised(trial, base_config, trial_num, total_trials):
 
 def pretrain_transformer(model, train_loader, val_loader, device, config, num_epochs=100, patience=10, trial_dir=None, plots_dir=None, run_name=None):
     """Pretrain the transformer model using reconstruction loss."""
+    # Ensure model is in pretraining mode
+    model.set_pretraining(True)
+    
     dtw_criterion = DTWLoss().to(device)
     
     optimizer = torch.optim.AdamW(
@@ -1422,7 +1411,7 @@ def pretrain_transformer(model, train_loader, val_loader, device, config, num_ep
                         'pretrain/train_loss': loss.item(),
                         'pretrain/train_mae_loss': dtw_criterion.last_losses['mae'],
                         'pretrain/train_dtw_loss': dtw_criterion.last_losses['dtw'],
-                        'pretrain/train_mse': dtw_criterion.last_losses['mse']  # MSE as metric
+                        'pretrain/train_mse': dtw_criterion.last_losses['mse']
                     })
                 
                 # Clean up memory
@@ -1472,33 +1461,18 @@ def pretrain_transformer(model, train_loader, val_loader, device, config, num_ep
             
             # Create and log learning curves plot to wandb
             if wandb.run is not None:
-                fig = plt.figure(figsize=(10, 6))
-                plt.plot(epochs, train_losses, label='Train Loss', marker='o')
-                plt.plot(epochs, val_losses, label='Validation Loss', marker='s')
-                plt.title('Learning Curves')
-                plt.xlabel('Epoch')
-                plt.ylabel('Loss')
-                plt.legend()
-                plt.grid(True)
-                
-                # Save plot locally
-                if plots_dir is not None:
-                    plt.savefig(plots_dir / f'{run_name}_learning_curves.png')
-                
-                # Log to wandb
                 wandb.log({
-                    "learning_curves": wandb.Image(fig),
-                    "train/loss": avg_train_loss,
-                    "val/loss": avg_val_loss,
-                    "train/mae": train_metric_avgs["train_mae_loss"],
-                    "train/dtw": train_metric_avgs["train_dtw_loss"],
-                    "train/mse": train_metric_avgs["train_mse_loss"],
-                    "val/mae": val_metric_avgs["val_mae_loss"],
-                    "val/dtw": val_metric_avgs["val_dtw_loss"],
-                    "val/mse": val_metric_avgs["val_mse_loss"],
-                    "epoch": epoch
+                    "pretrain/train_loss": avg_train_loss,
+                    "pretrain/val_loss": avg_val_loss,
+                    "pretrain/train_mae": train_metric_avgs["train_mae_loss"],
+                    "pretrain/train_dtw": train_metric_avgs["train_dtw_loss"],
+                    "pretrain/train_mse": train_metric_avgs["train_mse_loss"],
+                    "pretrain/val_mae": val_metric_avgs["val_mae_loss"],
+                    "pretrain/val_dtw": val_metric_avgs["val_dtw_loss"],
+                    "pretrain/val_mse": val_metric_avgs["val_mse_loss"],
+                    "pretrain/epoch": epoch,
+                    "pretrain/learning_rate": optimizer.param_groups[0]['lr']
                 })
-                plt.close()
             
             # Update learning rate
             scheduler.step(avg_val_loss)
@@ -1635,7 +1609,7 @@ def finetune_transformer(model, train_loader, val_loader, device, config, num_ep
                         'finetune/train_loss': loss.item(),
                         'finetune/train_mae_loss': dtw_criterion.last_losses['mae'],
                         'finetune/train_dtw_loss': dtw_criterion.last_losses['dtw'],
-                        'finetune/train_mse': dtw_criterion.last_losses['mse']  # MSE as metric
+                        'finetune/train_mse': dtw_criterion.last_losses['mse']
                     })
                 
                 # Clean up memory
@@ -1654,7 +1628,7 @@ def finetune_transformer(model, train_loader, val_loader, device, config, num_ep
                     batch_features = batch_features.float().to(device)
                     batch_targets = batch_targets.float().to(device)
                     
-                    with torch.cuda.amp.autocast(device_type='cuda', enabled=use_amp):
+                    with torch.cuda.amp.autocast(enabled=use_amp):
                         outputs = model(batch_features)
                         loss = dtw_criterion(outputs, batch_targets)
                     
@@ -1686,33 +1660,18 @@ def finetune_transformer(model, train_loader, val_loader, device, config, num_ep
             
             # Create and log learning curves plot to wandb
             if wandb.run is not None:
-                fig = plt.figure(figsize=(10, 6))
-                plt.plot(epochs, train_losses, label='Train Loss', marker='o')
-                plt.plot(epochs, val_losses, label='Validation Loss', marker='s')
-                plt.title('Learning Curves')
-                plt.xlabel('Epoch')
-                plt.ylabel('Loss')
-                plt.legend()
-                plt.grid(True)
-                
-                # Save plot locally
-                if plots_dir is not None:
-                    plt.savefig(plots_dir / f'{run_name}_learning_curves.png')
-                
-                # Log to wandb
                 wandb.log({
-                    "learning_curves": wandb.Image(fig),
-                    "train/loss": avg_train_loss,
-                    "val/loss": avg_val_loss,
-                    "train/mae": train_metric_avgs["train_mae_loss"],
-                    "train/dtw": train_metric_avgs["train_dtw_loss"],
-                    "train/mse": train_metric_avgs["train_mse_loss"],
-                    "val/mae": val_metric_avgs["val_mae_loss"],
-                    "val/dtw": val_metric_avgs["val_dtw_loss"],
-                    "val/mse": val_metric_avgs["val_mse_loss"],
-                    "epoch": epoch
+                    "finetune/train_loss": avg_train_loss,
+                    "finetune/val_loss": avg_val_loss,
+                    "finetune/train_mae": train_metric_avgs["train_mae_loss"],
+                    "finetune/train_dtw": train_metric_avgs["train_dtw_loss"],
+                    "finetune/train_mse": train_metric_avgs["train_mse_loss"],
+                    "finetune/val_mae": val_metric_avgs["val_mae_loss"],
+                    "finetune/val_dtw": val_metric_avgs["val_dtw_loss"],
+                    "finetune/val_mse": val_metric_avgs["val_mse_loss"],
+                    "finetune/epoch": epoch,
+                    "finetune/learning_rate": optimizer.param_groups[0]['lr']
                 })
-                plt.close()
             
             # Update learning rate
             scheduler.step(avg_val_loss)
