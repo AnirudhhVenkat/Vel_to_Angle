@@ -46,61 +46,49 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x.transpose(0, 1))
 
 class UnsupervisedTransformerModel(nn.Module):
-    def __init__(self, input_size, hidden_size=512, nhead=8, num_layers=4, dropout=0.1):
+    """Transformer model with pretraining and finetuning capabilities."""
+    def __init__(self, input_size, hidden_size, nhead, num_layers, dropout=0.1):
         super(UnsupervisedTransformerModel, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.nhead = nhead
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.pretraining = True
         
-        # Input embedding
-        self.input_embedding = nn.Linear(input_size, hidden_size)
-        
-        # Positional encoding is learned
-        self.pos_encoder = nn.Parameter(torch.randn(1, 1000, hidden_size))  # Max sequence length of 1000
-        
-        # Transformer encoder
-        encoder_layers = nn.TransformerEncoderLayer(
+        # Encoder
+        self.input_proj = nn.Linear(input_size, hidden_size)
+        encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_size,
             nhead=nhead,
             dim_feedforward=hidden_size * 4,
             dropout=dropout,
             batch_first=True
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
         
-        # Output layers for pretraining (reconstruct input) and finetuning (predict angles)
-        self.pretraining_output = nn.Linear(hidden_size, input_size)  # Reconstruct input features
-        self.finetuning_output = nn.Linear(hidden_size, 18)  # Predict 18 flexion angles
-        
-        # Training mode flag
-        self.pretraining = True
-        
+        # Output projections for pretraining (input reconstruction) and finetuning (joint angles)
+        self.pretrain_output = nn.Linear(hidden_size, input_size)  # Projects back to input size (10)
+        self.finetune_output = nn.Linear(hidden_size, 18)  # Projects to output size (18 joint angles)
+    
     def forward(self, x):
-        """
-        Forward pass of the model.
-        Args:
-            x: Input tensor of shape (batch_size, seq_len, input_size)
-        Returns:
-            Output tensor of shape (batch_size, seq_len, output_size)
-            where output_size is input_size during pretraining or 18 during finetuning
-        """
-        # Input embedding
-        x = self.input_embedding(x)
-        
-        # Add positional encoding
-        seq_len = x.size(1)
-        x = x + self.pos_encoder[:, :seq_len, :]
-        
-        # Transformer encoder
+        # Input projection and transformer encoding
+        x = self.input_proj(x)
         x = self.transformer_encoder(x)
         
-        # Output layer based on mode
+        # Output projection based on mode
         if self.pretraining:
-            return self.pretraining_output(x)  # Reconstruct input
+            return self.pretrain_output(x)  # Reconstruct input (10 dimensions)
         else:
-            return self.finetuning_output(x)  # Predict angles
+            return self.finetune_output(x)  # Predict joint angles (18 dimensions)
     
     def set_pretraining(self, mode=True):
         """Set the model to pretraining or finetuning mode."""
         self.pretraining = mode
-        self.train()  # Ensure model is in training mode
+        self.train()  # Set to training mode
 
 class LearnablePositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=2000):

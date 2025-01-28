@@ -40,8 +40,8 @@ class DTWLoss(nn.Module):
     """Dynamic Time Warping loss function using FastDTW."""
     def __init__(self):
         super(DTWLoss, self).__init__()
-        self.l1_loss = nn.L1Loss()
-        self.mse_loss = nn.MSELoss()
+        self.l1_loss = nn.L1Loss()  # MAE loss
+        self.mse_loss = nn.MSELoss()  # For metrics only
         self.batch_count = 0
         self.radius = 10  # Radius for FastDTW
     
@@ -62,10 +62,12 @@ class DTWLoss(nn.Module):
             pred: Predicted sequences (batch_size, seq_len, features)
             target: Target sequences (batch_size, seq_len, features)
         Returns:
-            Combined loss value
+            Combined loss value (MAE + DTW)
         """
-        # Calculate L1 and MSE losses on full batch (fast)
-        l1_loss = self.l1_loss(pred, target)
+        # Calculate MAE loss on full batch
+        mae_loss = self.l1_loss(pred, target)
+        
+        # Calculate MSE for metrics only
         mse_loss = self.mse_loss(pred, target)
         
         # For DTW, only use first sequence from batch
@@ -75,16 +77,17 @@ class DTWLoss(nn.Module):
         self.batch_count += 1
         if self.batch_count % 100 == 0:
             print(f"\nProcessed {self.batch_count} batches in DTWLoss")
-            print(f"Current losses - L1: {l1_loss.item():.4f}, MSE: {mse_loss.item():.4f}, DTW: {dtw_loss.item():.4f}")
+            print(f"Current losses - MAE: {mae_loss.item():.4f}, DTW: {dtw_loss.item():.4f}")
+            print(f"MSE (metric): {mse_loss.item():.4f}")
         
-        # Combine losses with more weight on L1 and MSE (fast) and less on DTW (slow)
-        final_loss = 0.45 * l1_loss + 0.45 * mse_loss + 0.1 * dtw_loss
+        # Combine losses with equal weight on MAE and DTW
+        final_loss = 0.5 * mae_loss + 0.5 * dtw_loss
         
         # Store individual losses for logging
         self.last_losses = {
-            'l1': l1_loss.item(),
-            'mse': mse_loss.item(),
+            'mae': mae_loss.item(),
             'dtw': dtw_loss.item(),
+            'mse': mse_loss.item(),  # Store MSE as a metric
             'total': final_loss.item()
         }
         
@@ -840,8 +843,8 @@ def train_unsupervised_transformer(config):
             weight_decay=pretrain_config['weight_decay']
         )
         
-        # Enable automatic mixed precision
-        use_amp = torch.cuda.is_available()
+        # Enable gradient scaler and AMP for mixed precision
+        use_amp = torch.cuda.is_available() and hasattr(torch.cuda.amp, 'autocast')
         scaler = torch.cuda.amp.GradScaler() if use_amp else None
         
         best_pretrain_loss = float('inf')
@@ -1057,12 +1060,8 @@ def train_unsupervised_transformer(config):
             
             with torch.no_grad():
                 for batch_features, batch_targets in val_loader:
-                    batch_features = batch_features.float()
-                    batch_targets = batch_targets.float()
-                    
-                    if torch.cuda.is_available():
-                        batch_features = batch_features.cuda()
-                        batch_targets = batch_targets.cuda()
+                    batch_features = batch_features.float().to(device)
+                    batch_targets = batch_targets.float().to(device)
                     
                     with torch.cuda.amp.autocast(device_type='cuda', enabled=use_amp):
                         outputs = model(batch_features)
@@ -1097,20 +1096,35 @@ def train_unsupervised_transformer(config):
                     'finetune/val_l1_loss': avg_val_l1,
                     'finetune/val_dtw_loss': avg_val_dtw,
                     'finetune/epoch': epoch,
-                    'finetune/learning_rate': optimizer.param_groups[0]['lr']
-                }, commit=True)
+                    'finetune/learning_rate': optimizer.param_groups[0]['lr'],
+                    **{f'finetune/{k}': v for k, v in {
+                        'train_mae_loss': avg_train_l1,
+                        'train_dtw_loss': avg_train_dtw,
+                        'train_mse_loss': avg_train_dtw
+                    }.items()},
+                    **{f'finetune/{k}': v for k, v in {
+                        'val_mae_loss': avg_val_l1,
+                        'val_dtw_loss': avg_val_dtw,
+                        'val_mse_loss': avg_val_dtw
+                    }.items()}
+                })
             
+            # Print epoch summary
+            print(f'\nEpoch {epoch+1}/{config.get("finetune_epochs", 150)}:')
+            print(f'Train Loss: {avg_train_loss:.4f} (MAE: {avg_train_l1:.4f}, '
+                  f'DTW: {avg_train_dtw:.4f}, MSE: {avg_train_dtw:.4f})')
+            print(f'Val Loss: {avg_val_loss:.4f} (MAE: {avg_val_l1:.4f}, '
+                  f'DTW: {avg_val_dtw:.4f}, MSE: {avg_val_dtw:.4f})')
+            print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
+            
+            # Update learning rate
             scheduler.step(avg_val_loss)
             
-            print(f'Finetune Epoch {epoch+1}:')
-            print(f'  Train Loss: {avg_train_loss:.6f}')
-            print(f'  Val Loss: {avg_val_loss:.6f}')
-            
-            # Save only the best finetuned model
+            # Save best model
             if avg_val_loss < best_finetune_loss:
                 best_finetune_loss = avg_val_loss
                 best_finetune_epoch = epoch
-                best_finetune_state = {k: v.cpu() for k, v in model.state_dict().items()}
+                best_finetune_state = model.state_dict()
                 patience_counter = 0
                 
                 # Save best finetuned model
@@ -1133,7 +1147,7 @@ def train_unsupervised_transformer(config):
             else:
                 patience_counter += 1
                 if patience_counter >= config.get('patience', 15):
-                    print(f'Early stopping finetuning after {epoch+1} epochs')
+                    print(f'\nEarly stopping triggered after {epoch+1} epochs')
                     break
         
         # Use the best finetuned model for final evaluation
@@ -1342,6 +1356,10 @@ def pretrain_transformer(model, train_loader, val_loader, device, config, num_ep
         weight_decay=config['weight_decay']
     )
     
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5, verbose=True
+    )
+    
     best_loss = float('inf')
     best_epoch = -1
     best_state = None
@@ -1352,136 +1370,193 @@ def pretrain_transformer(model, train_loader, val_loader, device, config, num_ep
     val_losses = []
     epochs = []
     
-    # Enable gradient scaler for mixed precision
-    scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
+    # Enable gradient scaler and AMP for mixed precision
+    use_amp = torch.cuda.is_available() and hasattr(torch.cuda.amp, 'autocast')
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
     
-    for epoch in range(num_epochs):
-        model.train()
-        epoch_train_losses = []
-        train_metrics = defaultdict(list)
-        
-        # Training loop with progress bar
-        train_loop = tqdm(train_loader, desc=f'Pretrain Epoch {epoch+1}')
-        for batch_idx, (batch_features, _) in enumerate(train_loop):
-            batch_features = batch_features.float().to(device)
+    try:
+        for epoch in range(num_epochs):
+            model.train()
+            epoch_train_losses = []
+            train_metrics = defaultdict(list)
             
-            optimizer.zero_grad(set_to_none=True)
-            
-            with torch.amp.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
-                outputs = model(batch_features)
-                loss = dtw_criterion(outputs, batch_features)
-            
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                optimizer.step()
-            
-            # Store losses for logging
-            epoch_train_losses.append(loss.item())
-            for loss_name, loss_value in dtw_criterion.last_losses.items():
-                train_metrics[f'train_{loss_name}_loss'].append(loss_value)
-            
-            # Update progress bar
-            train_loop.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'l1': f'{dtw_criterion.last_losses["l1"]:.4f}',
-                'mse': f'{dtw_criterion.last_losses["mse"]:.4f}',
-                'dtw': f'{dtw_criterion.last_losses["dtw"]:.4f}'
-            })
-            
-            # Log to wandb every 50 batches
-            if wandb.run is not None and batch_idx % 50 == 0:
-                wandb.log({
-                    'pretrain/batch': batch_idx + epoch * len(train_loader),
-                    'pretrain/train_loss': loss.item(),
-                    'pretrain/train_l1_loss': dtw_criterion.last_losses['l1'],
-                    'pretrain/train_mse_loss': dtw_criterion.last_losses['mse'],
-                    'pretrain/train_dtw_loss': dtw_criterion.last_losses['dtw']
-                })
-            
-            # Clean up memory
-            del outputs, loss
-            if scaler is not None:
-                torch.cuda.empty_cache()
-        
-        # Validation loop
-        model.eval()
-        epoch_val_losses = []
-        with torch.no_grad():
-            val_loop = tqdm(val_loader, desc='Validation')
-            for batch_features, batch_targets in val_loop:
-                batch_features = batch_features.float()
-                batch_targets = batch_targets.float()
+            # Training loop with progress bar
+            train_loop = tqdm(train_loader, desc=f'Pretrain Epoch {epoch+1}')
+            for batch_idx, (batch_features, _) in enumerate(train_loop):
+                batch_features = batch_features.float().to(device)
                 
-                if torch.cuda.is_available():
-                    batch_features = batch_features.cuda()
-                    batch_targets = batch_targets.cuda()
+                optimizer.zero_grad(set_to_none=True)
                 
-                with torch.cuda.amp.autocast(device_type='cuda', enabled=use_amp):
+                with torch.cuda.amp.autocast(enabled=use_amp):
                     outputs = model(batch_features)
                     loss = dtw_criterion(outputs, batch_features)
                 
-                epoch_val_losses.append(loss.item())
-                val_loop.set_postfix({'loss': f'{loss.item():.4f}'})
-        
-        # Calculate average losses
-        avg_train_loss = np.mean(epoch_train_losses)
-        avg_val_loss = np.mean(epoch_val_losses)
-        
-        # Store losses for plotting
-        train_losses.append(avg_train_loss)
-        val_losses.append(avg_val_loss)
-        epochs.append(epoch)
-        
-        # Create and log learning curves plot to wandb
-        if wandb.run is not None:
-            fig = plt.figure(figsize=(10, 6))
-            plt.plot(epochs, train_losses, label='Train Loss')
-            plt.plot(epochs, val_losses, label='Validation Loss')
-            plt.title('Pretraining Learning Curves')
-            plt.xlabel('Epoch')
-            plt.ylabel('Loss')
-            plt.legend()
-            plt.grid(True)
-            wandb.log({"pretrain/learning_curves": wandb.Image(fig)})
-            plt.close()
-        
-        # Log metrics
-        if wandb.run is not None:
-            wandb.log({
-                'pretrain/epoch': epoch,
-                'pretrain/train_loss': avg_train_loss,
-                'pretrain/val_loss': avg_val_loss,
-            })
-        
-        # Save best model
-        if avg_val_loss < best_loss:
-            best_loss = avg_val_loss
-            best_epoch = epoch
-            best_state = {k: v.cpu() for k, v in model.state_dict().items()}
-            patience_counter = 0
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                    optimizer.step()
+                
+                # Store losses for logging
+                epoch_train_losses.append(loss.item())
+                for loss_name, loss_value in dtw_criterion.last_losses.items():
+                    train_metrics[f'train_{loss_name}_loss'].append(loss_value)
+                
+                # Update progress bar
+                train_loop.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'mae': f'{dtw_criterion.last_losses["mae"]:.4f}',
+                    'dtw': f'{dtw_criterion.last_losses["dtw"]:.4f}',
+                    'mse': f'{dtw_criterion.last_losses["mse"]:.4f}'
+                })
+                
+                # Log to wandb every 50 batches
+                if wandb.run is not None and batch_idx % 50 == 0:
+                    wandb.log({
+                        'pretrain/batch': batch_idx + epoch * len(train_loader),
+                        'pretrain/train_loss': loss.item(),
+                        'pretrain/train_mae_loss': dtw_criterion.last_losses['mae'],
+                        'pretrain/train_dtw_loss': dtw_criterion.last_losses['dtw'],
+                        'pretrain/train_mse': dtw_criterion.last_losses['mse']  # MSE as metric
+                    })
+                
+                # Clean up memory
+                del outputs, loss
+                if scaler is not None:
+                    torch.cuda.empty_cache()
             
-            # Save best model state
-            if trial_dir is not None:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': best_state,
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': best_loss,
-                }, trial_dir / 'best_pretrain_model.pth')
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f'Early stopping pretraining after {epoch+1} epochs')
-                break
+            # Validation loop
+            model.eval()
+            epoch_val_losses = []
+            val_metrics = defaultdict(list)
+            
+            with torch.no_grad():
+                val_loop = tqdm(val_loader, desc='Validation')
+                for batch_features, _ in val_loop:
+                    batch_features = batch_features.float().to(device)
+                    
+                    with torch.cuda.amp.autocast(enabled=use_amp):
+                        outputs = model(batch_features)
+                        loss = dtw_criterion(outputs, batch_features)
+                    
+                    # Store losses for logging
+                    epoch_val_losses.append(loss.item())
+                    for loss_name, loss_value in dtw_criterion.last_losses.items():
+                        val_metrics[f'val_{loss_name}_loss'].append(loss_value)
+                    
+                    # Update validation progress bar
+                    val_loop.set_postfix({
+                        'loss': f'{loss.item():.4f}',
+                        'mae': f'{dtw_criterion.last_losses["mae"]:.4f}',
+                        'dtw': f'{dtw_criterion.last_losses["dtw"]:.4f}',
+                        'mse': f'{dtw_criterion.last_losses["mse"]:.4f}'
+                    })
+            
+            # Calculate average losses
+            avg_train_loss = np.mean(epoch_train_losses)
+            avg_val_loss = np.mean(epoch_val_losses)
+            
+            # Calculate average metrics
+            train_metric_avgs = {name: np.mean(values) for name, values in train_metrics.items()}
+            val_metric_avgs = {name: np.mean(values) for name, values in val_metrics.items()}
+            
+            # Store losses for plotting
+            train_losses.append(avg_train_loss)
+            val_losses.append(avg_val_loss)
+            epochs.append(epoch)
+            
+            # Create and log learning curves plot to wandb
+            if wandb.run is not None:
+                fig = plt.figure(figsize=(10, 6))
+                plt.plot(epochs, train_losses, label='Train Loss', marker='o')
+                plt.plot(epochs, val_losses, label='Validation Loss', marker='s')
+                plt.title('Learning Curves')
+                plt.xlabel('Epoch')
+                plt.ylabel('Loss')
+                plt.legend()
+                plt.grid(True)
+                
+                # Save plot locally
+                if plots_dir is not None:
+                    plt.savefig(plots_dir / f'{run_name}_learning_curves.png')
+                
+                # Log to wandb
+                wandb.log({
+                    "learning_curves": wandb.Image(fig),
+                    "train/loss": avg_train_loss,
+                    "val/loss": avg_val_loss,
+                    "train/mae": train_metric_avgs["train_mae_loss"],
+                    "train/dtw": train_metric_avgs["train_dtw_loss"],
+                    "train/mse": train_metric_avgs["train_mse_loss"],
+                    "val/mae": val_metric_avgs["val_mae_loss"],
+                    "val/dtw": val_metric_avgs["val_dtw_loss"],
+                    "val/mse": val_metric_avgs["val_mse_loss"],
+                    "epoch": epoch
+                })
+                plt.close()
+            
+            # Update learning rate
+            scheduler.step(avg_val_loss)
+            
+            # Log metrics
+            if wandb.run is not None:
+                wandb.log({
+                    'pretrain/epoch': epoch,
+                    'pretrain/train_loss': avg_train_loss,
+                    'pretrain/val_loss': avg_val_loss,
+                    'pretrain/learning_rate': optimizer.param_groups[0]['lr'],
+                    **{f'pretrain/{k}': v for k, v in train_metric_avgs.items()},
+                    **{f'pretrain/{k}': v for k, v in val_metric_avgs.items()}
+                })
+            
+            # Print epoch summary
+            print(f'\nEpoch {epoch+1}/{num_epochs}:')
+            print(f'Train Loss: {avg_train_loss:.4f} (MAE: {train_metric_avgs["train_mae_loss"]:.4f}, '
+                  f'DTW: {train_metric_avgs["train_dtw_loss"]:.4f}, MSE: {train_metric_avgs["train_mse_loss"]:.4f})')
+            print(f'Val Loss: {avg_val_loss:.4f} (MAE: {val_metric_avgs["val_mae_loss"]:.4f}, '
+                  f'DTW: {val_metric_avgs["val_dtw_loss"]:.4f}, MSE: {val_metric_avgs["val_mse_loss"]:.4f})')
+            print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
+            
+            # Save best model
+            if avg_val_loss < best_loss:
+                best_loss = avg_val_loss
+                best_epoch = epoch
+                best_state = model.state_dict()
+                patience_counter = 0
+                
+                # Save best model state
+                if trial_dir is not None:
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': best_state,
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'loss': best_loss,
+                        'metrics': {
+                            'train': train_metric_avgs,
+                            'val': val_metric_avgs
+                        }
+                    }, trial_dir / 'best_pretrain_model.pth')
+                    print(f"\nSaved new best model at epoch {epoch+1} with val_loss: {best_loss:.4f}")
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f'\nEarly stopping triggered after {epoch+1} epochs')
+                    break
+        
+        # Load best model state
+        model.load_state_dict(best_state)
+        return best_loss, best_epoch, best_state
     
-    return best_loss, best_epoch, best_state
+    except Exception as e:
+        print(f"Error during pretraining: {str(e)}")
+        traceback.print_exc()
+        return float('inf'), -1, None
 
 def finetune_transformer(model, train_loader, val_loader, device, config, num_epochs=150, patience=10, trial_dir=None, plots_dir=None, run_name=None):
     """Finetune the transformer model for the target task."""
@@ -1507,103 +1582,195 @@ def finetune_transformer(model, train_loader, val_loader, device, config, num_ep
     val_losses = []
     epochs = []
     
-    for epoch in range(num_epochs):
-        model.train()
-        epoch_train_losses = []
-        
-        # Training loop with progress bar
-        train_loop = tqdm(train_loader, desc=f'Finetune Epoch {epoch+1}')
-        for batch_features, batch_targets in train_loop:
-            batch_features = batch_features.float().to(device)
-            batch_targets = batch_targets.float().to(device)
+    # Enable gradient scaler and AMP for mixed precision
+    use_amp = torch.cuda.is_available() and hasattr(torch.cuda.amp, 'autocast')
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    
+    try:
+        for epoch in range(num_epochs):
+            model.train()
+            epoch_train_losses = []
+            train_metrics = defaultdict(list)
             
-            optimizer.zero_grad(set_to_none=True)
-            
-            with torch.amp.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
-                outputs = model(batch_features)
-                loss = dtw_criterion(outputs, batch_targets)
-            
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-            optimizer.step()
-            
-            epoch_train_losses.append(loss.item())
-            train_loop.set_postfix({'loss': f'{loss.item():.4f}'})
-        
-        # Validation loop
-        model.eval()
-        epoch_val_losses = []
-        with torch.no_grad():
-            val_loop = tqdm(val_loader, desc='Validation')
-            for batch_features, batch_targets in val_loop:
+            # Training loop with progress bar
+            train_loop = tqdm(train_loader, desc=f'Finetune Epoch {epoch+1}')
+            for batch_idx, (batch_features, batch_targets) in enumerate(train_loop):
                 batch_features = batch_features.float().to(device)
                 batch_targets = batch_targets.float().to(device)
                 
-                with torch.amp.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
+                optimizer.zero_grad(set_to_none=True)
+                
+                with torch.cuda.amp.autocast(enabled=use_amp):
                     outputs = model(batch_features)
                     loss = dtw_criterion(outputs, batch_targets)
                 
-                epoch_val_losses.append(loss.item())
-                val_loop.set_postfix({'loss': f'{loss.item():.4f}'})
-        
-        # Calculate average losses
-        avg_train_loss = np.mean(epoch_train_losses)
-        avg_val_loss = np.mean(epoch_val_losses)
-        
-        # Store losses for plotting
-        train_losses.append(avg_train_loss)
-        val_losses.append(avg_val_loss)
-        epochs.append(epoch)
-        
-        # Create and log learning curves plot to wandb
-        if wandb.run is not None:
-            fig = plt.figure(figsize=(10, 6))
-            plt.plot(epochs, train_losses, label='Train Loss')
-            plt.plot(epochs, val_losses, label='Validation Loss')
-            plt.title('Finetuning Learning Curves')
-            plt.xlabel('Epoch')
-            plt.ylabel('Loss')
-            plt.legend()
-            plt.grid(True)
-            wandb.log({"finetune/learning_curves": wandb.Image(fig)})
-            plt.close()
-        
-        # Update learning rate
-        scheduler.step(avg_val_loss)
-        
-        # Log metrics
-        if wandb.run is not None:
-            wandb.log({
-                'finetune/epoch': epoch,
-                'finetune/train_loss': avg_train_loss,
-                'finetune/val_loss': avg_val_loss,
-                'finetune/learning_rate': optimizer.param_groups[0]['lr']
-            })
-        
-        # Save best model
-        if avg_val_loss < best_loss:
-            best_loss = avg_val_loss
-            best_epoch = epoch
-            best_state = model.state_dict()
-            patience_counter = 0
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                    optimizer.step()
+                
+                # Store losses for logging
+                epoch_train_losses.append(loss.item())
+                for loss_name, loss_value in dtw_criterion.last_losses.items():
+                    train_metrics[f'train_{loss_name}_loss'].append(loss_value)
+                
+                # Update progress bar
+                train_loop.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'mae': f'{dtw_criterion.last_losses["mae"]:.4f}',
+                    'dtw': f'{dtw_criterion.last_losses["dtw"]:.4f}',
+                    'mse': f'{dtw_criterion.last_losses["mse"]:.4f}'
+                })
+                
+                # Log to wandb every 50 batches
+                if wandb.run is not None and batch_idx % 50 == 0:
+                    wandb.log({
+                        'finetune/batch': batch_idx + epoch * len(train_loader),
+                        'finetune/train_loss': loss.item(),
+                        'finetune/train_mae_loss': dtw_criterion.last_losses['mae'],
+                        'finetune/train_dtw_loss': dtw_criterion.last_losses['dtw'],
+                        'finetune/train_mse': dtw_criterion.last_losses['mse']  # MSE as metric
+                    })
+                
+                # Clean up memory
+                del outputs, loss
+                if scaler is not None:
+                    torch.cuda.empty_cache()
             
-            # Save best model state
-            if trial_dir is not None:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': best_state,
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': best_loss,
-                }, trial_dir / 'best_finetune_model.pth')
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f'Early stopping finetuning after {epoch+1} epochs')
-                break
+            # Validation loop
+            model.eval()
+            epoch_val_losses = []
+            val_metrics = defaultdict(list)
+            
+            with torch.no_grad():
+                val_loop = tqdm(val_loader, desc='Validation')
+                for batch_features, batch_targets in val_loop:
+                    batch_features = batch_features.float().to(device)
+                    batch_targets = batch_targets.float().to(device)
+                    
+                    with torch.cuda.amp.autocast(device_type='cuda', enabled=use_amp):
+                        outputs = model(batch_features)
+                        loss = dtw_criterion(outputs, batch_targets)
+                    
+                    # Store losses for logging
+                    epoch_val_losses.append(loss.item())
+                    for loss_name, loss_value in dtw_criterion.last_losses.items():
+                        val_metrics[f'val_{loss_name}_loss'].append(loss_value)
+                    
+                    # Update validation progress bar
+                    val_loop.set_postfix({
+                        'loss': f'{loss.item():.4f}',
+                        'mae': f'{dtw_criterion.last_losses["mae"]:.4f}',
+                        'dtw': f'{dtw_criterion.last_losses["dtw"]:.4f}',
+                        'mse': f'{dtw_criterion.last_losses["mse"]:.4f}'
+                    })
+            
+            # Calculate average losses
+            avg_train_loss = np.mean(epoch_train_losses)
+            avg_train_l1 = np.mean(train_metrics['train_mae_loss'])
+            avg_train_dtw = np.mean(train_metrics['train_dtw_loss'])
+            avg_val_loss = np.mean(epoch_val_losses)
+            avg_val_l1 = np.mean(val_metrics['val_mae_loss'])
+            avg_val_dtw = np.mean(val_metrics['val_dtw_loss'])
+            
+            # Store losses for plotting
+            train_losses.append(avg_train_loss)
+            val_losses.append(avg_val_loss)
+            epochs.append(epoch)
+            
+            # Create and log learning curves plot to wandb
+            if wandb.run is not None:
+                fig = plt.figure(figsize=(10, 6))
+                plt.plot(epochs, train_losses, label='Train Loss', marker='o')
+                plt.plot(epochs, val_losses, label='Validation Loss', marker='s')
+                plt.title('Learning Curves')
+                plt.xlabel('Epoch')
+                plt.ylabel('Loss')
+                plt.legend()
+                plt.grid(True)
+                
+                # Save plot locally
+                if plots_dir is not None:
+                    plt.savefig(plots_dir / f'{run_name}_learning_curves.png')
+                
+                # Log to wandb
+                wandb.log({
+                    "learning_curves": wandb.Image(fig),
+                    "train/loss": avg_train_loss,
+                    "val/loss": avg_val_loss,
+                    "train/mae": train_metric_avgs["train_mae_loss"],
+                    "train/dtw": train_metric_avgs["train_dtw_loss"],
+                    "train/mse": train_metric_avgs["train_mse_loss"],
+                    "val/mae": val_metric_avgs["val_mae_loss"],
+                    "val/dtw": val_metric_avgs["val_dtw_loss"],
+                    "val/mse": val_metric_avgs["val_mse_loss"],
+                    "epoch": epoch
+                })
+                plt.close()
+            
+            # Update learning rate
+            scheduler.step(avg_val_loss)
+            
+            # Log metrics
+            if wandb.run is not None:
+                wandb.log({
+                    'finetune/epoch': epoch,
+                    'finetune/train_loss': avg_train_loss,
+                    'finetune/val_loss': avg_val_loss,
+                    'finetune/learning_rate': optimizer.param_groups[0]['lr'],
+                    **{f'finetune/{k}': v for k, v in train_metrics.items()},
+                    **{f'finetune/{k}': v for k, v in val_metrics.items()}
+                })
+            
+            # Print epoch summary
+            print(f'\nEpoch {epoch+1}/{num_epochs}:')
+            print(f'Train Loss: {avg_train_loss:.4f} (MAE: {avg_train_l1:.4f}, '
+                  f'DTW: {avg_train_dtw:.4f})')
+            print(f'Val Loss: {avg_val_loss:.4f} (MAE: {avg_val_l1:.4f}, '
+                  f'DTW: {avg_val_dtw:.4f})')
+            print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
+            
+            # Save best model
+            if avg_val_loss < best_loss:
+                best_loss = avg_val_loss
+                best_epoch = epoch
+                best_state = model.state_dict()
+                patience_counter = 0
+                
+                # Save best model state
+                if trial_dir is not None:
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': best_state,
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'loss': best_loss,
+                        'metrics': {
+                            'train': train_metrics,
+                            'val': val_metrics
+                        }
+                    }, trial_dir / 'best_finetune_model.pth')
+                    print(f"\nSaved new best model at epoch {epoch+1} with val_loss: {best_loss:.4f}")
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f'\nEarly stopping triggered after {epoch+1} epochs')
+                    break
+        
+        # Load best model state
+        model.load_state_dict(best_state)
+        return best_loss, best_epoch, model
     
-    # Load best model state
-    model.load_state_dict(best_state)
-    return best_loss, best_epoch, model
+    except Exception as e:
+        print(f"Error during finetuning: {str(e)}")
+        traceback.print_exc()
+        return float('inf'), -1, model
 
 if __name__ == "__main__":
     total_start = time.time()
@@ -1674,7 +1841,7 @@ if __name__ == "__main__":
     models_to_train = ['unsupervised_transformer']
     
     # Number of trials for hyperparameter optimization
-    n_trials = 50
+    n_trials = 10
     
     # Results dictionary to store best trials for each model
     results = {}
