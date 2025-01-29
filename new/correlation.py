@@ -50,7 +50,7 @@ def calculate_enhanced_features(df):
     )
     
     # Calculate accelerations using central difference
-    dt = 1/60  # Assuming 60Hz sampling rate
+    dt = 1/200  # 200Hz sampling rate
     
     # Initialize acceleration arrays with zeros
     accelerations = np.zeros_like(df['x_vel'])
@@ -86,18 +86,22 @@ def calculate_enhanced_features(df):
         end_idx = (trial + 1) * trial_size
         
         # Forward fill within each trial
-        features.iloc[start_idx:end_idx] = features.iloc[start_idx:end_idx].fillna(method='ffill')
+        features.iloc[start_idx:end_idx] = features.iloc[start_idx:end_idx].ffill()
         # Backward fill within each trial
-        features.iloc[start_idx:end_idx] = features.iloc[start_idx:end_idx].fillna(method='bfill')
+        features.iloc[start_idx:end_idx] = features.iloc[start_idx:end_idx].bfill()
     
     return features
 
-def load_data(file_path):
+def load_data(file_path, genotype=None):
     """Load and preprocess the dataset from a CSV file efficiently."""
     try:
         # Load the full data first to get all columns
         df = pd.read_csv(file_path)
         print(f"Raw data loaded successfully with shape: {df.shape}")
+        
+        if genotype:
+            df = df[df['genotype'] == genotype]
+            print(f"Filtered data for {genotype} genotype, new shape: {df.shape}")    
         
         # Filter frames 400-1000 from each trial
         trial_size = 1400
@@ -190,10 +194,13 @@ def plot_correlation_heatmap(correlation_matrix, save_path=None):
         plt.savefig(save_path, bbox_inches='tight', dpi=300)
     plt.close()
 
-def analyze_correlations(correlation_matrix, threshold=0.3):
+def analyze_correlations(correlation_matrix, threshold=0.3, output_dir=None):
     """Analyze and print significant correlations between inputs and outputs."""
     print("\nSignificant Correlations Analysis:")
     print("-" * 50)
+    
+    # Store significant correlations
+    significant_correlations = []
     
     # For each input feature
     for input_feature in correlation_matrix.index:
@@ -209,39 +216,62 @@ def analyze_correlations(correlation_matrix, threshold=0.3):
             )
             for joint_angle, corr in strong_correlations.items():
                 print(f"  {joint_angle}: {corr:.3f}")
+                significant_correlations.append({
+                    'Feature': input_feature,
+                    'Joint Angle': joint_angle,
+                    'Correlation': corr
+                })
     
-    # Find the top correlations overall
-    print("\nTop 20 strongest input-output correlations:")  # Increased to top 20
-    flat_corr = correlation_matrix.unstack()
-    strongest_corr = flat_corr[abs(flat_corr).sort_values(ascending=False).index][:20]
+    # Sort significant correlations by absolute correlation value
+    significant_correlations.sort(key=lambda x: abs(x['Correlation']), reverse=True)
     
-    for (input_feat, output_feat), corr in strongest_corr.items():
-        print(f"{input_feat} -- {output_feat}: {corr:.3f}")
+    # Save significant correlations to CSV if output directory is provided
+    if output_dir and significant_correlations:
+        sig_corr_df = pd.DataFrame(significant_correlations)
+        sig_corr_path = output_dir / 'significant_correlations.csv'
+        sig_corr_df.to_csv(sig_corr_path, index=False)
+        print(f"\nSaved significant correlations to: {sig_corr_path}")
+    
+    # Print top correlations
+    print("\nTop 20 strongest input-output correlations:")
+    for i, corr in enumerate(significant_correlations[:20]):
+        print(f"{corr['Feature']} -- {corr['Joint Angle']}: {corr['Correlation']:.3f}")
+    
+    return significant_correlations
 
 def main():
     # Specify paths
-    file_path = "Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv"
-    output_dir = Path("correlation_analysis")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    file_path = "/Users/anivenkat/Downloads/BPN_P9LT_P9RT_flyCoords.csv"
+    parent_dir = Path("correlation_results")
+    parent_dir.mkdir(parents=True, exist_ok=True)
     
-    # Load and process data
-    df = load_data(file_path)
-    if df is not None:
-        # Compute correlations between inputs and outputs
-        correlation_matrix = compute_correlation(df)
+    # Process each genotype
+    genotypes = ['P9RT', 'BPN', 'P9LT']
+    
+    for genotype in genotypes:
+        print(f"\nProcessing {genotype} genotype...")
+        output_dir = parent_dir / genotype
+        output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Plot heatmap
-        plot_correlation_heatmap(
-            correlation_matrix,
-            save_path=str(output_dir / "enhanced_input_output_correlation.png")
-        )
-        
-        # Analyze correlations
-        analyze_correlations(correlation_matrix)
-        
-        # Save correlation matrix to CSV
-        correlation_matrix.to_csv(output_dir / "enhanced_input_output_correlation.csv")
-        print(f"\nResults saved to {output_dir}")
+        # Load and process data for this genotype
+        df = load_data(file_path, genotype)
+        if df is not None:
+            # Compute correlations between inputs and outputs
+            correlation_matrix = compute_correlation(df)
+            
+            # Plot heatmap
+            plot_correlation_heatmap(
+                correlation_matrix,
+                save_path=str(output_dir / f"enhanced_input_output_correlation_{genotype}.png")
+            )
+            
+            # Analyze correlations and save to CSV
+            print(f"\nCorrelation Analysis for {genotype}:")
+            analyze_correlations(correlation_matrix, output_dir=output_dir)
+            
+            # Save correlation matrix to CSV
+            correlation_matrix.to_csv(output_dir / f"correlation_matrix_{genotype}.csv")
+            print(f"\nResults saved to {output_dir}")
 
 if __name__ == "__main__":
     main()
