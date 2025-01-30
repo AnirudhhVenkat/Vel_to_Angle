@@ -27,6 +27,16 @@ def calculate_spearman_correlation(data_path, genotype, output_dir='spearman_cor
     print("\nCalculating enhanced features (positions, velocities, etc.)...")
     enhanced_features = calculate_enhanced_features(df)
     
+    # Calculate moving averages for TaG positions
+    print("\nCalculating moving averages for TaG positions...")
+    tag_cols = [col for col in df.columns if 'TaG' in col]
+    windows = [5, 10, 20]  # Window sizes for moving averages
+    
+    for window in windows:
+        for col in tag_cols:
+            ma_col = f"{col}_ma{window}"
+            df[ma_col] = df[col].rolling(window=window, center=True).mean()
+    
     # Combine original data with enhanced features
     df_combined = pd.concat([df, enhanced_features], axis=1)
     
@@ -41,7 +51,7 @@ def calculate_spearman_correlation(data_path, genotype, output_dir='spearman_cor
     # Get all input features: TaG points, velocities, positions, accelerations, etc.
     # Make sure to only get unique columns
     all_features = [col for col in df_combined.select_dtypes(include=[np.number]).columns 
-                   if any(x in col.lower() for x in ['tag', 'vel', 'pos', 'acc', 'jerk', 'magnitude'])]
+                   if any(x in col.lower() for x in ['tag', 'vel', 'pos', 'acc', 'jerk', 'magnitude', 'ma'])]
     feature_cols = list(dict.fromkeys([col for col in all_features 
                                      if col not in joint_cols 
                                      and col != 'genotype']))
