@@ -119,41 +119,58 @@ def calculate_kendall_correlation(data_path, genotype, parent_dir):
         
         print(f"Saved scatter plots to: {genotype_dir}")
 
+def get_available_data_path():
+    """Try multiple possible data paths and return the first available one."""
+    possible_paths = [
+        "Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv",  # Network drive path
+        "/Users/anivenkat/Downloads/BPN_P9LT_P9RT_flyCoords.csv",      # Local Mac path
+        "C:/Users/bidayelab/Downloads/BPN_P9LT_P9RT_flyCoords.csv"     # Local Windows path
+    ]
+    
+    for path in possible_paths:
+        if Path(path).exists():
+            print(f"Using data file: {path}")
+            return path
+    
+    raise FileNotFoundError("Could not find the data file in any of the expected locations")
+
 def main():
-    """Main function to run the correlation analysis."""
-    # Set up paths
-    data_path = "/Users/anivenkat/Downloads/BPN_P9LT_P9RT_flyCoords.csv"
-    parent_dir = Path("kendall_results")
-    parent_dir.mkdir(exist_ok=True)
-    
-    # Define genotypes to analyze
-    genotypes = ['P9RT', 'BPN', 'P9LT']
-    
-    # Run analysis for each genotype
     try:
-        print("Starting Kendall's Tau correlation analysis...")
+        # Get the first available data path
+        file_path = get_available_data_path()
+        
+        parent_dir = Path("kendall_correlation_results")
+        parent_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Process each genotype
+        genotypes = ['P9RT', 'BPN', 'P9LT']
+        
         for genotype in genotypes:
-            print(f"\nAnalyzing {genotype} genotype...")
-            calculate_kendall_correlation(data_path, genotype, parent_dir)
-        
-        # Create a summary file
-        with open(parent_dir / 'analysis_summary.txt', 'w') as f:
-            f.write("Kendall's Tau Correlation Analysis Summary\n")
-            f.write("========================================\n\n")
-            f.write("Analysis completed for the following genotypes:\n")
-            for genotype in genotypes:
-                f.write(f"- {genotype}\n")
-            f.write("\nEach genotype folder contains:\n")
-            f.write("1. kendall_correlation_matrix.csv: Full correlation matrix\n")
-            f.write("2. kendall_correlation_heatmap.png: Correlation heatmap\n")
-            f.write("3. significant_correlations.csv: List of significant correlations\n")
-            f.write("4. scatter_*.png: Scatter plots for top correlations\n")
-        
-        print("\nAnalysis completed successfully!")
-        print(f"All results have been saved in: {parent_dir}")
-        
+            print(f"\nProcessing {genotype} genotype...")
+            output_dir = parent_dir / genotype
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Load and process data for this genotype
+            df = load_data(file_path, genotype)
+            if df is not None:
+                correlation_matrix = calculate_kendall_correlation(file_path, genotype, output_dir)
+                
+                plot_correlation_heatmap(
+                    correlation_matrix,
+                    save_path=str(output_dir / f"kendall_correlation_{genotype}.png")
+                )
+                
+                print(f"\nKendall Correlation Analysis for {genotype}:")
+                analyze_correlations(correlation_matrix, output_dir=output_dir)
+                
+                correlation_matrix.to_csv(output_dir / f"kendall_correlation_matrix_{genotype}.csv")
+                print(f"\nResults saved to {output_dir}")
+    
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        print("Please ensure the data file is available in one of the expected locations.")
     except Exception as e:
-        print(f"\nError during analysis: {str(e)}")
+        print(f"An unexpected error occurred: {e}")
         raise
 
 if __name__ == "__main__":

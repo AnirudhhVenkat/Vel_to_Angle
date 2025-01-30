@@ -124,44 +124,58 @@ def calculate_mutual_information(data_path, genotype, parent_dir):
         
         print(f"Saved scatter plots to: {genotype_dir}")
 
+def get_available_data_path():
+    """Try multiple possible data paths and return the first available one."""
+    possible_paths = [
+        "Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv",  # Network drive path
+        "/Users/anivenkat/Downloads/BPN_P9LT_P9RT_flyCoords.csv",      # Local Mac path
+        "C:/Users/bidayelab/Downloads/BPN_P9LT_P9RT_flyCoords.csv"     # Local Windows path
+    ]
+    
+    for path in possible_paths:
+        if Path(path).exists():
+            print(f"Using data file: {path}")
+            return path
+    
+    raise FileNotFoundError("Could not find the data file in any of the expected locations")
+
 def main():
-    """Main function to run the mutual information analysis."""
-    # Set up paths
-    data_path = "/Users/anivenkat/Downloads/BPN_P9LT_P9RT_flyCoords.csv"
-    parent_dir = Path("mutual_info_results")
-    parent_dir.mkdir(exist_ok=True)
-    
-    # Define genotypes to analyze
-    genotypes = ['P9RT', 'BPN', 'P9LT']
-    
-    # Run analysis for each genotype
     try:
-        print("Starting mutual information analysis...")
+        # Get the first available data path
+        file_path = get_available_data_path()
+        
+        parent_dir = Path("mutual_information_results")
+        parent_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Process each genotype
+        genotypes = ['P9RT', 'BPN', 'P9LT']
+        
         for genotype in genotypes:
-            print(f"\nAnalyzing {genotype} genotype...")
-            calculate_mutual_information(data_path, genotype, parent_dir)
-        
-        # Create a summary file
-        with open(parent_dir / 'analysis_summary.txt', 'w') as f:
-            f.write("Mutual Information Analysis Summary\n")
-            f.write("==================================\n\n")
-            f.write("Analysis completed for the following genotypes:\n")
-            for genotype in genotypes:
-                f.write(f"- {genotype}\n")
-            f.write("\nEach genotype folder contains:\n")
-            f.write("1. mutual_information_matrix.csv: Full MI scores matrix\n")
-            f.write("2. mutual_information_heatmap.png: MI scores heatmap\n")
-            f.write("3. significant_relationships.csv: List of significant relationships\n")
-            f.write("4. scatter_*.png: Hexbin plots for top relationships\n")
-            f.write("\nNote: Mutual information measures how much information one variable\n")
-            f.write("provides about another, capturing both linear and non-linear relationships.\n")
-            f.write("Higher scores indicate stronger relationships (range: 0 to inf).\n")
-        
-        print("\nAnalysis completed successfully!")
-        print(f"All results have been saved in: {parent_dir}")
-        
+            print(f"\nProcessing {genotype} genotype...")
+            output_dir = parent_dir / genotype
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Load and process data for this genotype
+            df = load_data(file_path, genotype)
+            if df is not None:
+                mi_matrix = compute_mutual_information(df)
+                
+                plot_mi_heatmap(
+                    mi_matrix,
+                    save_path=str(output_dir / f"mutual_information_{genotype}.png")
+                )
+                
+                print(f"\nMutual Information Analysis for {genotype}:")
+                analyze_mi(mi_matrix, output_dir=output_dir)
+                
+                mi_matrix.to_csv(output_dir / f"mutual_information_matrix_{genotype}.csv")
+                print(f"\nResults saved to {output_dir}")
+    
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        print("Please ensure the data file is available in one of the expected locations.")
     except Exception as e:
-        print(f"\nError during analysis: {str(e)}")
+        print(f"An unexpected error occurred: {e}")
         raise
 
 if __name__ == "__main__":
