@@ -9,6 +9,30 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from tqdm import tqdm
 
+def check_gpu_availability():
+    """Check if GPU is available and can be used by XGBoost."""
+    try:
+        # Create a small dummy dataset
+        X = np.random.normal(size=(100, 10))
+        y = np.random.normal(size=100)
+        
+        # Try to train a small model with GPU - using new XGBoost 2.0+ syntax
+        model = xgb.XGBRegressor(tree_method='hist', device='cuda')
+        model.fit(X, y)
+        
+        # If we get here, GPU is working
+        print("\nGPU is available and working with XGBoost!")
+        print("Using CUDA device for training")
+        return True
+        
+    except Exception as e:
+        print("\nGPU acceleration is not available:")
+        print(f"Error: {str(e)}")
+        print("\nFalling back to CPU. To enable GPU acceleration, please:")
+        print("1. Install CUDA toolkit")
+        print("2. Make sure your GPU is CUDA-compatible")
+        return False
+
 def load_and_filter_data(file_path, genotype):
     """Load and preprocess the dataset from a CSV file."""
     try:
@@ -40,38 +64,108 @@ def load_and_filter_data(file_path, genotype):
         print(f"Error loading/preprocessing data: {e}")
         raise
 
+def get_available_data_path():
+    """Try multiple possible data paths and return the first available one."""
+    possible_paths = [
+        "Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv",  # Network drive path
+        "/Users/anivenkat/Downloads/BPN_P9LT_P9RT_flyCoords.csv",      # Local Mac path
+        "C:/Users/bidayelab/Downloads/BPN_P9LT_P9RT_flyCoords.csv"     # Local Windows path
+    ]
+    
+    for path in possible_paths:
+        if Path(path).exists():
+            print(f"Using data file: {path}")
+            return path
+    
+    raise FileNotFoundError("Could not find the data file in any of the expected locations")
+
 def prepare_data_for_xgboost(genotype):
     """Prepare data for XGBoost model using top correlated features."""
     # Load the preprocessed data
-    data_path = "/Users/anivenkat/Downloads/BPN_P9LT_P9RT_flyCoords.csv"
     try:
+        data_path = get_available_data_path()
         df = load_and_filter_data(data_path, genotype)
     except FileNotFoundError:
-        print(f"Could not find data file at {data_path}")
-        print("Please update the path to your data file")
+        print("Could not find the data file in any of the expected locations")
+        print("Please ensure the data file is available in one of the expected locations")
         return None, None
+    
+    # Print available columns for debugging
+    print("\nAvailable columns in DataFrame:")
+    for col in sorted(df.columns):
+        print(f"  {col}")
     
     # Select features and targets based on correlation analysis for each genotype
     if genotype == 'P9RT':
-        features = ['x_vel', 'y_vel', 'z_vel']  # Simplified feature set
-        targets = ['L2B_flex', 'L1B_rot']
+        # Base features that should exist
+        features = [
+            'L-F-TaG_z',     # -0.838 with L1B_flex
+        ]
+        
+        targets = [
+            'L1B_flex',      # Strongest correlation with L-F-TaG_z
+            'L2B_rot',       # Strong correlation with L-M-TaG_y
+            'R1B_rot',       # Strong correlation with R-F-TaG_z
+            'L1A_flex',      # Strong correlation with L-F-TaG_y
+            'L3A_rot'        # Strong correlation with L-H-TaG_x
+        ]
+        
     elif genotype == 'BPN':
-        features = ['x_vel', 'y_vel', 'z_vel']  # Simplified feature set
-        targets = ['R3A_flex', 'L2C_flex']
+        features = [
+            'L-F-TaG_y',     # Strongest correlation with L1A_flex
+        ]
+        
+        targets = [
+            'L1A_flex',      # Strongest correlation with L-F-TaG_y
+            'R1A_flex',      # Strong correlation with R-F-TaG_y
+            'L1B_flex',
+            'R1B_flex',
+            'L2A_flex'
+        ]
+        
     else:  # P9LT
-        features = ['x_vel', 'y_vel', 'z_vel']  # Simplified feature set
-        targets = ['L2B_rot', 'L1C_rot']
+        features = [
+            'R-F-TaG_y',     # Strongest correlation with R1A_flex
+        ]
+        
+        targets = [
+            'R1A_flex',      # Strongest correlation with R-F-TaG_y
+            'L1A_flex',      # Strong correlation with L-F-TaG_y
+            'R1B_flex',
+            'L1B_flex',
+            'R2A_flex'
+        ]
+    
+    # Verify all features exist in DataFrame
+    missing_features = [f for f in features if f not in df.columns]
+    if missing_features:
+        print(f"\nError: The following features are missing from the DataFrame:")
+        for feat in missing_features:
+            print(f"  {feat}")
+        return None, None
+    
+    # Verify all targets exist in DataFrame
+    missing_targets = [t for t in targets if t not in df.columns]
+    if missing_targets:
+        print(f"\nError: The following targets are missing from the DataFrame:")
+        for targ in missing_targets:
+            print(f"  {targ}")
+        return None, None
     
     print(f"\nUsing features for {genotype}:")
     for feat in features:
         print(f"  {feat}")
     print(f"\nPredicting targets:")
-    for target in targets:
-        print(f"  {target}")
+    for targ in targets:
+        print(f"  {targ}")
     
     # Prepare feature matrix X and target matrix y
     X = df[features]
     y = df[targets]
+    
+    # Print shapes for debugging
+    print(f"\nFeature matrix shape: {X.shape}")
+    print(f"Target matrix shape: {y.shape}")
     
     # Scale the features
     scaler = StandardScaler()
@@ -84,37 +178,76 @@ def prepare_data_for_xgboost(genotype):
     
     return (X_train, X_test, y_train, y_test), (features, targets)
 
-def find_optimal_params(X_train, y_train, target_name, parent_dir, genotype):
+def find_optimal_params(X_train, y_train, target_name, parent_dir, genotype, use_gpu=False):
     """Find optimal hyperparameters using cross-validation."""
     print(f"\nFinding optimal parameters for {target_name}...")
     
-    # Parameter combinations to try with more comprehensive search space
+    # Base parameters that are always used - balanced set
+    base_params = {
+        # Tree structure parameters
+        'max_depth': [3, 5, 7],                  # Controls tree depth
+        'min_child_weight': [1, 3],              # Controls overfitting
+        'max_leaves': [0, 31],                   # Limits number of leaves
+        
+        # Sampling parameters
+        'subsample': [0.7, 0.9],                 # Row subsampling
+        'colsample_bytree': [0.7, 0.9],          # Column subsampling
+        'colsample_bylevel': [0.7, 0.9],         # Level-wise column sampling
+        
+        # Learning rate and boosting parameters
+        'learning_rate': [0.01, 0.05],           # Step size
+        'n_estimators': [3000],                  # Number of trees
+        
+        # Regularization parameters
+        'gamma': [0, 0.1],                       # Minimum loss reduction
+        'reg_alpha': [0, 0.1],                   # L1 regularization
+        'reg_lambda': [1, 2],                    # L2 regularization
+        
+        # Tree method
+        'tree_method': ['hist']                  # Keep hist method for efficiency
+    }
+    
+    # Add GPU device if available
+    if use_gpu:
+        base_params['device'] = ['cuda']
+    
+    # Use all base parameters for initial search
+    initial_params = base_params.copy()
+    
+    # Generate parameter combinations
     param_combinations = [
         {
             'max_depth': max_depth,
             'learning_rate': lr,
             'n_estimators': n_est,
             'min_child_weight': mcw,
+            'max_leaves': ml,
             'subsample': ss,
             'colsample_bytree': cs,
+            'colsample_bylevel': cl,
             'gamma': g,
-            'reg_alpha': alpha,
-            'reg_lambda': lamb
+            'reg_alpha': ra,
+            'reg_lambda': rl,
+            'tree_method': 'hist',
+            **({"device": "cuda"} if use_gpu else {})
         }
-        for max_depth in [7, 9, 11]  # More options for tree depth
-        for lr in [0.01]  # More learning rate options
-        for n_est in [2000]  # Different numbers of estimators
-        for mcw in [1, 3, 5]  # More min_child_weight options
-        for ss in [0.6]  # More subsample ratios
-        for cs in [0.6]  # More colsample_bytree ratios
-        for g in [0, 0.1, 0.2]  # More gamma options
-        for alpha in [0, 0.1, 1.0]  # L1 regularization
-        for lamb in [0, 0.1, 1.0]  # L2 regularization
+        for max_depth in initial_params['max_depth']
+        for lr in initial_params['learning_rate']
+        for n_est in initial_params['n_estimators']
+        for mcw in initial_params['min_child_weight']
+        for ml in initial_params['max_leaves']
+        for ss in initial_params['subsample']
+        for cs in initial_params['colsample_bytree']
+        for cl in initial_params['colsample_bylevel']
+        for g in initial_params['gamma']
+        for ra in initial_params['reg_alpha']
+        for rl in initial_params['reg_lambda']
     ]
     
     # Calculate total number of combinations
     total_combinations = len(param_combinations)
     print(f"Total parameter combinations to try: {total_combinations}")
+    print(f"Using {'GPU' if use_gpu else 'CPU'} for training")
     
     # Create directory for parameter search results
     param_search_dir = parent_dir / genotype / 'parameter_search' / target_name
@@ -123,19 +256,31 @@ def find_optimal_params(X_train, y_train, target_name, parent_dir, genotype):
     best_mae = float('inf')
     best_params = None
     best_model = None
-    param_search_results = []  # Renamed from results to param_search_results
+    best_eval_results = None
+    param_search_results = []
     
     # Try each parameter combination with progress bar
     for i, params in enumerate(tqdm(param_combinations, desc="Parameter combinations", unit="combination")):
         # Use 5-fold cross-validation with progress bar
         cv_scores = []
         cv_models = []
+        cv_eval_results = []
+        
+        # Add additional parameters for fine-tuning
+        full_params = params.copy()
+        if i < total_combinations // 4:  # Try additional parameters for top 25% of combinations
+            full_params.update({
+                'max_leaves': np.random.choice(base_params['max_leaves']),
+                'colsample_bylevel': np.random.choice(base_params['colsample_bylevel']),
+                'reg_alpha': np.random.choice(base_params['reg_alpha']),
+                'reg_lambda': np.random.choice(base_params['reg_lambda'])
+            })
         
         model = xgb.XGBRegressor(
-            objective='reg:squarederror',  # Changed from absoluteerror to get better convergence
-            early_stopping_rounds=20,  # Reduced to prevent overfitting
-            eval_metric=['mae', 'rmse'],  # Track both metrics
-            **params
+            objective='reg:squarederror',
+            early_stopping_rounds=20,
+            eval_metric=['mae', 'rmse'],
+            **full_params
         )
         
         # Create progress bar for cross-validation folds
@@ -163,13 +308,14 @@ def find_optimal_params(X_train, y_train, target_name, parent_dir, genotype):
             mae = mean_absolute_error(y_val, val_pred)
             cv_scores.append(mae)
             cv_models.append(model)
+            cv_eval_results.append(model.evals_result())
         
         # Calculate average MAE across folds
         avg_mae = np.mean(cv_scores)
         std_mae = np.std(cv_scores)
         
         param_search_results.append({
-            'params': params,
+            'params': full_params,
             'mae': avg_mae,
             'std': std_mae
         })
@@ -177,52 +323,68 @@ def find_optimal_params(X_train, y_train, target_name, parent_dir, genotype):
         # Update best parameters if we found better ones
         if avg_mae < best_mae:
             best_mae = avg_mae
-            best_params = params
-            best_model = cv_models[np.argmin(cv_scores)]  # Keep the best model from CV
+            best_params = full_params
+            best_model = cv_models[np.argmin(cv_scores)]
+            best_eval_results = cv_eval_results[np.argmin(cv_scores)]
             
-            # Save learning curve only for the best model so far
-            plt.figure(figsize=(10, 6))
-            # Plot both MAE and RMSE curves
-            eval_results = best_model.evals_result()  # Renamed from results to eval_results
-            plt.plot(eval_results['validation_1']['mae'], label='Validation MAE', color='blue')
-            plt.plot(eval_results['validation_1']['rmse'], label='Validation RMSE', color='red', alpha=0.7)
-            plt.title(f'Learning Curves - Best Model\nMAE: {best_mae:.4f}')
-            plt.xlabel('Boosting Round')
-            plt.ylabel('Error')
-            plt.legend()
-            plt.grid(True)
-            plt.savefig(param_search_dir / 'best_model_learning_curve.png')
-            plt.close()
+            # Save intermediate best results
+            with open(param_search_dir / 'intermediate_best_params.txt', 'a') as f:
+                f.write(f"\nNew best parameters found at iteration {i+1}:\n")
+                f.write(f"MAE: {best_mae:.4f}\n")
+                for param, value in best_params.items():
+                    f.write(f"{param}: {value}\n")
+                f.write("-" * 50 + "\n")
+    
+    # After finding the best model, save its learning curve
+    plt.figure(figsize=(10, 6))
+    # Plot both MAE and RMSE curves using the best model's results
+    plt.plot(best_eval_results['validation_1']['mae'], label='Validation MAE', color='blue')
+    plt.plot(best_eval_results['validation_1']['rmse'], label='Validation RMSE', color='red', alpha=0.7)
+    plt.title(f'Learning Curves - Best Model\nMAE: {best_mae:.4f}')
+    plt.xlabel('Boosting Round')
+    plt.ylabel('Error')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(param_search_dir / 'best_model_learning_curve.png')
+    plt.close()
     
     # Save all results to CSV
     results_df = pd.DataFrame([
         {**r['params'], 'mae': r['mae'], 'std': r['std']}
-        for r in param_search_results  # Updated to use param_search_results
+        for r in param_search_results
     ])
     results_df.to_csv(param_search_dir / 'parameter_search_results.csv', index=False)
     
     # Plot parameter importance
     param_importance = {}
     for param in best_params.keys():
-        values = results_df[param].unique()
-        scores = [results_df[results_df[param] == v]['mae'].mean() for v in values]
-        param_importance[param] = np.std(scores)  # Higher std means parameter is more important
+        if param in results_df.columns:  # Check if parameter exists in results
+            values = results_df[param].unique()
+            if len(values) > 1:  # Only calculate importance if parameter has multiple values
+                scores = [results_df[results_df[param] == v]['mae'].mean() for v in values]
+                param_importance[param] = np.std(scores)  # Higher std means parameter is more important
     
-    plt.figure(figsize=(10, 6))
-    plt.bar(param_importance.keys(), param_importance.values())
-    plt.title('Parameter Importance\n(Higher value = More important)')
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.savefig(param_search_dir / 'parameter_importance.png')
-    plt.close()
+    if param_importance:  # Only create plot if we have parameters to show
+        plt.figure(figsize=(12, 6))
+        importance_items = sorted(param_importance.items(), key=lambda x: x[1], reverse=True)
+        params = [item[0] for item in importance_items]
+        scores = [item[1] for item in importance_items]
+        
+        plt.bar(params, scores)
+        plt.title('Parameter Importance\n(Higher value = More important)')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.savefig(param_search_dir / 'parameter_importance.png')
+        plt.close()
     
     print(f"\nBest parameters for {target_name}:")
-    print(best_params)
+    for param, value in best_params.items():
+        print(f"{param}: {value}")
     print(f"Best MAE: {best_mae:.4f}")
     
     return best_params
 
-def train_xgboost_models(X_train, y_train, features, targets, genotype, parent_dir):
+def train_xgboost_models(X_train, y_train, features, targets, genotype, parent_dir, use_gpu=False):
     """Train separate XGBoost models for each target variable with optimized parameters."""
     models = {}
     
@@ -230,15 +392,20 @@ def train_xgboost_models(X_train, y_train, features, targets, genotype, parent_d
         print(f"\nTraining model for {target}...")
         
         # Find optimal parameters
-        best_params = find_optimal_params(X_train, y_train[target], target, parent_dir, genotype)
+        best_params = find_optimal_params(X_train, y_train[target], target, parent_dir, genotype, use_gpu)
         
         # Train final model with best parameters and even more epochs
         final_params = best_params.copy()
         final_params['n_estimators'] = 10000  # Significantly more epochs for final training
+        final_params['tree_method'] = 'hist'  # Always use hist method
+        
+        # Add GPU device if available
+        if use_gpu:
+            final_params['device'] = 'cuda'
         
         model = xgb.XGBRegressor(
             objective='reg:absoluteerror',
-            early_stopping_rounds=50,  # Increased early stopping rounds for longer training
+            early_stopping_rounds=50,
             eval_metric='mae',
             **final_params
         )
@@ -394,6 +561,9 @@ def save_results(results, features, targets, genotype, parent_dir):
 
 def main():
     """Main function to run XGBoost analysis."""
+    # Check GPU availability first
+    use_gpu = check_gpu_availability()
+    
     genotypes = ['P9RT', 'BPN', 'P9LT']
     
     # Create parent directory for all results
@@ -410,9 +580,9 @@ def main():
         
         X_train, X_test, y_train, y_test = data
         
-        # Train models
-        print(f"\nTraining XGBoost models for {genotype}...")
-        models = train_xgboost_models(X_train, y_train, features, targets, genotype, parent_dir)
+        # Train models with GPU if available
+        print(f"\nTraining XGBoost models for {genotype} using {'GPU' if use_gpu else 'CPU'}...")
+        models = train_xgboost_models(X_train, y_train, features, targets, genotype, parent_dir, use_gpu)
         
         # Evaluate models
         print(f"\nEvaluating models for {genotype}...")

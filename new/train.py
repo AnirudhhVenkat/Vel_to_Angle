@@ -36,62 +36,45 @@ from models.unsupervised_transformer import (
 from utils.data import prepare_data, calculate_angular_velocities
 from utils.metrics import calculate_metrics
 
-class DTWLoss(nn.Module):
-    """Dynamic Time Warping loss function using FastDTW."""
+class MAELoss(nn.Module):
+    """Simple MAE (L1) loss with MSE tracking for metrics."""
     def __init__(self):
-        super(DTWLoss, self).__init__()
-        self.l1_loss = nn.L1Loss()  # MAE loss
+        super(MAELoss, self).__init__()
+        self.mae_loss = nn.L1Loss()  # MAE loss
         self.mse_loss = nn.MSELoss()  # For metrics only
         self.batch_count = 0
-        self.radius = 10  # Radius for FastDTW
-    
-    def compute_dtw(self, pred, target):
-        """Compute DTW distance using FastDTW."""
-        # Convert tensors to numpy for FastDTW
-        pred_np = pred.detach().cpu().numpy()
-        target_np = target.detach().cpu().numpy()
-        
-        # Compute FastDTW
-        distance, _ = fastdtw(pred_np, target_np, dist=euclidean, radius=self.radius)
-        return torch.tensor(distance, device=pred.device) / (pred.shape[0] * pred.shape[1])
     
     def forward(self, pred, target):
         """
-        Calculate combined loss between prediction and target sequences.
+        Calculate MAE loss between prediction and target sequences.
         Args:
             pred: Predicted sequences (batch_size, seq_len, features)
             target: Target sequences (batch_size, seq_len, features)
         Returns:
-            Combined loss value (MAE + DTW)
+            MAE loss value
         """
-        # Calculate MAE loss on full batch
-        mae_loss = self.l1_loss(pred, target)
+        # Ensure inputs have the same shape
+        if pred.shape != target.shape:
+            raise ValueError(f"Shape mismatch: pred {pred.shape} vs target {target.shape}")
         
-        # Calculate MSE for metrics only
-        mse_loss = self.mse_loss(pred, target)
-        
-        # For DTW, only use first sequence from batch
-        dtw_loss = self.compute_dtw(pred[0], target[0])
+        # Calculate losses
+        mae_loss = self.mae_loss(pred, target)
+        mse_loss = self.mse_loss(pred, target)  # For metrics only
         
         # Print progress occasionally
         self.batch_count += 1
         if self.batch_count % 100 == 0:
-            print(f"\nProcessed {self.batch_count} batches in DTWLoss")
-            print(f"Current losses - MAE: {mae_loss.item():.4f}, DTW: {dtw_loss.item():.4f}")
-            print(f"MSE (metric): {mse_loss.item():.4f}")
+            print(f"\nProcessed {self.batch_count} batches")
+            print(f"Current losses - MAE: {mae_loss.item():.4f}, MSE: {mse_loss.item():.4f}")
         
-        # Combine losses with equal weight on MAE and DTW
-        final_loss = 0.5 * mae_loss + 0.5 * dtw_loss
-        
-        # Store individual losses for logging
+        # Store losses for logging
         self.last_losses = {
             'mae': mae_loss.item(),
-            'dtw': dtw_loss.item(),
-            'mse': mse_loss.item(),  # Store MSE as a metric
-            'total': final_loss.item()
+            'mse': mse_loss.item(),
+            'total': mae_loss.item()
         }
         
-        return final_loss
+        return mae_loss
 
 # Suppress wandb output and only initialize in main process
 os.environ['WANDB_SILENT'] = 'true'
@@ -121,186 +104,64 @@ def finish_wandb():
     if wandb.run is not None:
         wandb.finish()
 
-def plot_predictions(predictions, targets, joint_names, model_name='model', use_windows=False, window_size=50):
-    """Plot predictions vs targets for each joint, with trials of 600 frames each.
-    
-    Args:
-        predictions: Model predictions (batch_size, num_joints) or (batch_size, seq_len, num_joints)
-        targets: Target values (batch_size, num_joints) or (batch_size, seq_len, num_joints)
-        joint_names: List of joint names
-        model_name: Name of the model for plot titles
-        use_windows: Whether the data is windowed
-        window_size: Size of windows if use_windows is True
-    """
-    import matplotlib.pyplot as plt
-    import wandb
-    from pathlib import Path
-    from datetime import datetime
-    
-    # Create plots directory if it doesn't exist
-    plots_dir = Path('plots')
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    
-    # Convert to numpy if tensors
-    if torch.is_tensor(predictions):
-        predictions = predictions.cpu().numpy()
-    if torch.is_tensor(targets):
-        targets = targets.cpu().numpy()
-    
-    # Check if predictions/targets are 3D (batch_size, seq_len, num_joints)
-    # or 2D (batch_size, num_joints)
-    is_sequence = len(predictions.shape) == 3
-    
-    # For windowed data with stride=1, we need to reconstruct the full sequence
-    if use_windows and is_sequence:
-        # Initialize arrays for full sequence reconstruction
-        seq_length = (predictions.shape[0] + window_size - 1)  # Total sequence length with stride=1
-        full_predictions = np.zeros((seq_length, predictions.shape[-1]))
-        full_targets = np.zeros((seq_length, targets.shape[-1]))
-        counts = np.zeros(seq_length)  # For averaging overlapping predictions
+def plot_predictions(predictions, targets, joint_names, model_name, plots_dir=None, epoch=None, phase='train'):
+    """Plot predictions vs targets for each joint angle."""
+    try:
+        num_joints = len(joint_names)
+        fig, axes = plt.subplots(num_joints, 1, figsize=(15, 4*num_joints))
+        if num_joints == 1:
+            axes = [axes]
         
-        # Reconstruct sequences by averaging overlapping windows
-        for i in range(predictions.shape[0]):
-            full_predictions[i:i+window_size] += predictions[i]
-            full_targets[i:i+window_size] += targets[i]
-            counts[i:i+window_size] += 1
-        
-        # Average overlapping regions
-        full_predictions = full_predictions / counts[:, np.newaxis]
-        full_targets = full_targets / counts[:, np.newaxis]
-        
-        predictions = full_predictions
-        targets = full_targets
-        is_sequence = False  # After reconstruction, treat as 2D
-    
-    # Split into trials of 600 frames
-    trial_length = 600
-    if is_sequence:
-        num_trials = predictions.shape[0]
-        trial_predictions = predictions
-        trial_targets = targets
-    else:
-        num_trials = len(predictions) // trial_length
-        trial_predictions = predictions.reshape(num_trials, trial_length, -1)
-        trial_targets = targets.reshape(num_trials, trial_length, -1)
-    
-    # Calculate metrics for each joint and trial
-    metrics = {}
-    for i, joint in enumerate(joint_names):
-        joint_metrics = []
-        for trial in range(num_trials):
-            if is_sequence:
-                trial_mae = np.mean(np.abs(trial_predictions[trial, :, i] - trial_targets[trial, :, i]))
-                trial_mse = np.mean((trial_predictions[trial, :, i] - trial_targets[trial, :, i])**2)
-            else:
-                trial_data = slice(trial * trial_length, (trial + 1) * trial_length)
-                trial_mae = np.mean(np.abs(predictions[trial_data, i] - targets[trial_data, i]))
-                trial_mse = np.mean((predictions[trial_data, i] - targets[trial_data, i])**2)
-            joint_metrics.append({'mae': trial_mae, 'mse': trial_mse})
-        
-        metrics[f'{joint}_mae'] = np.mean([m['mae'] for m in joint_metrics])
-        metrics[f'{joint}_mse'] = np.mean([m['mse'] for m in joint_metrics])
-    
-    # Calculate overall metrics
-    metrics['overall_mae'] = np.mean([metrics[f'{j}_mae'] for j in joint_names])
-    metrics['overall_mse'] = np.mean([metrics[f'{j}_mse'] for j in joint_names])
-    
-    # Group joints by leg for better visualization
-    legs = ['L1', 'L2', 'L3', 'R1', 'R2', 'R3']
-    segments = ['A', 'B', 'C']
-    
-    # Create a figure for each leg
-    for leg in legs:
-        # Get all joints for this leg
-        leg_joints = [j for j in joint_names if j.startswith(leg)]
-        
-        # Create subplots for each trial and segment
-        fig_height = 3 * num_trials  # 3 inches per trial
-        fig, axes = plt.subplots(num_trials, len(segments), figsize=(15, fig_height))
-        fig.suptitle(f'{model_name} - {leg} Leg Flexion Angles')
-        
-        # Plot each trial
-        for trial_idx in range(num_trials):
-            for seg_idx, segment in enumerate(segments):
-                joint = f'{leg}{segment}_flex'
-                joint_idx = joint_names.index(joint)
-                ax = axes[trial_idx, seg_idx]
-                
-                time_points = np.arange(trial_length)
-                if is_sequence:
-                    pred_data = trial_predictions[trial_idx, :, joint_idx]
-                    target_data = trial_targets[trial_idx, :, joint_idx]
-                else:
-                    trial_data = slice(trial_idx * trial_length, (trial_idx + 1) * trial_length)
-                    pred_data = predictions[trial_data, joint_idx]
-                    target_data = targets[trial_data, joint_idx]
-                
-                # Calculate trial-specific metrics
-                trial_mae = np.mean(np.abs(pred_data - target_data))
-                trial_mse = np.mean((pred_data - target_data)**2)
-                
-                ax.plot(time_points, pred_data, label='Predicted', color='blue', alpha=0.7)
-                ax.plot(time_points, target_data, label='Target', color='red', alpha=0.7)
-                ax.set_title(f'{joint}\nTrial {trial_idx+1} (MAE: {trial_mae:.4f})')
-                ax.set_xlabel('Frame')
-                ax.set_ylabel('Angle (degrees)')
-                ax.legend()
-                ax.grid(True)
+        metrics = {}
+        for i, (joint, ax) in enumerate(zip(joint_names, axes)):
+            # Get predictions and targets for this joint
+            pred = predictions[:, i].cpu().numpy()
+            targ = targets[:, i].cpu().numpy()
+            
+            # Plot
+            ax.plot(targ, label='Target', alpha=0.7)
+            ax.plot(pred, label='Prediction', alpha=0.7)
+            ax.set_title(f'{joint} Prediction vs Target')
+            ax.set_xlabel('Time Step')
+            ax.set_ylabel('Angle (degrees)')
+            ax.legend()
+            ax.grid(True)
+            
+            # Calculate metrics for this joint
+            mae = np.mean(np.abs(pred - targ))
+            mse = np.mean((pred - targ)**2)
+            metrics[f'{joint}_mae'] = mae
+            metrics[f'{joint}_mse'] = mse
+            
+            # Add metrics to plot
+            ax.text(0.02, 0.98, f'MAE: {mae:.2f}\nMSE: {mse:.2f}',
+                   transform=ax.transAxes, verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         
         plt.tight_layout()
         
-        # Save the figure
-        plot_path = plots_dir / f'{model_name}_{leg}_leg_{timestamp}.png'
-        plt.savefig(plot_path, bbox_inches='tight', dpi=300)
-        print(f"Saved plot to: {plot_path}")
+        # Save plot if directory is provided
+        if plots_dir is not None:
+            plots_dir = Path(plots_dir)
+            plots_dir.mkdir(parents=True, exist_ok=True)
+            epoch_str = f'_epoch_{epoch}' if epoch is not None else ''
+            plot_path = plots_dir / f'{model_name}_{phase}_predictions{epoch_str}.png'
+            plt.savefig(plot_path, bbox_inches='tight', dpi=300)
+            
+            # Log to wandb
+            if wandb.run is not None:
+                wandb.log({
+                    f'plots/{phase}_predictions': wandb.Image(str(plot_path)),
+                    **{f'metrics/{phase}/{k}': v for k, v in metrics.items()}
+                })
         
-        # Log to wandb if available
-        if wandb.run is not None:
-            wandb.log({
-                f'predictions/{leg}_leg': wandb.Image(str(plot_path))
-            })
+        plt.close(fig)
+        return metrics
         
-        plt.close()
-        
-    # Save metrics to a file
-    metrics_path = plots_dir / f'{model_name}_metrics_{timestamp}.txt'
-    with open(metrics_path, 'w') as f:
-        f.write(f"Model: {model_name}\n")
-        f.write(f"Timestamp: {timestamp}\n")
-        f.write(f"Window settings: use_windows={use_windows}, window_size={window_size}\n\n")
-        f.write("Metrics:\n")
-        
-        # Write metrics by leg
-        for leg in legs:
-            f.write(f"\n{leg} Leg:\n")
-            leg_joints = [j for j in joint_names if j.startswith(leg)]
-            for joint in leg_joints:
-                f.write(f"  {joint}:\n")
-                f.write(f"    MAE: {metrics[f'{joint}_mae']:.4f}\n")
-                f.write(f"    MSE: {metrics[f'{joint}_mse']:.4f}\n")
-        
-        f.write(f"\nOverall Metrics:\n")
-        f.write(f"  MAE: {metrics['overall_mae']:.4f}\n")
-        f.write(f"  MSE: {metrics['overall_mse']:.4f}\n")
-    
-    print(f"Saved metrics to: {metrics_path}")
-    
-    # Log overall metrics to wandb
-    if wandb.run is not None:
-        wandb.log({
-            'metrics/overall_mae': metrics['overall_mae'],
-            'metrics/overall_mse': metrics['overall_mse']
-        })
-        
-        # Log individual joint metrics
-        for joint in joint_names:
-            wandb.log({
-                f'metrics/{joint}/mae': metrics[f'{joint}_mae'],
-                f'metrics/{joint}/mse': metrics[f'{joint}_mse']
-            })
-    
-    return metrics
+    except Exception as e:
+        print(f"Error in plot_predictions: {str(e)}")
+        traceback.print_exc()
+        return {}
 
 def get_model_name(model_name, config):
     """Create descriptive model name with hyperparameters"""
@@ -669,8 +530,9 @@ def train_model(model_name, config):
             test_targets, 
             joint_names=config['joint_angle_columns'],
             model_name=model_name,
-            use_windows=config.get('use_windows', False),
-            window_size=config.get('window_size', 50)
+            plots_dir=None,
+            epoch=None,
+            phase='test'
         )
         
         # Log final metrics
@@ -827,15 +689,7 @@ def train_unsupervised_transformer(config):
             'patience': config.get('patience', 15)
         }
         
-        l1_criterion = nn.L1Loss()
-        dtw_criterion = DTWLoss().to(model.device)
-        
-        def combined_loss(pred, target, alpha=0.5):
-            """Combine L1 and DTW losses."""
-            l1_loss = l1_criterion(pred, target)
-            dtw_loss = dtw_criterion(pred.unsqueeze(1) if len(pred.shape) == 2 else pred, 
-                                   target.unsqueeze(1) if len(target.shape) == 2 else target)
-            return l1_loss * (1 - alpha) + dtw_loss * alpha, l1_loss, dtw_loss
+        criterion = MAELoss().to(model.device)
         
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -855,8 +709,7 @@ def train_unsupervised_transformer(config):
         for epoch in range(pretrain_config['num_epochs']):
             model.train()
             train_losses = []
-            train_l1_losses = []
-            train_dtw_losses = []
+            train_metrics = defaultdict(list)
             
             for batch_features, batch_targets in tqdm(train_loader, desc=f'Pretrain Epoch {epoch+1}'):
                 batch_features = batch_features.float()
@@ -871,11 +724,11 @@ def train_unsupervised_transformer(config):
                 with torch.cuda.amp.autocast(enabled=use_amp):
                     outputs = model(batch_features)
                     if model.pretraining:
-                        loss, l1_loss, dtw_loss = combined_loss(outputs, batch_features)
+                        loss = criterion(outputs, batch_features)
                     else:
-                        loss, l1_loss, dtw_loss = combined_loss(outputs, batch_targets)
+                        loss = criterion(outputs, batch_targets)
                 
-                if use_amp:
+                if scaler is not None:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -887,14 +740,25 @@ def train_unsupervised_transformer(config):
                     optimizer.step()
                 
                 train_losses.append(loss.item())
-                train_l1_losses.append(l1_loss.item())
-                train_dtw_losses.append(dtw_loss.item())
+                for loss_name, loss_value in criterion.last_losses.items():
+                    train_metrics[f'train_{loss_name}_loss'].append(loss_value)
+                
+                # Update progress bar
+                train_loop.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'mae': f'{criterion.last_losses["mae"]:.4f}',
+                    'mse': f'{criterion.last_losses["mse"]:.4f}'
+                })
+                
+                # Clean up memory
+                del outputs, loss
+                if use_amp:
+                    torch.cuda.empty_cache()
             
             # Validation phase
             model.eval()
             val_losses = []
-            val_l1_losses = []
-            val_dtw_losses = []
+            val_metrics = defaultdict(list)
             
             with torch.no_grad():
                 for batch_features, batch_targets in val_loader:
@@ -907,47 +771,57 @@ def train_unsupervised_transformer(config):
                     
                     with torch.cuda.amp.autocast(device_type='cuda', enabled=use_amp):
                         outputs = model(batch_features)
-                        if model.pretraining:
-                            loss, l1_loss, dtw_loss = combined_loss(outputs, batch_features)
-                        else:
-                            loss, l1_loss, dtw_loss = combined_loss(outputs, batch_targets)
+                        loss = criterion(outputs, batch_targets)
                     
                     val_losses.append(loss.item())
-                    val_l1_losses.append(l1_loss.item())
-                    val_dtw_losses.append(dtw_loss.item())
+                    for loss_name, loss_value in criterion.last_losses.items():
+                        val_metrics[f'val_{loss_name}_loss'].append(loss_value)
+                    
+                    # Update validation progress bar
+                    val_loop.set_postfix({
+                        'loss': f'{loss.item():.4f}',
+                        'mae': f'{criterion.last_losses["mae"]:.4f}',
+                        'mse': f'{criterion.last_losses["mse"]:.4f}'
+                    })
+                    
+                    # Clean up memory
+                    del outputs, loss
+                    if use_amp:
+                        torch.cuda.empty_cache()
             
+            # Calculate average losses
             avg_train_loss = np.mean(train_losses)
-            avg_train_l1 = np.mean(train_l1_losses)
-            avg_train_dtw = np.mean(train_dtw_losses)
             avg_val_loss = np.mean(val_losses)
-            avg_val_l1 = np.mean(val_l1_losses)
-            avg_val_dtw = np.mean(val_dtw_losses)
             
-            # Update history
-            history['pretrain_train_loss'].append(avg_train_loss)
-            history['pretrain_val_loss'].append(avg_val_loss)
-            history['pretrain_epochs'].append(epoch)
+            # Calculate average metrics
+            train_metric_avgs = {name: np.mean(values) for name, values in train_metrics.items()}
+            val_metric_avgs = {name: np.mean(values) for name, values in val_metrics.items()}
             
-            # Log to wandb
-            if wandb.run is not None:
-                wandb.log({
-                    'pretrain/train_loss': avg_train_loss,
-                    'pretrain/train_l1_loss': avg_train_l1,
-                    'pretrain/train_dtw_loss': avg_train_dtw,
-                    'pretrain/val_loss': avg_val_loss,
-                    'pretrain/val_l1_loss': avg_val_l1,
-                    'pretrain/val_dtw_loss': avg_val_dtw,
-                    'pretrain/epoch': epoch,
-                    'pretrain/learning_rate': optimizer.param_groups[0]['lr']
-                })
-            
+            # Update learning rate
             scheduler.step(avg_val_loss)
             
-            print(f'Pretrain Epoch {epoch+1}:')
-            print(f'  Train Loss: {avg_train_loss:.6f}')
-            print(f'  Val Loss: {avg_val_loss:.6f}')
+            # Log metrics
+            if wandb.run is not None:
+                wandb.log({
+                    'pretrain/loss/train': avg_train_loss,
+                    'pretrain/loss/val': avg_val_loss,
+                    'pretrain/learning_rate': optimizer.param_groups[0]['lr'],
+                    'pretrain/metrics/train_mae': train_metric_avgs["train_mae_loss"],
+                    'pretrain/metrics/train_mse': train_metric_avgs["train_mse_loss"],
+                    'pretrain/metrics/val_mae': val_metric_avgs["val_mae_loss"],
+                    'pretrain/metrics/val_mse': val_metric_avgs["val_mse_loss"],
+                    'pretrain/epoch': epoch
+                })
             
-            # Save only the best pretrained model
+            # Print epoch summary
+            print(f'\nEpoch {epoch+1}/{pretrain_config["num_epochs"]}:')
+            print(f'Train Loss: {avg_train_loss:.4f} (MAE: {train_metric_avgs["train_mae_loss"]:.4f}, '
+                  f'MSE: {train_metric_avgs["train_mse_loss"]:.4f})')
+            print(f'Val Loss: {avg_val_loss:.4f} (MAE: {val_metric_avgs["val_mae_loss"]:.4f}, '
+                  f'MSE: {val_metric_avgs["val_mse_loss"]:.4f})')
+            print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
+            
+            # Save best model
             if avg_val_loss < best_pretrain_loss:
                 best_pretrain_loss = avg_val_loss
                 best_pretrain_epoch = epoch
@@ -1018,8 +892,7 @@ def train_unsupervised_transformer(config):
         for epoch in range(config.get('finetune_epochs', 150)):
             model.train()
             train_losses = []
-            train_l1_losses = []
-            train_dtw_losses = []
+            train_metrics = defaultdict(list)
             
             for batch_features, batch_targets in tqdm(train_loader, desc=f'Finetune Epoch {epoch+1}'):
                 batch_features = batch_features.float()
@@ -1033,12 +906,9 @@ def train_unsupervised_transformer(config):
                 
                 with torch.cuda.amp.autocast(enabled=use_amp):
                     outputs = model(batch_features)
-                    if model.pretraining:
-                        loss, l1_loss, dtw_loss = combined_loss(outputs, batch_features)
-                    else:
-                        loss, l1_loss, dtw_loss = combined_loss(outputs, batch_targets)
+                    loss = criterion(outputs, batch_targets)
                 
-                if use_amp:
+                if scaler is not None:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -1050,13 +920,24 @@ def train_unsupervised_transformer(config):
                     optimizer.step()
                 
                 train_losses.append(loss.item())
-                train_l1_losses.append(l1_loss.item())
-                train_dtw_losses.append(dtw_loss.item())
+                for loss_name, loss_value in criterion.last_losses.items():
+                    train_metrics[f'train_{loss_name}_loss'].append(loss_value)
+                
+                # Update progress bar
+                train_loop.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'mae': f'{criterion.last_losses["mae"]:.4f}',
+                    'mse': f'{criterion.last_losses["mse"]:.4f}'
+                })
+                
+                # Clean up memory
+                del outputs, loss
+                if use_amp:
+                    torch.cuda.empty_cache()
             
             model.eval()
             val_losses = []
-            val_l1_losses = []
-            val_dtw_losses = []
+            val_metrics = defaultdict(list)
             
             with torch.no_grad():
                 for batch_features, batch_targets in val_loader:
@@ -1065,57 +946,55 @@ def train_unsupervised_transformer(config):
                     
                     with torch.cuda.amp.autocast(enabled=use_amp):
                         outputs = model(batch_features)
-                        loss = dtw_criterion(outputs, batch_targets)
+                        loss = criterion(outputs, batch_targets)
                     
                     val_losses.append(loss.item())
-                    val_l1_losses.append(l1_loss.item())
-                    val_dtw_losses.append(dtw_loss.item())
+                    for loss_name, loss_value in criterion.last_losses.items():
+                        val_metrics[f'val_{loss_name}_loss'].append(loss_value)
+                    
+                    # Update validation progress bar
+                    val_loop.set_postfix({
+                        'loss': f'{loss.item():.4f}',
+                        'mae': f'{criterion.last_losses["mae"]:.4f}',
+                        'mse': f'{criterion.last_losses["mse"]:.4f}'
+                    })
+                    
+                    # Clean up memory
+                    del outputs, loss
+                    if use_amp:
+                        torch.cuda.empty_cache()
             
+            # Calculate average losses
             avg_train_loss = np.mean(train_losses)
-            avg_train_l1 = np.mean(train_l1_losses)
-            avg_train_dtw = np.mean(train_dtw_losses)
             avg_val_loss = np.mean(val_losses)
-            avg_val_l1 = np.mean(val_l1_losses)
-            avg_val_dtw = np.mean(val_dtw_losses)
             
-            # Update history
-            history['finetune_train_loss'].append(avg_train_loss)
-            history['finetune_val_loss'].append(avg_val_loss)
-            history['finetune_epochs'].append(epoch)
+            # Calculate average metrics
+            train_metric_avgs = {name: np.mean(values) for name, values in train_metrics.items()}
+            val_metric_avgs = {name: np.mean(values) for name, values in val_metrics.items()}
             
-            # Log to wandb
+            # Update learning rate
+            scheduler.step(avg_val_loss)
+            
+            # Log metrics
             if wandb.run is not None:
                 wandb.log({
-                    'finetune/train_loss': avg_train_loss,
-                    'finetune/train_l1_loss': avg_train_l1,
-                    'finetune/train_dtw_loss': avg_train_dtw,
-                    'finetune/val_loss': avg_val_loss,
-                    'finetune/val_l1_loss': avg_val_l1,
-                    'finetune/val_dtw_loss': avg_val_dtw,
-                    'finetune/epoch': epoch,
+                    'finetune/loss/train': avg_train_loss,
+                    'finetune/loss/val': avg_val_loss,
                     'finetune/learning_rate': optimizer.param_groups[0]['lr'],
-                    **{f'finetune/{k}': v for k, v in {
-                        'train_mae_loss': avg_train_l1,
-                        'train_dtw_loss': avg_train_dtw,
-                        'train_mse_loss': avg_train_dtw
-                    }.items()},
-                    **{f'finetune/{k}': v for k, v in {
-                        'val_mae_loss': avg_val_l1,
-                        'val_dtw_loss': avg_val_dtw,
-                        'val_mse_loss': avg_val_dtw
-                    }.items()}
+                    'finetune/metrics/train_mae': train_metric_avgs["train_mae_loss"],
+                    'finetune/metrics/train_mse': train_metric_avgs["train_mse_loss"],
+                    'finetune/metrics/val_mae': val_metric_avgs["val_mae_loss"],
+                    'finetune/metrics/val_mse': val_metric_avgs["val_mse_loss"],
+                    'finetune/epoch': epoch
                 })
             
             # Print epoch summary
             print(f'\nEpoch {epoch+1}/{config.get("finetune_epochs", 150)}:')
-            print(f'Train Loss: {avg_train_loss:.4f} (MAE: {avg_train_l1:.4f}, '
-                  f'DTW: {avg_train_dtw:.4f}, MSE: {avg_train_dtw:.4f})')
-            print(f'Val Loss: {avg_val_loss:.4f} (MAE: {avg_val_l1:.4f}, '
-                  f'DTW: {avg_val_dtw:.4f}, MSE: {avg_val_dtw:.4f})')
+            print(f'Train Loss: {avg_train_loss:.4f} (MAE: {train_metric_avgs["train_mae_loss"]:.4f}, '
+                  f'MSE: {train_metric_avgs["train_mse_loss"]:.4f})')
+            print(f'Val Loss: {avg_val_loss:.4f} (MAE: {val_metric_avgs["val_mae_loss"]:.4f}, '
+                  f'MSE: {val_metric_avgs["val_mse_loss"]:.4f})')
             print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
-            
-            # Update learning rate
-            scheduler.step(avg_val_loss)
             
             # Save best model
             if avg_val_loss < best_finetune_loss:
@@ -1147,51 +1026,53 @@ def train_unsupervised_transformer(config):
                     print(f'\nEarly stopping triggered after {epoch+1} epochs')
                     break
         
-        # Use the best finetuned model for final evaluation
-        model.load_state_dict(best_finetune_state)
+            # Generate prediction plots every 10 epochs
+            if epoch % 10 == 0 and plots_dir is not None:
+                model.eval()
+                with torch.no_grad():
+                    # Get a batch of validation data for plotting
+                    val_features, val_targets = next(iter(val_loader))
+                    val_features = val_features.float().to(device)
+                    val_targets = val_targets.float().to(device)
+                    
+                    # Generate predictions
+                    predictions = model(val_features)
+                    
+                    # Plot and log
+                    plot_predictions(
+                        predictions=predictions,
+                        targets=val_targets,
+                        joint_names=config['joint_angle_columns'],
+                        model_name='transformer',
+                        plots_dir=plots_dir,
+                        epoch=epoch,
+                        phase='val'
+                    )
+        
+        # Generate final prediction plots
         model.eval()
-        model.set_pretraining(False)
+        with torch.no_grad():
+            val_features, val_targets = next(iter(val_loader))
+            val_features = val_features.float().to(device)
+            val_targets = val_targets.float().to(device)
+            predictions = model(val_features)
+            
+            final_metrics = plot_predictions(
+                predictions=predictions,
+                targets=val_targets,
+                joint_names=config['joint_angle_columns'],
+                model_name='transformer',
+                plots_dir=plots_dir,
+                epoch='final',
+                phase='val'
+            )
+            
+            if wandb.run is not None:
+                wandb.log({
+                    'final/metrics': final_metrics
+                })
         
-        # Generate and save final predictions plot
-        metrics = plot_predictions(
-            test_predictions, 
-            test_targets, 
-            joint_names=config['joint_angle_columns'],
-            model_name=model_name,
-            use_windows=config['use_windows'],
-            window_size=config['window_size']
-        )
-        
-        # Log final metrics
-        log_wandb({
-            'test/loss': test_loss,
-            'test/metrics': metrics,
-            'training/total_epochs': config['num_epochs'],
-            'training/best_epoch': best_finetune_epoch,
-            'training/best_val_loss': best_finetune_loss,
-        })
-        
-        # Save final model and results
-        final_results = {
-            'model_state_dict': best_finetune_state,
-            'pretrained_state_dict': best_pretrain_state,
-            'config': config,
-            'metrics': metrics,
-            'history': history,
-            'feature_scaler': feature_scaler,
-            'target_scaler': target_scaler,
-            'pretrain_loss': best_pretrain_loss,
-            'pretrain_epoch': best_pretrain_epoch,
-            'finetune_loss': best_finetune_loss,
-            'finetune_epoch': best_finetune_epoch
-        }
-        
-        torch.save(final_results, trial_dir / 'final_model.pth')
-        
-        if wandb.run is not None:
-            wandb.finish()
-        
-        return model, metrics
+        return model, final_metrics
         
     except Exception as e:
         print(f"Error in training: {str(e)}")
@@ -1333,40 +1214,36 @@ def objective_unsupervised(trial, base_config, trial_num, total_trials):
         return float('inf')
 
 def pretrain_transformer(model, train_loader, val_loader, device, config, num_epochs=100, patience=10, trial_dir=None, plots_dir=None, run_name=None):
-    """Pretrain the transformer model using reconstruction loss."""
-    # Ensure model is in pretraining mode
-    model.set_pretraining(True)
-    
-    dtw_criterion = DTWLoss().to(device)
-    
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config['pretrain_lr'],
-        weight_decay=config['weight_decay']
-    )
-    
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5, verbose=True
-    )
-    
-    best_loss = float('inf')
-    best_epoch = -1
-    best_state = None
-    patience_counter = 0
-    
-    # Lists to store losses for plotting
-    train_losses = []
-    val_losses = []
-    epochs = []
-    
-    # Enable gradient scaler and AMP for mixed precision
-    use_amp = torch.cuda.is_available() and hasattr(torch.cuda.amp, 'autocast')
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
-    
+    """Pretrain transformer model in an unsupervised manner."""
     try:
+        # Ensure model is in pretraining mode
+        model.set_pretraining(True)
+        model.train()
+        
+        # Initialize loss function and optimizer
+        criterion = MAELoss().to(device)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config['pretrain_lr'],
+            weight_decay=config['weight_decay']
+        )
+        
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        )
+        
+        best_loss = float('inf')
+        best_epoch = -1
+        best_state = None
+        patience_counter = 0
+        
+        # Enable gradient scaler for mixed precision training
+        use_amp = torch.cuda.is_available() and hasattr(torch.cuda.amp, 'autocast')
+        scaler = torch.cuda.amp.GradScaler() if use_amp else None
+        
         for epoch in range(num_epochs):
             model.train()
-            epoch_train_losses = []
+            train_losses = []
             train_metrics = defaultdict(list)
             
             # Training loop with progress bar
@@ -1377,8 +1254,10 @@ def pretrain_transformer(model, train_loader, val_loader, device, config, num_ep
                 optimizer.zero_grad(set_to_none=True)
                 
                 with torch.cuda.amp.autocast(enabled=use_amp):
-                    outputs = model(batch_features)
-                    loss = dtw_criterion(outputs, batch_features)
+                    # Forward pass - reconstruct input features
+                    reconstructed = model(batch_features)
+                    # Calculate reconstruction loss
+                    loss = criterion(reconstructed, batch_features)
                 
                 if scaler is not None:
                     scaler.scale(loss).backward()
@@ -1392,36 +1271,25 @@ def pretrain_transformer(model, train_loader, val_loader, device, config, num_ep
                     optimizer.step()
                 
                 # Store losses for logging
-                epoch_train_losses.append(loss.item())
-                for loss_name, loss_value in dtw_criterion.last_losses.items():
+                train_losses.append(loss.item())
+                for loss_name, loss_value in criterion.last_losses.items():
                     train_metrics[f'train_{loss_name}_loss'].append(loss_value)
                 
                 # Update progress bar
                 train_loop.set_postfix({
                     'loss': f'{loss.item():.4f}',
-                    'mae': f'{dtw_criterion.last_losses["mae"]:.4f}',
-                    'dtw': f'{dtw_criterion.last_losses["dtw"]:.4f}',
-                    'mse': f'{dtw_criterion.last_losses["mse"]:.4f}'
+                    'mae': f'{criterion.last_losses["mae"]:.4f}',
+                    'mse': f'{criterion.last_losses["mse"]:.4f}'
                 })
                 
-                # Log to wandb every 50 batches
-                if wandb.run is not None and batch_idx % 50 == 0:
-                    wandb.log({
-                        'pretrain/batch': batch_idx + epoch * len(train_loader),
-                        'pretrain/train_loss': loss.item(),
-                        'pretrain/train_mae_loss': dtw_criterion.last_losses['mae'],
-                        'pretrain/train_dtw_loss': dtw_criterion.last_losses['dtw'],
-                        'pretrain/train_mse': dtw_criterion.last_losses['mse']
-                    })
-                
                 # Clean up memory
-                del outputs, loss
-                if scaler is not None:
+                del reconstructed, loss
+                if use_amp:
                     torch.cuda.empty_cache()
             
             # Validation loop
             model.eval()
-            epoch_val_losses = []
+            val_losses = []
             val_metrics = defaultdict(list)
             
             with torch.no_grad():
@@ -1430,49 +1298,32 @@ def pretrain_transformer(model, train_loader, val_loader, device, config, num_ep
                     batch_features = batch_features.float().to(device)
                     
                     with torch.cuda.amp.autocast(enabled=use_amp):
-                        outputs = model(batch_features)
-                        loss = dtw_criterion(outputs, batch_features)
+                        reconstructed = model(batch_features)
+                        loss = criterion(reconstructed, batch_features)
                     
-                    # Store losses for logging
-                    epoch_val_losses.append(loss.item())
-                    for loss_name, loss_value in dtw_criterion.last_losses.items():
+                    val_losses.append(loss.item())
+                    for loss_name, loss_value in criterion.last_losses.items():
                         val_metrics[f'val_{loss_name}_loss'].append(loss_value)
                     
                     # Update validation progress bar
                     val_loop.set_postfix({
                         'loss': f'{loss.item():.4f}',
-                        'mae': f'{dtw_criterion.last_losses["mae"]:.4f}',
-                        'dtw': f'{dtw_criterion.last_losses["dtw"]:.4f}',
-                        'mse': f'{dtw_criterion.last_losses["mse"]:.4f}'
+                        'mae': f'{criterion.last_losses["mae"]:.4f}',
+                        'mse': f'{criterion.last_losses["mse"]:.4f}'
                     })
+                    
+                    # Clean up memory
+                    del reconstructed, loss
+                    if use_amp:
+                        torch.cuda.empty_cache()
             
             # Calculate average losses
-            avg_train_loss = np.mean(epoch_train_losses)
-            avg_val_loss = np.mean(epoch_val_losses)
+            avg_train_loss = np.mean(train_losses)
+            avg_val_loss = np.mean(val_losses)
             
             # Calculate average metrics
             train_metric_avgs = {name: np.mean(values) for name, values in train_metrics.items()}
             val_metric_avgs = {name: np.mean(values) for name, values in val_metrics.items()}
-            
-            # Store losses for plotting
-            train_losses.append(avg_train_loss)
-            val_losses.append(avg_val_loss)
-            epochs.append(epoch)
-            
-            # Create and log learning curves plot to wandb
-            if wandb.run is not None:
-                wandb.log({
-                    "pretrain/train_loss": avg_train_loss,
-                    "pretrain/val_loss": avg_val_loss,
-                    "pretrain/train_mae": train_metric_avgs["train_mae_loss"],
-                    "pretrain/train_dtw": train_metric_avgs["train_dtw_loss"],
-                    "pretrain/train_mse": train_metric_avgs["train_mse_loss"],
-                    "pretrain/val_mae": val_metric_avgs["val_mae_loss"],
-                    "pretrain/val_dtw": val_metric_avgs["val_dtw_loss"],
-                    "pretrain/val_mse": val_metric_avgs["val_mse_loss"],
-                    "pretrain/epoch": epoch,
-                    "pretrain/learning_rate": optimizer.param_groups[0]['lr']
-                })
             
             # Update learning rate
             scheduler.step(avg_val_loss)
@@ -1480,27 +1331,29 @@ def pretrain_transformer(model, train_loader, val_loader, device, config, num_ep
             # Log metrics
             if wandb.run is not None:
                 wandb.log({
-                    'pretrain/epoch': epoch,
-                    'pretrain/train_loss': avg_train_loss,
-                    'pretrain/val_loss': avg_val_loss,
+                    'pretrain/loss/train': avg_train_loss,
+                    'pretrain/loss/val': avg_val_loss,
                     'pretrain/learning_rate': optimizer.param_groups[0]['lr'],
-                    **{f'pretrain/{k}': v for k, v in train_metric_avgs.items()},
-                    **{f'pretrain/{k}': v for k, v in val_metric_avgs.items()}
+                    'pretrain/metrics/train_mae': train_metric_avgs["train_mae_loss"],
+                    'pretrain/metrics/train_mse': train_metric_avgs["train_mse_loss"],
+                    'pretrain/metrics/val_mae': val_metric_avgs["val_mae_loss"],
+                    'pretrain/metrics/val_mse': val_metric_avgs["val_mse_loss"],
+                    'pretrain/epoch': epoch
                 })
             
             # Print epoch summary
             print(f'\nEpoch {epoch+1}/{num_epochs}:')
             print(f'Train Loss: {avg_train_loss:.4f} (MAE: {train_metric_avgs["train_mae_loss"]:.4f}, '
-                  f'DTW: {train_metric_avgs["train_dtw_loss"]:.4f}, MSE: {train_metric_avgs["train_mse_loss"]:.4f})')
+                  f'MSE: {train_metric_avgs["train_mse_loss"]:.4f})')
             print(f'Val Loss: {avg_val_loss:.4f} (MAE: {val_metric_avgs["val_mae_loss"]:.4f}, '
-                  f'DTW: {val_metric_avgs["val_dtw_loss"]:.4f}, MSE: {val_metric_avgs["val_mse_loss"]:.4f})')
+                  f'MSE: {val_metric_avgs["val_mse_loss"]:.4f})')
             print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
             
             # Save best model
             if avg_val_loss < best_loss:
                 best_loss = avg_val_loss
                 best_epoch = epoch
-                best_state = model.state_dict()
+                best_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
                 patience_counter = 0
                 
                 # Save best model state
@@ -1522,48 +1375,89 @@ def pretrain_transformer(model, train_loader, val_loader, device, config, num_ep
                 if patience_counter >= patience:
                     print(f'\nEarly stopping triggered after {epoch+1} epochs')
                     break
+            
+            # Generate prediction plots every 10 epochs
+            if epoch % 10 == 0 and plots_dir is not None:
+                model.eval()
+                with torch.no_grad():
+                    # Get a batch of validation data for plotting
+                    val_features, _ = next(iter(val_loader))
+                    val_features = val_features.float().to(device)
+                    
+                    # Generate reconstructions
+                    reconstructed = model(val_features)
+                    
+                    # Plot and log
+                    plot_predictions(
+                        predictions=reconstructed,
+                        targets=val_features,
+                        joint_names=config['velocity_features'],
+                        model_name='transformer',
+                        plots_dir=plots_dir,
+                        epoch=epoch,
+                        phase='pretrain_val'
+                    )
         
-        # Load best model state
-        model.load_state_dict(best_state)
+        # Generate final reconstruction plots
+        model.eval()
+        with torch.no_grad():
+            val_features, _ = next(iter(val_loader))
+            val_features = val_features.float().to(device)
+            reconstructed = model(val_features)
+            
+            final_metrics = plot_predictions(
+                predictions=reconstructed,
+                targets=val_features,
+                joint_names=config['velocity_features'],
+                model_name='transformer',
+                plots_dir=plots_dir,
+                epoch='final',
+                phase='pretrain_val'
+            )
+            
+            if wandb.run is not None:
+                wandb.log({
+                    'final/pretrain_metrics': final_metrics
+                })
+        
         return best_loss, best_epoch, best_state
-    
+        
     except Exception as e:
         print(f"Error during pretraining: {str(e)}")
-        traceback.print_exc()
+        print(f"Traceback: {traceback.format_exc()}")
         return float('inf'), -1, None
 
 def finetune_transformer(model, train_loader, val_loader, device, config, num_epochs=150, patience=10, trial_dir=None, plots_dir=None, run_name=None):
-    """Finetune the transformer model for the target task."""
-    dtw_criterion = DTWLoss().to(device)
-    
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config['finetune_lr'],
-        weight_decay=config['weight_decay']
-    )
-    
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5, verbose=True
-    )
-    
-    best_loss = float('inf')
-    best_epoch = -1
-    best_state = None
-    patience_counter = 0
-    
-    # Lists to store losses for plotting
-    train_losses = []
-    val_losses = []
-    epochs = []
-    
-    # Enable gradient scaler and AMP for mixed precision
-    use_amp = torch.cuda.is_available() and hasattr(torch.cuda.amp, 'autocast')
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
-    
+    """Finetune transformer model for joint angle prediction."""
     try:
+        # Ensure model is in finetuning mode
+        model.set_pretraining(False)
+        model.train()
+        
+        # Initialize loss function and optimizer
+        criterion = MAELoss().to(device)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config['finetune_lr'],
+            weight_decay=config['weight_decay']
+        )
+        
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        )
+        
+        best_loss = float('inf')
+        best_epoch = -1
+        best_state = None
+        patience_counter = 0
+        
+        # Enable gradient scaler for mixed precision training
+        use_amp = torch.cuda.is_available() and hasattr(torch.cuda.amp, 'autocast')
+        scaler = torch.cuda.amp.GradScaler() if use_amp else None
+        
         for epoch in range(num_epochs):
             model.train()
-            epoch_train_losses = []
+            train_losses = []
             train_metrics = defaultdict(list)
             
             # Training loop with progress bar
@@ -1575,8 +1469,10 @@ def finetune_transformer(model, train_loader, val_loader, device, config, num_ep
                 optimizer.zero_grad(set_to_none=True)
                 
                 with torch.cuda.amp.autocast(enabled=use_amp):
-                    outputs = model(batch_features)
-                    loss = dtw_criterion(outputs, batch_targets)
+                    # Forward pass - predict joint angles
+                    predictions = model(batch_features)
+                    # Calculate prediction loss
+                    loss = criterion(predictions, batch_targets)
                 
                 if scaler is not None:
                     scaler.scale(loss).backward()
@@ -1590,36 +1486,25 @@ def finetune_transformer(model, train_loader, val_loader, device, config, num_ep
                     optimizer.step()
                 
                 # Store losses for logging
-                epoch_train_losses.append(loss.item())
-                for loss_name, loss_value in dtw_criterion.last_losses.items():
+                train_losses.append(loss.item())
+                for loss_name, loss_value in criterion.last_losses.items():
                     train_metrics[f'train_{loss_name}_loss'].append(loss_value)
                 
                 # Update progress bar
                 train_loop.set_postfix({
                     'loss': f'{loss.item():.4f}',
-                    'mae': f'{dtw_criterion.last_losses["mae"]:.4f}',
-                    'dtw': f'{dtw_criterion.last_losses["dtw"]:.4f}',
-                    'mse': f'{dtw_criterion.last_losses["mse"]:.4f}'
+                    'mae': f'{criterion.last_losses["mae"]:.4f}',
+                    'mse': f'{criterion.last_losses["mse"]:.4f}'
                 })
                 
-                # Log to wandb every 50 batches
-                if wandb.run is not None and batch_idx % 50 == 0:
-                    wandb.log({
-                        'finetune/batch': batch_idx + epoch * len(train_loader),
-                        'finetune/train_loss': loss.item(),
-                        'finetune/train_mae_loss': dtw_criterion.last_losses['mae'],
-                        'finetune/train_dtw_loss': dtw_criterion.last_losses['dtw'],
-                        'finetune/train_mse': dtw_criterion.last_losses['mse']
-                    })
-                
                 # Clean up memory
-                del outputs, loss
-                if scaler is not None:
+                del predictions, loss
+                if use_amp:
                     torch.cuda.empty_cache()
             
             # Validation loop
             model.eval()
-            epoch_val_losses = []
+            val_losses = []
             val_metrics = defaultdict(list)
             
             with torch.no_grad():
@@ -1629,49 +1514,32 @@ def finetune_transformer(model, train_loader, val_loader, device, config, num_ep
                     batch_targets = batch_targets.float().to(device)
                     
                     with torch.cuda.amp.autocast(enabled=use_amp):
-                        outputs = model(batch_features)
-                        loss = dtw_criterion(outputs, batch_targets)
+                        predictions = model(batch_features)
+                        loss = criterion(predictions, batch_targets)
                     
-                    # Store losses for logging
-                    epoch_val_losses.append(loss.item())
-                    for loss_name, loss_value in dtw_criterion.last_losses.items():
+                    val_losses.append(loss.item())
+                    for loss_name, loss_value in criterion.last_losses.items():
                         val_metrics[f'val_{loss_name}_loss'].append(loss_value)
                     
                     # Update validation progress bar
                     val_loop.set_postfix({
                         'loss': f'{loss.item():.4f}',
-                        'mae': f'{dtw_criterion.last_losses["mae"]:.4f}',
-                        'dtw': f'{dtw_criterion.last_losses["dtw"]:.4f}',
-                        'mse': f'{dtw_criterion.last_losses["mse"]:.4f}'
+                        'mae': f'{criterion.last_losses["mae"]:.4f}',
+                        'mse': f'{criterion.last_losses["mse"]:.4f}'
                     })
+                    
+                    # Clean up memory
+                    del predictions, loss
+                    if use_amp:
+                        torch.cuda.empty_cache()
             
             # Calculate average losses
-            avg_train_loss = np.mean(epoch_train_losses)
-            avg_train_l1 = np.mean(train_metrics['train_mae_loss'])
-            avg_train_dtw = np.mean(train_metrics['train_dtw_loss'])
-            avg_val_loss = np.mean(epoch_val_losses)
-            avg_val_l1 = np.mean(val_metrics['val_mae_loss'])
-            avg_val_dtw = np.mean(val_metrics['val_dtw_loss'])
+            avg_train_loss = np.mean(train_losses)
+            avg_val_loss = np.mean(val_losses)
             
-            # Store losses for plotting
-            train_losses.append(avg_train_loss)
-            val_losses.append(avg_val_loss)
-            epochs.append(epoch)
-            
-            # Create and log learning curves plot to wandb
-            if wandb.run is not None:
-                wandb.log({
-                    "finetune/train_loss": avg_train_loss,
-                    "finetune/val_loss": avg_val_loss,
-                    "finetune/train_mae": train_metric_avgs["train_mae_loss"],
-                    "finetune/train_dtw": train_metric_avgs["train_dtw_loss"],
-                    "finetune/train_mse": train_metric_avgs["train_mse_loss"],
-                    "finetune/val_mae": val_metric_avgs["val_mae_loss"],
-                    "finetune/val_dtw": val_metric_avgs["val_dtw_loss"],
-                    "finetune/val_mse": val_metric_avgs["val_mse_loss"],
-                    "finetune/epoch": epoch,
-                    "finetune/learning_rate": optimizer.param_groups[0]['lr']
-                })
+            # Calculate average metrics
+            train_metric_avgs = {name: np.mean(values) for name, values in train_metrics.items()}
+            val_metric_avgs = {name: np.mean(values) for name, values in val_metrics.items()}
             
             # Update learning rate
             scheduler.step(avg_val_loss)
@@ -1679,27 +1547,29 @@ def finetune_transformer(model, train_loader, val_loader, device, config, num_ep
             # Log metrics
             if wandb.run is not None:
                 wandb.log({
-                    'finetune/epoch': epoch,
-                    'finetune/train_loss': avg_train_loss,
-                    'finetune/val_loss': avg_val_loss,
+                    'finetune/loss/train': avg_train_loss,
+                    'finetune/loss/val': avg_val_loss,
                     'finetune/learning_rate': optimizer.param_groups[0]['lr'],
-                    **{f'finetune/{k}': v for k, v in train_metrics.items()},
-                    **{f'finetune/{k}': v for k, v in val_metrics.items()}
+                    'finetune/metrics/train_mae': train_metric_avgs["train_mae_loss"],
+                    'finetune/metrics/train_mse': train_metric_avgs["train_mse_loss"],
+                    'finetune/metrics/val_mae': val_metric_avgs["val_mae_loss"],
+                    'finetune/metrics/val_mse': val_metric_avgs["val_mse_loss"],
+                    'finetune/epoch': epoch
                 })
             
             # Print epoch summary
             print(f'\nEpoch {epoch+1}/{num_epochs}:')
-            print(f'Train Loss: {avg_train_loss:.4f} (MAE: {avg_train_l1:.4f}, '
-                  f'DTW: {avg_train_dtw:.4f})')
-            print(f'Val Loss: {avg_val_loss:.4f} (MAE: {avg_val_l1:.4f}, '
-                  f'DTW: {avg_val_dtw:.4f})')
+            print(f'Train Loss: {avg_train_loss:.4f} (MAE: {train_metric_avgs["train_mae_loss"]:.4f}, '
+                  f'MSE: {train_metric_avgs["train_mse_loss"]:.4f})')
+            print(f'Val Loss: {avg_val_loss:.4f} (MAE: {val_metric_avgs["val_mae_loss"]:.4f}, '
+                  f'MSE: {val_metric_avgs["val_mse_loss"]:.4f})')
             print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
             
             # Save best model
             if avg_val_loss < best_loss:
                 best_loss = avg_val_loss
                 best_epoch = epoch
-                best_state = model.state_dict()
+                best_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
                 patience_counter = 0
                 
                 # Save best model state
@@ -1711,8 +1581,8 @@ def finetune_transformer(model, train_loader, val_loader, device, config, num_ep
                         'scheduler_state_dict': scheduler.state_dict(),
                         'loss': best_loss,
                         'metrics': {
-                            'train': train_metrics,
-                            'val': val_metrics
+                            'train': train_metric_avgs,
+                            'val': val_metric_avgs
                         }
                     }, trial_dir / 'best_finetune_model.pth')
                     print(f"\nSaved new best model at epoch {epoch+1} with val_loss: {best_loss:.4f}")
@@ -1721,14 +1591,58 @@ def finetune_transformer(model, train_loader, val_loader, device, config, num_ep
                 if patience_counter >= patience:
                     print(f'\nEarly stopping triggered after {epoch+1} epochs')
                     break
+            
+            # Generate prediction plots every 10 epochs
+            if epoch % 10 == 0 and plots_dir is not None:
+                model.eval()
+                with torch.no_grad():
+                    # Get a batch of validation data for plotting
+                    val_features, val_targets = next(iter(val_loader))
+                    val_features = val_features.float().to(device)
+                    val_targets = val_targets.float().to(device)
+                    
+                    # Generate predictions
+                    predictions = model(val_features)
+                    
+                    # Plot and log
+                    plot_predictions(
+                        predictions=predictions,
+                        targets=val_targets,
+                        joint_names=config['joint_angle_columns'],
+                        model_name='transformer',
+                        plots_dir=plots_dir,
+                        epoch=epoch,
+                        phase='val'
+                    )
         
-        # Load best model state
-        model.load_state_dict(best_state)
+        # Generate final prediction plots
+        model.eval()
+        with torch.no_grad():
+            val_features, val_targets = next(iter(val_loader))
+            val_features = val_features.float().to(device)
+            val_targets = val_targets.float().to(device)
+            predictions = model(val_features)
+            
+            final_metrics = plot_predictions(
+                predictions=predictions,
+                targets=val_targets,
+                joint_names=config['joint_angle_columns'],
+                model_name='transformer',
+                plots_dir=plots_dir,
+                epoch='final',
+                phase='val'
+            )
+            
+            if wandb.run is not None:
+                wandb.log({
+                    'final/metrics': final_metrics
+                })
+        
         return best_loss, best_epoch, model
-    
+        
     except Exception as e:
         print(f"Error during finetuning: {str(e)}")
-        traceback.print_exc()
+        print(f"Traceback: {traceback.format_exc()}")
         return float('inf'), -1, model
 
 if __name__ == "__main__":

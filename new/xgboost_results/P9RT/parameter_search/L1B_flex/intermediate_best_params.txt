@@ -1,0 +1,136 @@
+
+New best parameters found at iteration 1:
+MAE: 10.2261
+max_depth: 3
+learning_rate: 0.01
+n_estimators: 3000
+min_child_weight: 1
+max_leaves: 0
+subsample: 0.7
+colsample_bytree: 0.7
+colsample_bylevel: 0.9
+gamma: 0
+reg_alpha: 0.1
+reg_lambda: 2
+tree_method: hist
+device: cuda
+--------------------------------------------------
+
+New best parameters found at iteration 5:
+MAE: 10.2260
+max_depth: 3
+learning_rate: 0.01
+n_estimators: 3000
+min_child_weight: 1
+max_leaves: 0
+subsample: 0.7
+colsample_bytree: 0.7
+colsample_bylevel: 0.7
+gamma: 0.1
+reg_alpha: 0.0
+reg_lambda: 2
+tree_method: hist
+device: cuda
+--------------------------------------------------
+
+New best parameters found at iteration 17:
+MAE: 10.2260
+max_depth: 3
+learning_rate: 0.01
+n_estimators: 3000
+min_child_weight: 1
+max_leaves: 31
+subsample: 0.7
+colsample_bytree: 0.9
+colsample_bylevel: 0.9
+gamma: 0
+reg_alpha: 0.0
+reg_lambda: 2
+tree_method: hist
+device: cuda
+--------------------------------------------------
+
+New best parameters found at iteration 33:
+MAE: 10.2256
+max_depth: 3
+learning_rate: 0.01
+n_estimators: 3000
+min_child_weight: 1
+max_leaves: 0
+subsample: 0.9
+colsample_bytree: 0.7
+colsample_bylevel: 0.7
+gamma: 0
+reg_alpha: 0.1
+reg_lambda: 2
+tree_method: hist
+device: cuda
+--------------------------------------------------
+
+New best parameters found at iteration 45:
+MAE: 10.2256
+max_depth: 3
+learning_rate: 0.01
+n_estimators: 3000
+min_child_weight: 1
+max_leaves: 31
+subsample: 0.9
+colsample_bytree: 0.7
+colsample_bylevel: 0.9
+gamma: 0.1
+reg_alpha: 0.1
+reg_lambda: 2
+tree_method: hist
+device: cuda
+--------------------------------------------------
+
+New best parameters found at iteration 48:
+MAE: 10.2255
+max_depth: 3
+learning_rate: 0.01
+n_estimators: 3000
+min_child_weight: 1
+max_leaves: 31
+subsample: 0.9
+colsample_bytree: 0.7
+colsample_bylevel: 0.7
+gamma: 0.1
+reg_alpha: 0.0
+reg_lambda: 1
+tree_method: hist
+device: cuda
+--------------------------------------------------
+
+New best parameters found at iteration 51:
+MAE: 10.2250
+max_depth: 3
+learning_rate: 0.01
+n_estimators: 3000
+min_child_weight: 1
+max_leaves: 31
+subsample: 0.9
+colsample_bytree: 0.9
+colsample_bylevel: 0.7
+gamma: 0
+reg_alpha: 0.1
+reg_lambda: 1
+tree_method: hist
+device: cuda
+--------------------------------------------------
+
+New best parameters found at iteration 54:
+MAE: 10.2250
+max_depth: 3
+learning_rate: 0.01
+n_estimators: 3000
+min_child_weight: 1
+max_leaves: 31
+subsample: 0.9
+colsample_bytree: 0.9
+colsample_bylevel: 0.7
+gamma: 0.1
+reg_alpha: 0.1
+reg_lambda: 1
+tree_method: hist
+device: cuda
+--------------------------------------------------
