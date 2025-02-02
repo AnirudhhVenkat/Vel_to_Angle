@@ -1,0 +1,297 @@
+COORDINATE-JOINT CORRELATIONS BY LEG
+====================================
+
+RIGHT FRONT LEG (R1)
+-------------------
+Strong correlations (|ρ| > 0.8):
+1. R-F-CTr_y → R1A_flex: 0.971 (strongest overall)
+2. R-F-FeTi_z → R1B_flex: -0.933
+3. R-F-TiTa_y → R1A_flex: 0.913
+4. R-F-FeTi_y → R1A_flex: 0.908
+5. R-F-FeTi_y → R1A_rot: 0.897
+6. R-F-TaG_y → R1A_flex: 0.890
+7. R-F-TiTa_y → R1A_rot: 0.860
+8. R-F-TiTa_z → R1B_flex: -0.859
+9. R-F-CTr_z → R1A_flex: -0.858
+10. R-F-CTr_y → R1A_abduct: -0.819
+11. R-F-FeTi_z → R1C_flex: -0.801
+
+Moderate correlations (0.6 < |ρ| < 0.8):
+1. R-F-CTr_y → R1A_rot: 0.764
+2. R-F-CTr_z → R1A_rot: -0.764
+3. R-F-FeTi_y → R1A_abduct: -0.709
+4. R-F-CTr_y → R1C_flex: 0.708
+5. R-F-TiTa_y → R1C_flex: 0.707
+
+LEFT FRONT LEG (L1)
+------------------
+Strong correlations (|ρ| > 0.8):
+1. L-F-FeTi_z → L1B_flex: -0.964
+2. L-F-CTr_y → L1A_flex: 0.913
+3. L-F-TiTa_z → L1B_flex: -0.909
+4. L-F-FeTi_z → L1B_rot: 0.870
+5. L-F-TiTa_z → L1B_rot: 0.865
+6. L-F-CTr_y → L1B_flex: 0.830
+7. L-F-TiTa_y → L1C_flex: 0.825
+8. L-F-TaG_z → L1B_rot: 0.817
+9. L-F-TaG_z → L1B_flex: -0.816
+
+Moderate correlations (0.6 < |ρ| < 0.8):
+1. L-F-CTr_z → L1A_flex: -0.799
+2. L-F-FeTi_z → L1C_flex: -0.772
+3. L-F-CTr_y → L1A_abduct: -0.761
+4. L-F-TiTa_z → L1C_flex: -0.758
+5. L-F-TaG_x → L1C_rot: -0.756
+
+RIGHT MIDDLE LEG (R2)
+--------------------
+Strong correlations (|ρ| > 0.8):
+1. R-M-TaG_y → R2B_rot: -0.877
+2. R-M-TiTa_y → R2B_rot: -0.870
+3. R-M-FeTi_y → R2B_rot: -0.861
+4. R-M-FeTi_z → R2C_flex: -0.828
+
+Moderate correlations (0.6 < |ρ| < 0.8):
+1. R-M-TaG_y → R2C_rot: 0.762
+2. R-M-FeTi_x → R2A_rot: 0.784
+3. R-M-FeTi_y → R2B_flex: -0.716
+4. R-M-TiTa_y → R2B_flex: -0.705
+5. R-M-CTr_y → R2A_abduct: -0.701
+
+LEFT MIDDLE LEG (L2)
+-------------------
+Strong correlations (|ρ| > 0.8):
+1. L-M-TiTa_z → L2B_flex: -0.913
+2. L-M-FeTi_z → L2B_flex: -0.908
+3. L-M-FeTi_y → L2A_rot: -0.878
+4. L-M-TiTa_z → L2C_flex: -0.822
+5. L-M-TiTa_y → L2A_rot: -0.818
+6. L-M-TiTa_y → L2B_rot: 0.817
+7. L-M-TaG_y → L2C_rot: -0.816
+
+Moderate correlations (0.6 < |ρ| < 0.8):
+1. L-M-TaG_z → L2B_flex: -0.781
+2. L-M-FeTi_y → L2B_rot: 0.776
+3. L-M-FeTi_z → L2C_flex: -0.769
+4. L-M-TiTa_x → L2C_flex: -0.766
+
+RIGHT HIND LEG (R3)
+------------------
+Strong correlations (|ρ| > 0.8):
+1. R-H-FeTi_x → R3A_rot: 0.946
+2. R-H-TiTa_x → R3A_rot: 0.900
+3. R-H-FeTi_z → R3B_flex: -0.849
+4. R-H-FeTi_y → R3B_flex: -0.837
+
+Moderate correlations (0.6 < |ρ| < 0.8):
+1. R-H-TaG_x → R3A_rot: 0.807
+2. R-H-FeTi_y → R3A_rot: 0.806
+3. R-H-FeTi_z → R3C_flex: -0.754
+4. R-H-TaG_x → R3C_rot: 0.750
+5. R-H-FeTi_x → R3B_flex: -0.749
+6. R-H-FeTi_z → R3B_rot: 0.743
+
+LEFT HIND LEG (L3)
+-----------------
+Strong correlations (|ρ| > 0.8):
+1. L-H-FeTi_z → L3B_flex: -0.916
+2. L-H-TiTa_z → L3B_flex: -0.863
+3. L-H-CTr_y → L3B_rot: 0.848
+
+Moderate correlations (0.6 < |ρ| < 0.8):
+1. L-H-FeTi_z → L3C_flex: -0.812
+2. L-H-TaG_z → L3B_flex: -0.798
+3. L-H-TaG_y → L3A_rot: -0.794
+4. L-H-TaG_x → L3C_rot: 0.793
+5. L-H-TiTa_y → L3A_rot: -0.789
+6. L-H-FeTi_y → L3A_rot: -0.802
+7. L-H-TiTa_z → L3C_flex: -0.695
+
+PREDICTION PLANS BY LEG
+======================
+
+RIGHT FRONT LEG (R1) - Starting from R-F-CTr_y
+---------------------------------------------
+1. R1A_flex
+   - Direct prediction from R-F-CTr_y (ρ = 0.971)
+   - Strongest correlation in dataset
+
+2. R1A_rot
+   - From R-F-CTr_y (ρ = 0.764)
+   - R1A_flex correlation helps refine
+
+3. R1A_abduct
+   - From R-F-CTr_y (ρ = -0.819)
+   - R1A_flex correlation helps refine
+
+4. R1B_flex
+   - Use R-F-FeTi_z (ρ = -0.933)
+   - R1A_flex helps refine prediction
+
+5. R1B_rot
+   - From R-F-FeTi_y and R1B_flex correlations
+   - Use previous predictions to refine
+
+6. R1C_flex
+   - From R-F-FeTi_z (ρ = -0.801)
+   - Chain dependency with R1B_flex
+
+7. R1C_rot
+   - Use correlations with R1C_flex
+   - Previous angle predictions help refine
+
+8. R1D_flex
+   - Chain dependency from previous angles
+   - Use correlations with R1C angles
+
+LEFT FRONT LEG (L1) - Starting from L-F-CTr_y
+--------------------------------------------
+1. L1A_flex
+   - Direct from L-F-CTr_y (ρ = 0.913)
+   - Strong primary correlation
+
+2. L1B_flex
+   - Use L-F-FeTi_z (ρ = -0.964)
+   - L1A_flex helps refine
+
+3. L1B_rot
+   - From L-F-FeTi_z (ρ = 0.870)
+   - Use L1B_flex to refine
+
+4. L1A_abduct
+   - From L-F-CTr_y (ρ = -0.761)
+   - L1A_flex helps refine
+
+5. L1C_flex
+   - From L-F-TiTa_y (ρ = 0.825)
+   - Use L1B_flex to refine
+
+6. L1C_rot
+   - From L-F-TaG_x (ρ = -0.756)
+   - Use previous predictions
+
+7. L1D_flex
+   - Chain dependency from previous angles
+   - Use correlations with L1C angles
+
+RIGHT MIDDLE LEG (R2) - Starting from R-M-TaG_y
+---------------------------------------------
+1. R2B_rot
+   - Direct from R-M-TaG_y (ρ = -0.877)
+   - Strongest correlation for R2
+
+2. R2B_flex
+   - From R-M-FeTi_y (ρ = -0.716)
+   - R2B_rot helps refine
+
+3. R2A_rot
+   - Use R-M-FeTi_x (ρ = 0.784)
+   - R2B_rot helps refine
+
+4. R2A_abduct
+   - From R-M-CTr_y (ρ = -0.701)
+   - Use previous predictions
+
+5. R2A_flex
+   - Chain dependency from R2A_rot
+   - Use correlations with other angles
+
+6. R2C_flex
+   - From R-M-FeTi_z (ρ = -0.828)
+   - Use previous predictions
+
+7. R2C_rot
+   - From R-M-TaG_y (ρ = 0.762)
+   - Use R2C_flex correlation
+
+8. R2D_flex
+   - Chain dependency from previous angles
+   - Use correlations with R2C angles
+
+LEFT MIDDLE LEG (L2) - Starting from L-M-TiTa_z
+---------------------------------------------
+1. L2B_flex
+   - Direct from L-M-TiTa_z (ρ = -0.913)
+   - Also use L-M-FeTi_z (ρ = -0.908)
+
+2. L2A_rot
+   - From L-M-FeTi_y (ρ = -0.878)
+   - L2B_flex helps refine
+
+3. L2B_rot
+   - From L-M-TiTa_y (ρ = 0.817)
+   - Use previous predictions
+
+4. L2C_flex
+   - From L-M-TiTa_z (ρ = -0.822)
+   - Chain of previous predictions
+
+5. L2C_rot
+   - From L-M-TaG_y (ρ = -0.816)
+   - Use L2C_flex correlation
+
+6. L2A_flex, L2A_abduct, L2D_flex
+   - Chain dependencies from previous angles
+   - Use correlations with other angles
+
+RIGHT HIND LEG (R3) - Starting from R-H-FeTi_x
+--------------------------------------------
+1. R3A_rot
+   - Direct from R-H-FeTi_x (ρ = 0.946)
+   - Also R-H-TiTa_x helps (ρ = 0.900)
+
+2. R3B_flex
+   - From R-H-FeTi_z (ρ = -0.849)
+   - R-H-FeTi_y helps (ρ = -0.837)
+
+3. R3B_rot
+   - From R-H-FeTi_z (ρ = 0.743)
+   - Use R3B_flex correlation
+
+4. R3C_flex
+   - From R-H-FeTi_z (ρ = -0.754)
+   - Chain from R3B_flex
+
+5. R3C_rot
+   - From R-H-TaG_x (ρ = 0.750)
+   - Use R3C_flex correlation
+
+6. R3A_flex, R3A_abduct, R3D_flex
+   - Chain dependencies from previous angles
+   - Use correlations with other angles
+
+LEFT HIND LEG (L3) - Starting from L-H-FeTi_z
+-------------------------------------------
+1. L3B_flex
+   - Direct from L-H-FeTi_z (ρ = -0.916)
+   - L-H-TiTa_z helps (ρ = -0.863)
+
+2. L3B_rot
+   - From L-H-CTr_y (ρ = 0.848)
+   - L3B_flex helps refine
+
+3. L3A_rot
+   - From L-H-TaG_y (ρ = -0.794)
+   - Chain of previous predictions
+
+4. L3C_flex
+   - From L-H-FeTi_z (ρ = -0.812)
+   - Chain from L3B_flex
+
+5. L3C_rot
+   - From L-H-TaG_x (ρ = 0.793)
+   - Use L3C_flex correlation
+
+6. L3A_flex, L3A_abduct, L3D_flex
+   - Chain dependencies from previous angles
+   - Use correlations with other angles
+
+Notes:
+1. Correlation values show the strength and direction of the relationship
+2. Positive correlations: variables move in the same direction
+3. Negative correlations: variables move in opposite directions
+4. Only correlations with |ρ| > 0.6 are listed
+5. Strongest correlations (|ρ| > 0.8) are listed separately from moderate ones
+6. Multiple coordinates can be used to improve prediction accuracy
+7. Cross-validation should be used to verify these ρ estimates
+8. Each plan starts with the strongest available coordinate correlation 

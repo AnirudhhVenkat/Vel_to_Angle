@@ -10,6 +10,8 @@ from pathlib import Path
 from tqdm import tqdm
 import itertools
 from sklearn.model_selection import KFold
+from matplotlib.backends.backend_pdf import PdfPages
+from datetime import datetime
 
 def check_gpu_availability():
     """Check if GPU is available and can be used by XGBoost."""
@@ -47,18 +49,44 @@ def load_and_filter_data(file_path, genotype):
             df = df[df['genotype'] == genotype]
             print(f"Filtered data for {genotype} genotype, new shape: {df.shape}")    
         
-        # Filter frames 400-1000 from each trial
-        trial_size = 1400
-        num_trials = len(df) // trial_size
+        # Create trial IDs based on frame numbers
+        frame_nums = df['fnum'].values
+        trial_ids = []
+        current_trial = 0
+        last_frame = frame_nums[0]
         
+        for frame in frame_nums:
+            if frame < last_frame:  # New trial starts when frame number resets
+                current_trial += 1
+            trial_ids.append(current_trial)
+            last_frame = frame
+        
+        df['trial_id'] = trial_ids
+        print(f"Initial number of trials: {len(df['trial_id'].unique())}")
+        print(f"Frames per trial: {len(df) / len(df['trial_id'].unique()):.1f}")
+        
+        # Verify trial lengths and keep only complete trials
+        trial_lengths = df.groupby('trial_id').size()
+        print("\nTrial length statistics before filtering:")
+        print(trial_lengths.describe())
+        
+        # Keep only trials with exactly 1400 frames
+        complete_trials = trial_lengths[trial_lengths == 1400].index
+        df = df[df['trial_id'].isin(complete_trials)].copy()
+        print(f"\nKeeping only complete 1400-frame trials:")
+        print(f"Remaining trials: {len(complete_trials)}")
+        print(f"Total frames: {len(df)}")
+        
+        # Filter frames 400-1000 from each trial
         filtered_rows = []
-        for trial in range(num_trials):
-            start_idx = trial * trial_size + 400
-            end_idx = trial * trial_size + 1000
-            filtered_rows.append(df.iloc[start_idx:end_idx])
+        for trial in df['trial_id'].unique():
+            trial_data = df[df['trial_id'] == trial]
+            filtered_rows.append(trial_data.iloc[400:1000])
         
         df = pd.concat(filtered_rows, axis=0, ignore_index=True)
-        print(f"Filtered data to frames 400-1000, new shape: {df.shape}")
+        print(f"\nFiltered to frames 400-1000:")
+        print(f"Number of trials: {len(filtered_rows)}")
+        print(f"Total frames: {len(df)} ({len(df) / len(filtered_rows):.1f} frames per trial)")
         
         return df
         
@@ -81,241 +109,339 @@ def get_available_data_path():
     
     raise FileNotFoundError("Could not find the data file in any of the expected locations")
 
-def prepare_data_for_xgboost(genotype):
-    """Prepare data for XGBoost model using top correlated features."""
-    # Load the preprocessed data
-    try:
-        data_path = get_available_data_path()
-        df = load_and_filter_data(data_path, genotype)
-    except FileNotFoundError:
-        print("Could not find the data file in any of the expected locations")
-        print("Please ensure the data file is available in one of the expected locations")
-        return None, None
+def prepare_data_for_xgboost(genotype, window_size=100):
+    """Prepare data for XGBoost training."""
+    print(f"\nPreparing data for {genotype}...")
     
-    # Print available columns for debugging
-    print("\nAvailable columns in DataFrame:")
-    for col in sorted(df.columns):
-        print(f"  {col}")
+    # Load data
+    df = pd.read_csv("Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv")
+    print(f"Loaded data with shape: {df.shape}")
     
-    # Select features and targets based on correlation analysis for each genotype
-    if genotype == 'P9RT':
-        features = [
-            'L-F-TaG_y',     # -0.815 with L1B_flex
-            'x_vel',         # Velocity components
-            'y_vel',
-            'z_vel'
-        ]
-        
-        targets = [
-            'L1A_flex'      # Primary target
-        ]
-        
-    elif genotype == 'BPN':
-        features = [
-            'L-F-TaG_y',     # Strong correlation with L1A_flex
-            'x_vel',         # Velocity components
-            'y_vel',
-            'z_vel'
-        ]
-        
-        targets = [
-            'L1A_flex'      # Primary target
-        ]
-        
-    else:  # P9LT
-        features = [
-            'R-F-TaG_y',     # Strong correlation with R1A_flex
-            'x_vel',         # Velocity components
-            'y_vel',
-            'z_vel'
-        ]
-        
-        targets = [
-            'R1A_flex'      # Primary target
-        ]
+    # Filter for specific genotype
+    df = df[df['genotype'] == genotype].copy()
+    print(f"Filtered for {genotype}: {df.shape}")
     
-    # Verify all features exist in DataFrame
-    missing_features = [f for f in features if f not in df.columns]
-    if missing_features:
-        print(f"\nError: The following features are missing from the DataFrame:")
-        for feat in missing_features:
-            print(f"  {feat}")
-        return None, None
+    # Create trial IDs based on frame numbers
+    frame_nums = df['fnum'].values
+    trial_ids = []
+    current_trial = 0
+    last_frame = frame_nums[0]
     
-    # Verify all targets exist in DataFrame
-    missing_targets = [t for t in targets if t not in df.columns]
-    if missing_targets:
-        print(f"\nError: The following targets are missing from the DataFrame:")
-        for targ in missing_targets:
-            print(f"  {targ}")
-        return None, None
+    for frame in frame_nums:
+        if frame < last_frame:  # New trial starts when frame number resets
+            current_trial += 1
+        trial_ids.append(current_trial)
+        last_frame = frame
     
-    print(f"\nUsing features for {genotype}:")
-    for feat in features:
-        print(f"  {feat}")
-    print(f"\nPredicting targets:")
-    for targ in targets:
-        print(f"  {targ}")
+    df['trial_id'] = trial_ids
+    print(f"Initial number of trials: {len(df['trial_id'].unique())}")
+    print(f"Frames per trial: {len(df) / len(df['trial_id'].unique()):.1f}")
     
-    # Prepare feature matrix X and target matrix y
-    X = df[features]
-    y = df[targets]
+    # Verify trial lengths and keep only complete trials
+    trial_lengths = df.groupby('trial_id').size()
+    print("\nTrial length statistics before filtering:")
+    print(trial_lengths.describe())
     
-    # Print shapes for debugging
-    print(f"\nFeature matrix shape: {X.shape}")
-    print(f"Target matrix shape: {y.shape}")
+    # Keep only trials with exactly 1400 frames
+    complete_trials = trial_lengths[trial_lengths == 1400].index
+    df = df[df['trial_id'].isin(complete_trials)].copy()
+    print(f"\nKeeping only complete 1400-frame trials:")
+    print(f"Remaining trials: {len(complete_trials)}")
+    print(f"Total frames: {len(df)}")
     
-    # Scale the features
-    scaler = StandardScaler()
-    X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=X.columns, index=X.index)
+    # Calculate context start based on window size
+    context_start = 400 - window_size
+    print(f"\nWindow Configuration:")
+    print(f"Window size: {window_size}")
+    print(f"Using frames {context_start}-1000 for each trial")
+    print(f"This provides {window_size} frames of context to predict frames 400-1000")
     
-    # Split the data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y, test_size=0.2, random_state=42
-    )
+    # Filter frames context_start-1000 from each trial
+    filtered_rows = []
+    for trial in df['trial_id'].unique():
+        trial_data = df[df['trial_id'] == trial]
+        filtered_rows.append(trial_data.iloc[context_start:1000])
     
-    return (X_train, X_test, y_train, y_test), (features, targets)
+    df = pd.concat(filtered_rows, axis=0, ignore_index=True)
+    print(f"\nFiltered to frames {context_start}-1000:")
+    print(f"Number of trials: {len(filtered_rows)}")
+    print(f"Total frames: {len(df)} ({len(df) / len(filtered_rows):.1f} frames per trial)")
+    
+    # Calculate moving averages for velocities within each trial
+    base_velocities = ['x_vel', 'y_vel', 'z_vel']
+    for window in [5, 10, 20]:
+        for vel in base_velocities:
+            # Calculate moving average for each trial separately
+            ma_values = []
+            for trial in df['trial_id'].unique():
+                trial_data = df[df['trial_id'] == trial][vel]
+                # Calculate moving average and handle edges
+                ma = trial_data.rolling(window=window, center=True, min_periods=1).mean()
+                ma_values.extend(ma.tolist())
+            df[f'{vel}_ma{window}'] = ma_values
+    
+    # Define base features for all predictions
+    features = [
+        'R-F-CTr_y',    # Starting point for prediction chain
+        'x_vel_ma5',    # Moving average velocities
+        'y_vel_ma5',
+        'z_vel_ma5',
+        'x_vel_ma10',
+        'y_vel_ma10',
+        'z_vel_ma10',
+        'x_vel_ma20',
+        'y_vel_ma20',
+        'z_vel_ma20',
+        'x_vel',
+        'y_vel',
+        'z_vel'
+    ]
+    
+    # All targets in the prediction chain
+    targets = [
+        'R1A_flex',     # First predict joint angles
+        'R1A_rot',
+        'R1A_abduct',
+        'R1B_flex',
+        'R1B_rot',
+        'R1C_flex',
+        'R1C_rot',
+        'R1D_flex'
+    ]
+    
+    # Print all column names for debugging
+    print("\nAll available columns:")
+    print(sorted(df.columns.tolist()))
+    
+    # Print target columns that exist in the data
+    print("\nTarget columns found in data:")
+    for target in targets:
+        if target in df.columns:
+            print(f"  ✓ {target}")
+            print(f"    NaN count: {df[target].isna().sum()}")
+        else:
+            print(f"  ✗ {target} (not found)")
+            
+    # Print feature columns that exist in the data
+    print("\nFeature columns found in data:")
+    for feature in features:
+        if feature in df.columns:
+            print(f"  ✓ {feature}")
+            print(f"    NaN count: {df[feature].isna().sum()}")
+        else:
+            print(f"  ✗ {feature} (not found)")
+    
+    # Split into train, validation, and test sets by trials
+    unique_trials = df['trial_id'].unique()
+    train_trials, temp_trials = train_test_split(unique_trials, test_size=0.3, random_state=42)
+    val_trials, test_trials = train_test_split(temp_trials, test_size=0.5, random_state=42)
+    
+    # Create masks for each split
+    train_mask = df['trial_id'].isin(train_trials)
+    val_mask = df['trial_id'].isin(val_trials)
+    test_mask = df['trial_id'].isin(test_trials)
+    
+    print("\nDataset Split Information:")
+    print(f"Training: {len(train_trials)} trials ({train_mask.sum()} frames)")
+    print(f"Validation: {len(val_trials)} trials ({val_mask.sum()} frames)")
+    print(f"Test: {len(test_trials)} trials ({test_mask.sum()} frames)")
+    print(f"Frames per trial: {1000 - context_start} (frames {context_start}-1000)")
+    
+    return df, features, targets, (train_mask, val_mask, test_mask)
 
-def find_optimal_params(X_train, y_train, target_name, parent_dir, genotype, use_gpu=False):
-    """Find optimal hyperparameters using cross-validation."""
+def find_optimal_params(X_train, X_val, y_train, y_val, target_name, parent_dir, genotype, use_gpu=False):
+    """Find optimal hyperparameters using validation set."""
     print(f"\nFinding optimal parameters for {target_name}...")
     
-    # Base parameters for grid search
+    # Base parameters for grid search - focused around best performing values
     base_params = {
-        'max_depth': [3, 5, 7],
-        'learning_rate': [0.01, 0.1],
-        'n_estimators': [1000],
-        'min_child_weight': [1, 3, 5],
-        'objective': ['reg:absoluteerror'],
-        'tree_method': ['hist']
+        # Tree structure parameters
+        'max_depth': [4, 5, 6],              # Center around 5
+        'min_child_weight': [3],       # Center around 3
+        
+        # Sampling parameters
+        'subsample': [0.8],        # Center around 0.8
+        'colsample_bytree': [0.8], # Center around 0.8
+        
+        # Learning parameters
+        'learning_rate': [0.005, 0.01, 0.02], # Focus on lower learning rates
+        'n_estimators': [2000, 3000],   # Number of trees
+        
+        # Fixed parameters
+        'tree_method': ['hist'],
+        'objective': ['reg:absoluteerror'],  # Use MAE loss
+        'eval_metric': ['mae'],    # Evaluate using MAE
+        'early_stopping_rounds': [10],      # Early stopping
+        'verbosity': [0]                    # Less verbose output
     }
     
-    # Add GPU device if available
     if use_gpu:
+        base_params['tree_method'] = ['gpu_hist']
         base_params['device'] = ['cuda']
     
-    # Create parameter grid
-    param_grid = base_params.copy()
+    # Create parameter combinations
+    param_combinations = [dict(zip(base_params.keys(), v)) 
+                        for v in itertools.product(*base_params.values())]
     
-    # Create output directory for this genotype
-    output_dir = parent_dir / genotype
-    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Total parameter combinations to try: {len(param_combinations)}")
     
-    # Lists to store results
     param_search_results = []
     
-    # Perform grid search with cross-validation
-    print("\nPerforming grid search with cross-validation...")
-    
-    # Create parameter combinations
-    param_combinations = [dict(zip(param_grid.keys(), v)) 
-                        for v in itertools.product(*param_grid.values())]
-    
-    # Progress bar for parameter combinations
     for params in tqdm(param_combinations, desc="Parameter combinations"):
-        # Create and configure model
-        model = xgb.XGBRegressor(**params)
+        # Extract early stopping rounds
+        early_stopping = params.pop('early_stopping_rounds')
         
-        # Perform k-fold cross-validation
-        cv_scores = []
-        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        # Create and train model
+        model = XGBRegressor(**params)
         
-        # Progress bar for cross-validation folds
-        for fold, (train_idx, val_idx) in enumerate(tqdm(kf.split(X_train), 
-                                                       total=5, 
-                                                       desc="Cross-validation",
-                                                       leave=False)):
-            X_train_fold = X_train.iloc[train_idx]
-            y_train_fold = y_train.iloc[train_idx]
-            X_val_fold = X_train.iloc[val_idx]
-            y_val_fold = y_train.iloc[val_idx]
-            
-            # Create evaluation set for early stopping
-            eval_set = [(X_val_fold, y_val_fold)]
-            
-            # Train model
-            model.fit(X_train_fold, y_train_fold,
-                     eval_set=eval_set,
-                     eval_metric=['mae', 'rmse'],
-                     early_stopping_rounds=20,
-                     verbose=False)
-            
-            # Make predictions
-            y_pred = model.predict(X_val_fold)
-            
-            # Calculate MAE for this fold
-            mae = mean_absolute_error(y_val_fold, y_pred)
-            cv_scores.append(mae)
+        # Train with early stopping using validation set
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            verbose=False
+        )
         
-        # Calculate mean and std of cross-validation scores
-        mean_mae = np.mean(cv_scores)
-        std_mae = np.std(cv_scores)
+        # Evaluate on validation set
+        y_pred = model.predict(X_val)
+        mae = mean_absolute_error(y_val, y_pred)
+        r2 = r2_score(y_val, y_pred)
         
-        # Store results
         param_search_results.append({
             'params': params,
-            'mean_mae': mean_mae,
-            'std_mae': std_mae
+            'mae': mae,
+            'r2': r2
         })
     
-    # Convert results to DataFrame and sort by mean MAE
+    # Find best parameters based on MAE
     results_df = pd.DataFrame(param_search_results)
-    results_df = results_df.sort_values('mean_mae')
+    results_df = results_df.sort_values('mae')
     
-    # Save results
-    results_df.to_csv(output_dir / f'parameter_search_results_{target_name}.csv', index=False)
-    
-    # Get best parameters
     best_params = results_df.iloc[0]['params']
-    best_mae = results_df.iloc[0]['mean_mae']
+    best_mae = results_df.iloc[0]['mae']
+    best_r2 = results_df.iloc[0]['r2']
     
     print(f"\nBest parameters for {target_name}:")
     for param, value in best_params.items():
         print(f"  {param}: {value}")
-    print(f"Best Mean MAE: {best_mae:.4f}")
+    print(f"Best MAE: {best_mae:.4f}")
+    print(f"Best R²: {best_r2:.4f}")
     
     return best_params
 
-def train_xgboost_models(X_train, y_train, features, targets, genotype, parent_dir, use_gpu=False):
+def train_xgboost_model(X_train, X_val, y_train, y_val, params, target_name, parent_dir, genotype, use_gpu=False):
+    """Train an XGBoost model with given parameters."""
+    print(f"\nTraining XGBoost model for {target_name}...")
+    
+    # Ensure MAE loss is set
+    final_params = params.copy()
+    final_params['objective'] = 'reg:absoluteerror'
+    final_params['eval_metric'] = 'mae'
+    
+    # Create model with parameters
+    model = XGBRegressor(**final_params)
+    if use_gpu:
+        model.set_params(tree_method='gpu_hist', device='cuda')
+    
+    # Create output directory
+    output_dir = parent_dir / target_name
+    output_dir.mkdir(exist_ok=True)
+    
+    # Train the model
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        verbose=True
+    )
+    
+    # Make predictions
+    train_pred = model.predict(X_train)
+    val_pred = model.predict(X_val)
+    
+    # Calculate metrics
+    train_metrics = {
+        'r2': r2_score(y_train, train_pred),
+        'mae': mean_absolute_error(y_train, train_pred),
+        'mse': mean_squared_error(y_train, train_pred)
+    }
+    
+    val_metrics = {
+        'r2': r2_score(y_val, val_pred),
+        'mae': mean_absolute_error(y_val, val_pred),
+        'mse': mean_squared_error(y_val, val_pred)
+    }
+    
+    # Save metrics
+    with open(output_dir / 'metrics.txt', 'w') as f:
+        f.write("Training Metrics:\n")
+        for metric, value in train_metrics.items():
+            f.write(f"{metric.upper()}: {value:.4f}\n")
+        f.write("\nValidation Metrics:\n")
+        for metric, value in val_metrics.items():
+            f.write(f"{metric.upper()}: {value:.4f}\n")
+        
+        # Save feature importances
+        f.write("\nFeature Importances:\n")
+        importances = dict(zip(X_train.columns, model.feature_importances_))
+        for feat, imp in sorted(importances.items(), key=lambda x: x[1], reverse=True):
+            f.write(f"{feat}: {imp:.4f}\n")
+    
+    # Plot actual vs predicted
+    plt.figure(figsize=(10, 5))
+    
+    # Training set
+    plt.subplot(1, 2, 1)
+    plt.scatter(y_train, train_pred, alpha=0.5)
+    plt.plot([y_train.min(), y_train.max()], [y_train.min(), y_train.max()], 'r--', lw=2)
+    plt.xlabel('Actual')
+    plt.ylabel('Predicted')
+    plt.title(f'Training Set\nR² = {train_metrics["r2"]:.3f}')
+    
+    # Validation set
+    plt.subplot(1, 2, 2)
+    plt.scatter(y_val, val_pred, alpha=0.5)
+    plt.plot([y_val.min(), y_val.max()], [y_val.min(), y_val.max()], 'r--', lw=2)
+    plt.xlabel('Actual')
+    plt.ylabel('Predicted')
+    plt.title(f'Validation Set\nR² = {val_metrics["r2"]:.3f}')
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'actual_vs_predicted.png')
+    plt.close()
+    
+    # Save model
+    model.save_model(str(output_dir / f'{target_name}_model.json'))
+    
+    print(f"\nModel training completed for {target_name}")
+    print(f"Training R²: {train_metrics['r2']:.4f}")
+    print(f"Validation R²: {val_metrics['r2']:.4f}")
+    
+    return model
+
+def train_xgboost_models(X_train, X_val, y_train, y_val, features, targets, genotype, parent_dir, use_gpu=False):
     """Train separate XGBoost models for each target variable with optimized parameters."""
     models = {}
     
     for target in targets:
         print(f"\nTraining model for {target}...")
         
-        # Find optimal parameters
-        best_params = find_optimal_params(X_train, y_train[target], target, parent_dir, genotype, use_gpu)
+        # Find optimal parameters using validation set
+        best_params = find_optimal_params(X_train, X_val, y_train[target], y_val[target], 
+                                        target, parent_dir, genotype, use_gpu)
         
-        # Train final model with best parameters and even more epochs
+        # Train final model with best parameters
         final_params = best_params.copy()
-        final_params['n_estimators'] = 10000  # Significantly more epochs for final training
-        final_params['tree_method'] = 'hist'  # Always use hist method
+        final_params['n_estimators'] = 5000  # More trees for final model
         final_params['objective'] = 'reg:absoluteerror'  # Ensure MAE objective
+        final_params['eval_metric'] = 'mae'  # Set eval metric
         
         # Add GPU device if available
         if use_gpu:
             final_params['device'] = 'cuda'
         
-        model = xgb.XGBRegressor(
-            early_stopping_rounds=50,
-            eval_metric='mae',
-            **final_params
+        model = train_xgboost_model(
+            X_train, X_val, y_train[target], y_val[target],
+            final_params, target, parent_dir, genotype, use_gpu
         )
-        
-        # Train with a validation set for early stopping
-        X_train_final, X_val, y_train_final, y_val = train_test_split(
-            X_train, y_train[target], test_size=0.2, random_state=42
-        )
-        
-        print(f"Training final model for {target} with {final_params['n_estimators']} max epochs...")
-        model.fit(
-            X_train_final, y_train_final,
-            eval_set=[(X_val, y_val)],
-            verbose=True  # Show progress for final training
-        )
-        
-        # Print actual number of trees used (after early stopping)
-        print(f"Final number of trees used: {model.get_booster().num_boosted_rounds()}")
         
         models[target] = model
         
@@ -350,7 +476,7 @@ def evaluate_models(models, X_test, y_test, features, targets, genotype, parent_
     results = {}
     
     # Set style for better-looking plots
-    plt.style.use('bmh')
+    plt.style.use('bmh')  # Using built-in style instead of seaborn
     
     for target in targets:
         model = models[target]
@@ -370,55 +496,109 @@ def evaluate_models(models, X_test, y_test, features, targets, genotype, parent_
         }
         
         # Calculate number of trials in test set
-        trial_size = 600
-        num_trials = min(4, len(predictions) // trial_size)  # Show up to 4 trials
+        trial_size = 600  # frames 400-1000
+        num_trials = len(predictions) // trial_size
+        print(f"\nNumber of test trials for {target}: {num_trials}")
         
-        # Create subplot figure
-        fig, axes = plt.subplots(num_trials, 1, figsize=(40, 6*num_trials), dpi=300)  # Increased width from 30 to 40
-        fig.suptitle(f'Predicted vs Actual {target} ({genotype})\nR² = {r2:.3f}, RMSE = {rmse:.3f}', 
-                    fontsize=16, fontweight='bold', y=0.95)
+        # Create plots directory
+        output_dir = parent_dir / genotype / 'plots' / target
+        output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Plot each trial in a separate subplot
-        for trial in range(num_trials):
-            start_idx = trial * trial_size
-            end_idx = start_idx + trial_size
-            
-            ax = axes[trial] if num_trials > 1 else axes
-            
-            # Plot actual and predicted values for this trial with thicker lines
-            ax.plot(range(trial_size), 
-                   y_test[target].iloc[start_idx:end_idx],
-                   label='Actual', color='#2E86C1', linewidth=2.0, alpha=0.8)  # Increased linewidth from 1.5 to 2.0
-            ax.plot(range(trial_size), 
-                   predictions[start_idx:end_idx],
-                   label='Predicted', color='#E74C3C', linewidth=2.0, alpha=0.8)  # Increased linewidth from 1.5 to 2.0
-            
-            # Enhanced styling for each subplot
-            ax.set_xlabel('Time Points', fontsize=12, fontweight='bold')
-            ax.set_ylabel(f'{target} Value', fontsize=12, fontweight='bold')
-            ax.set_title(f'Trial {trial + 1}', fontsize=12, fontweight='bold', pad=10)
-            ax.legend(fontsize=10, frameon=True, fancybox=True, shadow=True)
-            ax.grid(True, linestyle='--', alpha=0.7)
-            ax.minorticks_on()
-            ax.grid(True, which='minor', linestyle=':', alpha=0.4)
-            
-            # Add trial-specific metrics
-            trial_mse = mean_squared_error(y_test[target].iloc[start_idx:end_idx], 
-                                         predictions[start_idx:end_idx])
-            trial_r2 = r2_score(y_test[target].iloc[start_idx:end_idx], 
-                              predictions[start_idx:end_idx])
-            ax.text(0.02, 0.95, f'Trial R² = {trial_r2:.3f}\nTrial RMSE = {np.sqrt(trial_mse):.3f}',
-                   transform=ax.transAxes, fontsize=10, verticalalignment='top',
-                   bbox=dict(facecolor='white', alpha=0.8))
+        # 1. Plot all trials in a scrolling plot
+        plt.figure(figsize=(20, 6))
+        time_points = np.arange(len(predictions))
+        plt.plot(time_points, y_test[target], label='Actual', color='#2E86C1', alpha=0.8)
+        plt.plot(time_points, predictions, label='Predicted', color='#E74C3C', alpha=0.8)
         
-        # Improve overall layout
-        plt.tight_layout()
+        # Add trial boundaries
+        for i in range(num_trials):
+            plt.axvline(x=i*trial_size, color='gray', linestyle='--', alpha=0.5)
         
-        # Save high-quality plot
-        output_dir = parent_dir / genotype
-        output_dir.mkdir(exist_ok=True)
-        plt.savefig(output_dir / f'predictions_vs_actual_trials_{target}.png',
-                   dpi=300, bbox_inches='tight', facecolor='white')
+        plt.title(f'All Trials Prediction vs Actual - {target} ({genotype})\nR² = {r2:.3f}, RMSE = {rmse:.3f}')
+        plt.xlabel('Frame Number')
+        plt.ylabel(f'{target} Value')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig(output_dir / 'all_trials_prediction.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # 2. Plot all trials in a multi-page figure
+        trials_per_page = 4
+        num_pages = (num_trials + trials_per_page - 1) // trials_per_page
+        
+        with PdfPages(output_dir / 'all_trials.pdf') as pdf:
+            for page in range(num_pages):
+                # Create figure with subplots for this page
+                start_trial = page * trials_per_page
+                end_trial = min((page + 1) * trials_per_page, num_trials)
+                num_trials_this_page = end_trial - start_trial
+                
+                fig, axes = plt.subplots(num_trials_this_page, 1, figsize=(15, 5*num_trials_this_page))
+                fig.suptitle(f'Trials {start_trial+1}-{end_trial} - {target} ({genotype})', fontsize=16)
+                
+                # Make axes iterable even if there's only one subplot
+                if num_trials_this_page == 1:
+                    axes = [axes]
+                
+                for trial_idx, trial in enumerate(range(start_trial, end_trial)):
+                    ax = axes[trial_idx]
+                    start_idx = trial * trial_size
+                    end_idx = start_idx + trial_size
+                    
+                    # Get trial data
+                    trial_actual = y_test[target].iloc[start_idx:end_idx]
+                    trial_pred = predictions[start_idx:end_idx]
+                    
+                    # Calculate confidence band (using residuals)
+                    residuals = np.abs(trial_actual - trial_pred)
+                    conf_band = np.std(residuals) * 1.96  # 95% confidence interval
+                    
+                    # Plot with confidence band
+                    time_points = np.arange(400, 1000)  # Actual frame numbers
+                    ax.plot(time_points, trial_actual, label='Actual', color='#2E86C1', linewidth=2)
+                    ax.plot(time_points, trial_pred, label='Predicted', color='#E74C3C', linewidth=2)
+                    ax.fill_between(time_points, 
+                                  trial_pred - conf_band,
+                                  trial_pred + conf_band,
+                                  color='#E74C3C', alpha=0.2, label='95% Confidence')
+                    
+                    # Calculate trial-specific metrics
+                    trial_mae = mean_absolute_error(trial_actual, trial_pred)
+                    trial_r2 = r2_score(trial_actual, trial_pred)
+                    
+                    ax.set_title(f'Trial {trial+1} (MAE: {trial_mae:.3f}, R²: {trial_r2:.3f})')
+                    ax.set_xlabel('Frame Number')
+                    ax.set_ylabel(f'{target} Value')
+                    ax.legend()
+                    ax.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                pdf.savefig(fig)
+                plt.close()
+        
+        # 3. Plot residuals
+        plt.figure(figsize=(10, 6))
+        residuals = y_test[target] - predictions
+        plt.scatter(predictions, residuals, alpha=0.5)
+        plt.axhline(y=0, color='r', linestyle='--')
+        plt.title(f'Residual Plot - {target} ({genotype})')
+        plt.xlabel('Predicted Values')
+        plt.ylabel('Residuals')
+        plt.grid(True, alpha=0.3)
+        plt.savefig(output_dir / 'residuals.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # 4. Plot actual vs predicted scatter
+        plt.figure(figsize=(10, 6))
+        plt.scatter(y_test[target], predictions, alpha=0.5)
+        min_val = min(y_test[target].min(), predictions.min())
+        max_val = max(y_test[target].max(), predictions.max())
+        plt.plot([min_val, max_val], [min_val, max_val], 'r--')
+        plt.title(f'Actual vs Predicted - {target} ({genotype})')
+        plt.xlabel('Actual Values')
+        plt.ylabel('Predicted Values')
+        plt.grid(True, alpha=0.3)
+        plt.savefig(output_dir / 'actual_vs_predicted.png', dpi=300, bbox_inches='tight')
         plt.close()
         
         # Print overall results
@@ -451,38 +631,502 @@ def save_results(results, features, targets, genotype, parent_dir):
             for metric, value in metrics.items():
                 f.write(f"{metric.upper()}: {value:.4f}\n")
 
-def main():
-    """Main function to run XGBoost analysis."""
-    # Check GPU availability first
-    use_gpu = check_gpu_availability()
+def calculate_confidence_score(predictions, targets, target_name=None):
+    """Calculate confidence score based on R² and MAE, weighted by position in chain."""
+    r2 = r2_score(targets, predictions)
+    mae = mean_absolute_error(targets, predictions)
+    max_abs_target = np.max(np.abs(targets))
+    normalized_mae = 1 - (mae / max_abs_target)
     
-    genotypes = ['P9RT', 'BPN', 'P9LT']
+    # Adjust weights based on position in chain
+    if target_name:
+        # Weight R² more heavily for early chain predictions
+        r2_weight = 0.8
+        mae_weight = 0.2
+    else:
+        # Default weights if target_name not provided
+        r2_weight = 0.8
+        mae_weight = 0.2
     
-    # Create parent directory for all results
-    parent_dir = Path("xgboost_results")
-    parent_dir.mkdir(parents=True, exist_ok=True)
+    # Calculate confidence score
+    confidence = r2_weight * r2 + mae_weight * normalized_mae
     
-    for genotype in genotypes:
-        print(f"\nProcessing {genotype} genotype...")
+    return confidence
+
+def train_prediction_chain(X_train, X_val, y_train, y_val, features, prediction_chain, chain_features, 
+                         parent_dir, genotype, use_gpu=False):
+    """Train a chain of XGBoost models starting with R-F-CTr_y to predict joint angles."""
+    models = {}
+    predictions = {}
+    
+    # Add debug prints
+    print("\nInitial features in X_train:")
+    print(X_train.columns.tolist())
+    
+    # Train model for each step in the chain (skip R-F-CTr_y as it's the input)
+    for target in prediction_chain[1:]:
+        print(f"\nTraining model for {target}...")
         
-        # Prepare data
-        data, (features, targets) = prepare_data_for_xgboost(genotype)
-        if data is None:
+        # Get features for this target
+        current_features = chain_features[target]
+        
+        # For subsequent predictions, we need to use the previous predictions
+        if target != prediction_chain[1]:  # Not the first prediction
+            print(f"\nBefore adding predictions for {target}, X_train features:")
+            print(X_train.columns.tolist())
+            
+            # Update training features with previous predictions
+            for prev_target in prediction_chain[1:prediction_chain.index(target)]:
+                if prev_target in predictions:
+                    X_train[prev_target] = predictions[prev_target]['train']
+                    X_val[prev_target] = predictions[prev_target]['val']
+                    print(f"Added {prev_target} predictions as feature")
+            
+            print(f"\nAfter adding predictions for {target}, X_train features:")
+            print(X_train.columns.tolist())
+        
+        # Prepare feature matrices
+        X_train_current = X_train[current_features].copy()
+        X_val_current = X_val[current_features].copy()
+        
+        # Find optimal parameters
+        best_params = find_optimal_params(
+            X_train_current, X_val_current,
+            y_train[target], y_val[target],
+            target, parent_dir, genotype, use_gpu
+        )
+        
+        if best_params is None:
+            print(f"Error: Could not find optimal parameters for {target}")
             continue
         
-        X_train, X_test, y_train, y_test = data
+        # Train model with best parameters
+        model = train_xgboost_model(
+            X_train_current, X_val_current,
+            y_train[target], y_val[target],
+            best_params, target, parent_dir, genotype,
+            use_gpu
+        )
         
-        # Train models with GPU if available
-        print(f"\nTraining XGBoost models for {genotype} using {'GPU' if use_gpu else 'CPU'}...")
-        models = train_xgboost_models(X_train, y_train, features, targets, genotype, parent_dir, use_gpu)
+        # Store model
+        models[target] = model
         
-        # Evaluate models
-        print(f"\nEvaluating models for {genotype}...")
-        results = evaluate_models(models, X_test, y_test, features, targets, genotype, parent_dir)
+        # Make predictions
+        train_pred = model.predict(X_train_current)
+        val_pred = model.predict(X_val_current)
         
-        # Save results
-        save_results(results, features, targets, genotype, parent_dir)
-        print(f"\nResults saved to {parent_dir}/{genotype}/")
+        # Calculate R² scores
+        train_r2 = r2_score(y_train[target], train_pred)
+        val_r2 = r2_score(y_val[target], val_pred)
+        
+        print(f"\nPerformance metrics for {target}:")
+        print(f"Training R²: {train_r2:.3f}")
+        print(f"Validation R²: {val_r2:.3f}")
+        
+        # Store predictions
+        predictions[target] = {
+            'train': train_pred,
+            'val': val_pred
+        }
+    
+    return models, predictions
+
+def plot_chain_performance(chain_results_dir, predictions, y_val, prediction_chain):
+    """Create detailed visualizations of the prediction chain performance."""
+    # Calculate actual R² scores
+    actual_r2 = {}
+    for target in prediction_chain[1:]:
+        actual_r2[target] = r2_score(y_val[target], predictions[target]['val'])
+    
+    # Create R² plot
+    plt.figure(figsize=(12, 6))
+    x = np.arange(len(prediction_chain[1:]))
+    plt.bar(x, [actual_r2[t] for t in prediction_chain[1:]], alpha=0.6)
+    plt.xlabel('Target')
+    plt.ylabel('R² Score')
+    plt.title('R² Scores Across Prediction Chain')
+    plt.xticks(x, prediction_chain[1:], rotation=45)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(chain_results_dir / 'r2_scores.png')
+    plt.close()
+    
+    # Create detailed chain progression plot
+    plt.figure(figsize=(15, 8))
+    
+    # Plot R² scores
+    plt.plot(prediction_chain[1:], [actual_r2[t] for t in prediction_chain[1:]], 
+             'r-', label='R² Score', marker='s')
+    plt.grid(True, alpha=0.3)
+    plt.ylabel('R² Score')
+    plt.title('Prediction Chain Performance')
+    plt.legend()
+    plt.xticks(rotation=45)
+    
+    plt.tight_layout()
+    plt.savefig(chain_results_dir / 'chain_progression.png')
+    plt.close()
+    
+    return actual_r2
+
+def save_prediction_plots_pdf(chain_results_dir, predictions, y_val, prediction_chain, actual_r2):
+    """Save all prediction plots in a single PDF file."""
+    pdf_path = chain_results_dir / 'prediction_plots.pdf'
+    
+    with PdfPages(pdf_path) as pdf:
+        # Create a summary page
+        plt.figure(figsize=(10, 6))
+        plt.axis('off')
+        plt.text(0.5, 0.9, 'Prediction Results Summary', ha='center', va='center', fontsize=16)
+        plt.text(0.1, 0.8, f'Generated on: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', fontsize=10)
+        plt.text(0.1, 0.7, 'R² Scores:', fontsize=12)
+        y_pos = 0.65
+        for target in prediction_chain[1:]:
+            plt.text(0.2, y_pos, f'{target}: {actual_r2[target]:.3f}', fontsize=10)
+            y_pos -= 0.05
+        pdf.savefig()
+        plt.close()
+        
+        # Add individual prediction plots
+        for target in prediction_chain[1:]:
+            plt.figure(figsize=(10, 6))
+            
+            # Scatter plot
+            plt.scatter(y_val[target], predictions[target]['val'], alpha=0.5)
+            
+            # Perfect prediction line
+            min_val = min(y_val[target].min(), predictions[target]['val'].min())
+            max_val = max(y_val[target].max(), predictions[target]['val'].max())
+            plt.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2)
+            
+            # Labels and title
+            plt.xlabel(f'Actual {target}')
+            plt.ylabel(f'Predicted {target}')
+            plt.title(f'{target} Predictions\nR² Score: {actual_r2[target]:.3f}')
+            
+            # Add grid
+            plt.grid(True, alpha=0.3)
+            
+            # Add correlation info
+            plt.text(0.05, 0.95, f'R² = {actual_r2[target]:.3f}',
+                    transform=plt.gca().transAxes,
+                    bbox=dict(facecolor='white', alpha=0.8))
+            
+            plt.tight_layout()
+            pdf.savefig()
+            plt.close()
+        
+        # Add R² comparison plot
+        plt.figure(figsize=(12, 6))
+        x = np.arange(len(prediction_chain[1:]))
+        plt.bar(x, [actual_r2[t] for t in prediction_chain[1:]], alpha=0.6)
+        plt.xlabel('Target')
+        plt.ylabel('R² Score')
+        plt.title('R² Scores Across Prediction Chain')
+        plt.xticks(x, prediction_chain[1:], rotation=45)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
+
+def plot_trial_predictions(predictions, y_val, trial_indices, target, output_dir):
+    """Create line plots comparing predicted vs actual values for each trial."""
+    print(f"\nCreating trial plots for {target}...")
+    
+    # Create a directory for trial plots
+    trial_plots_dir = output_dir / 'trial_plots'
+    trial_plots_dir.mkdir(exist_ok=True)
+    
+    # Get unique trials
+    unique_trials = np.unique(trial_indices)
+    print(f"Found {len(unique_trials)} unique trials")
+    
+    # Verify data exists
+    if target not in predictions or target not in y_val:
+        print(f"Error: Missing data for target {target}")
+        print("Available targets in predictions:", list(predictions.keys()))
+        print("Available targets in y_val:", list(y_val.columns))
+        return
+    
+    # Create PDF for all trials
+    pdf_path = trial_plots_dir / f'{target}_trial_predictions.pdf'
+    print(f"Creating PDF: {pdf_path}")
+    
+    with PdfPages(pdf_path) as pdf:
+        # Summary page
+        plt.figure(figsize=(10, 6))
+        plt.axis('off')
+        plt.text(0.5, 0.9, f'Trial Predictions for {target}', ha='center', va='center', fontsize=16)
+        plt.text(0.1, 0.8, f'Generated on: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', fontsize=10)
+        plt.text(0.1, 0.7, f'Number of trials: {len(unique_trials)}', fontsize=12)
+        plt.text(0.1, 0.6, f'Frames per trial: 600 (frames 400-1000)', fontsize=12)
+        pdf.savefig()
+        plt.close()
+        
+        # Plot each trial
+        for trial_idx, trial in enumerate(unique_trials):
+            print(f"Processing trial {trial_idx + 1}/{len(unique_trials)} for {target}")
+            
+            trial_mask = trial_indices == trial
+            
+            # Get trial data
+            actual = y_val[target][trial_mask].values
+            predicted = predictions[target]['val'][trial_mask]
+            
+            if len(actual) == 0 or len(predicted) == 0:
+                print(f"Warning: No data for trial {trial} in {target}")
+                continue
+            
+            if len(actual) != 600:  # Should be 600 frames (400-1000)
+                print(f"Warning: Trial {trial} has {len(actual)} frames instead of 600")
+                continue
+            
+            # Create plot
+            plt.figure(figsize=(15, 8))
+            
+            # Plot actual and predicted values
+            frames = np.arange(400, 1000)  # Actual frame numbers
+            plt.plot(frames, actual, 'b-', label='Actual', linewidth=2, alpha=0.7)
+            plt.plot(frames, predicted, 'r--', label='Predicted', linewidth=2, alpha=0.7)
+            
+            # Add confidence band
+            residuals = np.abs(actual - predicted)
+            conf_band = np.std(residuals) * 1.96  # 95% confidence interval
+            plt.fill_between(frames, 
+                           predicted - conf_band,
+                           predicted + conf_band,
+                           color='red', alpha=0.1, label='95% Confidence')
+            
+            # Calculate metrics for this trial
+            trial_r2 = r2_score(actual, predicted)
+            trial_mae = mean_absolute_error(actual, predicted)
+            trial_rmse = np.sqrt(mean_squared_error(actual, predicted))
+            
+            # Add labels and title
+            plt.xlabel('Frame Number', fontsize=12)
+            plt.ylabel('Value', fontsize=12)
+            plt.title(f'{target} - Trial {trial + 1}\nR² = {trial_r2:.3f}, MAE = {trial_mae:.3f}, RMSE = {trial_rmse:.3f}',
+                     fontsize=14, pad=20)
+            
+            # Add grid
+            plt.grid(True, alpha=0.3, linestyle='--')
+            
+            # Add legend
+            plt.legend(fontsize=10, loc='upper right')
+            
+            # Add metrics text box
+            metrics_text = (f'R² = {trial_r2:.3f}\n'
+                          f'MAE = {trial_mae:.3f}\n'
+                          f'RMSE = {trial_rmse:.3f}')
+            plt.text(0.02, 0.98, metrics_text,
+                    transform=plt.gca().transAxes,
+                    bbox=dict(facecolor='white', alpha=0.8, edgecolor='gray'),
+                    verticalalignment='top',
+                    fontsize=10)
+            
+            # Customize axis
+            plt.xticks(np.arange(400, 1001, 100))
+            
+            plt.tight_layout()
+            pdf.savefig()
+            plt.close()
+        
+        # Add a summary plot with all trials overlaid
+        plt.figure(figsize=(20, 10))
+        for trial in unique_trials:
+            trial_mask = trial_indices == trial
+            actual = y_val[target][trial_mask].values
+            predicted = predictions[target]['val'][trial_mask]
+            frames = np.arange(400, 1000)
+            plt.plot(frames, actual, 'b-', alpha=0.2)
+            plt.plot(frames, predicted, 'r--', alpha=0.2)
+        
+        plt.xlabel('Frame Number', fontsize=12)
+        plt.ylabel('Value', fontsize=12)
+        plt.title(f'{target} - All Trials Overlay\nBlue: Actual, Red: Predicted', fontsize=14, pad=20)
+        plt.grid(True, alpha=0.3, linestyle='--')
+        plt.xticks(np.arange(400, 1001, 100))
+        
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
+        
+    print(f"Completed trial plots for {target}")
+
+def main():
+    """Main function to run XGBoost analysis."""
+    print("\nStarting XGBoost analysis...")
+    
+    # Check GPU availability
+    use_gpu = check_gpu_availability()
+    
+    # Create output directories
+    parent_dir = Path('xgboost_results')
+    parent_dir.mkdir(exist_ok=True)
+    
+    # Configuration
+    window_size = 100  # Number of frames of context needed before prediction
+    
+    # List of genotypes to process
+    genotypes = ['P9LT']  # Focus on P9LT for prediction chain
+    
+    # Define base features used across all predictions
+    base_features = [
+        'x_vel_ma5',    # Moving average velocities
+        'y_vel_ma5',
+        'z_vel_ma5',
+        'x_vel_ma10',
+        'y_vel_ma10',
+        'z_vel_ma10',
+        'x_vel_ma20',
+        'y_vel_ma20',
+        'z_vel_ma20',
+        'x_vel',        # Raw velocities
+        'y_vel',
+        'z_vel'
+    ]
+    
+    # Define prediction chain configuration
+    prediction_chain = [
+        'R-F-CTr_y',    # Starting point - ground truth
+        'R1A_flex',     # First prediction
+        'R-F-FeTi_y',   # Then predict TaG positions
+        'R-F-TiTa_y',
+        'R-F-TaG_y',
+        'R1B_flex',     # Then rest of joint angles
+        'R1A_abduct',
+        'R1C_flex',
+        'R1A_rot',
+        'R1D_flex',
+        'R1B_rot',
+        'R1C_rot'
+    ]
+    
+    # Features specific to each target in the chain
+    chain_features = {
+        # R1A_flex - strongest correlations with CTr_y (0.971)
+        'R1A_flex': ['R-F-CTr_y'] + base_features,
+        
+        # R-F-FeTi_y - uses R-F-CTr_y and R1A_flex
+        'R-F-FeTi_y': ['R-F-CTr_y', 'R1A_flex'] + base_features,
+        
+        # R-F-TiTa_y - uses CTr_y, FeTi_y
+        'R-F-TiTa_y': ['R-F-CTr_y', 'R-F-FeTi_y'] + base_features,
+        
+        # R-F-TaG_y - uses CTr_y, FeTi_y, TiTa_y
+        'R-F-TaG_y': ['R-F-CTr_y', 'R-F-FeTi_y', 'R-F-TiTa_y'] + base_features,
+        
+        # R1B_flex - strong correlation with FeTi_z (-0.933)
+        'R1B_flex': ['R-F-FeTi_y', 'R1A_flex'] + base_features,
+        
+        # R1A_abduct - strong correlation with CTr_y (-0.819)
+        'R1A_abduct': ['R-F-CTr_y', 'R1A_flex'] + base_features,
+        
+        # R1C_flex - correlates with FeTi_z (-0.801)
+        'R1C_flex': ['R-F-FeTi_y', 'R1B_flex'] + base_features,
+        
+        # R1A_rot - correlates with CTr_y (0.764) and FeTi_y (0.897)
+        'R1A_rot': ['R-F-CTr_y', 'R-F-FeTi_y', 'R1A_flex'] + base_features,
+        
+        # R1D_flex - chain dependency from previous flex angles
+        'R1D_flex': ['R1A_flex', 'R1B_flex', 'R1C_flex'] + base_features,
+        
+        # R1B_rot - chain dependency from flex angles
+        'R1B_rot': ['R1B_flex', 'R-F-FeTi_y'] + base_features,
+        
+        # R1C_rot - chain dependency from flex angles
+        'R1C_rot': ['R1C_flex', 'R-F-FeTi_y'] + base_features
+    }
+    
+    for genotype in genotypes:
+        print(f"\nProcessing {genotype}...")
+        genotype_dir = parent_dir / genotype
+        genotype_dir.mkdir(exist_ok=True)
+        
+        # Prepare data
+        df, features, targets, (train_mask, val_mask, test_mask) = prepare_data_for_xgboost(genotype, window_size=window_size)
+        if df is None:
+            print(f"Skipping {genotype} due to data preparation error")
+            continue
+        
+        X_train, X_val, X_test, y_train, y_val, y_test = df, features, targets, train_mask, val_mask, test_mask
+        
+        if genotype == 'P9LT':
+            # Train prediction chain
+            print("\nTraining prediction chain for P9LT...")
+            print("Starting with R-F-CTr_y to predict joint angles...")
+            
+            # Train the chain
+            models, predictions = train_prediction_chain(
+                X_train.copy(), X_val.copy(), y_train.copy(), y_val.copy(),
+                features, prediction_chain, chain_features,
+                genotype_dir, genotype, use_gpu
+            )
+            
+            # Save chain results
+            chain_results_dir = genotype_dir / 'chain_results'
+            chain_results_dir.mkdir(exist_ok=True)
+            
+            # Create performance visualizations
+            actual_r2 = plot_chain_performance(
+                chain_results_dir, predictions, y_val, prediction_chain
+            )
+            
+            # Save prediction plots in PDF
+            save_prediction_plots_pdf(
+                chain_results_dir, predictions, y_val,
+                prediction_chain, actual_r2
+            )
+            
+            # Save predictions
+            for target in prediction_chain[1:]:  # Skip R-F-CTr_y (input)
+                target_dir = chain_results_dir / target
+                target_dir.mkdir(exist_ok=True)
+                
+                # Save model
+                model = models[target]
+                model.save_model(str(target_dir / f'{target}_model.json'))
+                
+                # Create trial-by-trial prediction plots
+                plot_trial_predictions(
+                    predictions, y_val, 
+                    df[val_mask]['trial_id'].values,  # Use actual trial IDs
+                    target, target_dir
+                )
+                
+                # Plot actual vs predicted (individual PNG files)
+                plt.figure(figsize=(10, 6))
+                plt.scatter(y_val[target], predictions[target]['val'], alpha=0.5)
+                plt.plot([y_val[target].min(), y_val[target].max()],
+                        [y_val[target].min(), y_val[target].max()],
+                        'r--', lw=2)
+                plt.xlabel(f'Actual {target}')
+                plt.ylabel(f'Predicted {target}')
+                plt.title(f'{target} Predictions\nR² Score: {actual_r2[target]:.3f}')
+                plt.savefig(target_dir / 'validation_scatter.png')
+                plt.close()
+            
+            print("\nPrediction chain training completed!")
+            print(f"Results saved to: {chain_results_dir}")
+            
+        else:
+            # Original training process for other genotypes
+            for target in targets:
+                best_params = find_optimal_params(
+                    X_train, X_val, y_train[target], y_val[target],
+                    target, genotype_dir, genotype, use_gpu
+                )
+                
+                if best_params is None:
+                    print(f"Skipping {target} due to parameter optimization error")
+                    continue
+                
+                train_xgboost_model(
+                    X_train, X_val, y_train[target], y_val[target],
+                    best_params, target, genotype_dir, genotype, use_gpu
+                )
+    
+    print("\nXGBoost analysis completed!")
 
 if __name__ == "__main__":
     main() 

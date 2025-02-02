@@ -47,48 +47,86 @@ class PositionalEncoding(nn.Module):
 
 class UnsupervisedTransformerModel(nn.Module):
     """Transformer model with pretraining and finetuning capabilities."""
-    def __init__(self, input_size, hidden_size, nhead, num_layers, dropout=0.1):
+    def __init__(self, input_size=18, hidden_size=256, nhead=8, num_layers=4, dropout=0.1):
         super(UnsupervisedTransformerModel, self).__init__()
+        
         self.input_size = input_size
         self.hidden_size = hidden_size
-        self.nhead = nhead
-        self.num_layers = num_layers
-        self.dropout = dropout
         self.pretraining = True
         
-        # Encoder
-        self.input_proj = nn.Linear(input_size, hidden_size)
-        encoder_layer = nn.TransformerEncoderLayer(
+        # Calculate embedding sizes
+        self.position_dim = 6  # TaG y-positions (one for each of 6 TaGs)
+        self.velocity_dim = 12  # 9 moving averages + 3 raw velocities
+        
+        # Verify dimensions
+        if input_size != self.position_dim + self.velocity_dim:
+            raise ValueError(f"Input size must be {self.position_dim + self.velocity_dim} (6 TaG y-positions + 12 velocity features)")
+        
+        print(f"Model initialized with:")
+        print(f"- Total input size: {input_size}")
+        print(f"- Position features (6): L-F-TaG_y, R-F-TaG_y, L-M-TaG_y, R-M-TaG_y, L-H-TaG_y, R-H-TaG_y")
+        print(f"- Velocity features (12):")
+        print("  * Moving averages (9): x/y/z_vel_ma5, x/y/z_vel_ma10, x/y/z_vel_ma20")
+        print("  * Raw velocities (3): x_vel, y_vel, z_vel")
+        print("- Output joint angles during finetuning (48 total):")
+        print("  * Front legs (L1, R1): A_flex, A_rot, A_abduct, B_flex, B_rot, C_flex, C_rot, D_flex")
+        print("  * Middle legs (L2, R2): A_flex, A_rot, A_abduct, B_flex, B_rot, C_flex, C_rot, D_flex")
+        print("  * Hind legs (L3, R3): A_flex, A_rot, A_abduct, B_flex, B_rot, C_flex, C_rot, D_flex")
+        
+        # Separate embeddings for positions and velocities
+        self.position_embedding = nn.Linear(self.position_dim, hidden_size // 2)
+        self.velocity_embedding = nn.Linear(self.velocity_dim, hidden_size // 2)
+        
+        # Combine embeddings
+        self.combine_embeddings = nn.Linear(hidden_size, hidden_size)
+        
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(hidden_size, dropout)
+        
+        # Transformer encoder
+        encoder_layers = nn.TransformerEncoderLayer(
             d_model=hidden_size,
             nhead=nhead,
             dim_feedforward=hidden_size * 4,
             dropout=dropout,
             batch_first=True
         )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers
-        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
         
-        # Output projections for pretraining (input reconstruction) and finetuning (joint angles)
-        self.pretrain_output = nn.Linear(hidden_size, input_size)  # Projects back to input size (10)
-        self.finetune_output = nn.Linear(hidden_size, 18)  # Projects to output size (18 joint angles)
-    
+        # Output layers
+        self.pretraining_decoder = nn.Linear(hidden_size, input_size)  # Reconstruct all 18 input features
+        self.finetuning_decoder = nn.Linear(hidden_size, 48)  # Predict all joint angles (8 per leg × 6 legs)
+        
     def forward(self, x):
-        # Input projection and transformer encoding
-        x = self.input_proj(x)
+        # Split input into positions and velocities
+        positions = x[..., :self.position_dim]  # First 6 features are TaG y-positions
+        velocities = x[..., self.position_dim:]  # Remaining 12 features are velocities
+        
+        # Embed positions and velocities separately
+        pos_embedded = self.position_embedding(positions)
+        vel_embedded = self.velocity_embedding(velocities)
+        
+        # Combine embeddings
+        combined = torch.cat([pos_embedded, vel_embedded], dim=-1)
+        x = self.combine_embeddings(combined)
+        
+        # Add positional encoding
+        x = self.pos_encoder(x)
+        
+        # Transform
         x = self.transformer_encoder(x)
         
-        # Output projection based on mode
+        # Decode based on mode
         if self.pretraining:
-            return self.pretrain_output(x)  # Reconstruct input (10 dimensions)
+            output = self.pretraining_decoder(x)  # Reconstruct all 18 input features
         else:
-            return self.finetune_output(x)  # Predict joint angles (18 dimensions)
+            output = self.finetuning_decoder(x)  # Predict all 48 joint angles
+        
+        return output
     
     def set_pretraining(self, mode=True):
         """Set the model to pretraining or finetuning mode."""
         self.pretraining = mode
-        self.train()  # Set to training mode
 
 class LearnablePositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=2000):
@@ -146,51 +184,54 @@ class EnhancedTransformerEncoderLayer(nn.TransformerEncoderLayer):
         
         return x
 
-def pretrain_transformer(model, train_loader, val_loader, device, num_epochs=10, patience=10):
-    """Pretrain transformer model in an unsupervised manner by reconstructing input sequences."""
-    model.train()
-    
-    # Use L1Loss (MAE) for both pretraining and finetuning
-    criterion = nn.L1Loss()
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=1e-4,
-        weight_decay=0.01
-    )
-    
-    # Add learning rate scheduler with adjusted patience
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=patience//3,
-        verbose=True, min_lr=1e-6
-    )
-    
-    best_val_loss = float('inf')
-    best_model_state = None
-    best_epoch = -1
-    epochs_no_improve = 0
-    
-    # Add gradient clipping
-    max_grad_norm = 0.5  # Reduced from 1.0 for shorter sequences
-    
-    # Initialize wandb logging group
-    if wandb.run is not None:
-        wandb.define_metric("pretrain/*", step_metric="pretrain/epoch")
-    
-    # Create progress bar for epochs
-    epoch_pbar = tqdm(range(num_epochs), desc='Pretraining')
-    
-    # Initialize AMP
-    use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
-    
+def pretrain_transformer(model, train_loader, val_loader, device, config, num_epochs=100, patience=10, trial_dir=None, plots_dir=None, run_name=None):
+    """Pretrain transformer model in an unsupervised manner."""
     try:
+        # Ensure model is in pretraining mode
+        model.set_pretraining(True)
+        model.train()
+        
+        # Initialize loss function and optimizer with reduced learning rate
+        criterion = nn.L1Loss().to(device)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config['pretrain_lr'] * 0.1,  # Reduce learning rate
+            weight_decay=config['weight_decay'],
+            eps=1e-8  # Increase epsilon for better numerical stability
+        )
+        
+        # Use a more conservative scheduler
+        scheduler = torch.optim.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=0.2,  # More conservative reduction
+            patience=3,
+            verbose=True,
+            min_lr=1e-6
+        )
+        
+        best_loss = float('inf')
+        best_epoch = -1
+        best_state = None
+        patience_counter = 0
+        
+        # Enable gradient scaler for mixed precision training
+        use_amp = torch.cuda.is_available() and hasattr(torch.cuda.amp, 'autocast')
+        scaler = torch.cuda.amp.GradScaler() if use_amp else None
+        
+        # Create progress bar for epochs
+        epoch_pbar = tqdm(range(num_epochs), desc='Pretraining')
+        
         for epoch in epoch_pbar:
-            # Training phase
             model.train()
-            train_loss = 0.0
-            num_batches = 0
+            train_losses = []
+            train_metrics = defaultdict(list)
+            max_grad_norm = 0.0  # Track maximum gradient norm
             
-            for batch in train_loader:
+            # Create progress bar for batches
+            batch_pbar = tqdm(train_loader, leave=False, desc=f'Epoch {epoch+1}')
+            
+            for batch in batch_pbar:
                 # Handle both tuple and tensor inputs
                 if isinstance(batch, (tuple, list)):
                     inputs = batch[0]
@@ -204,27 +245,57 @@ def pretrain_transformer(model, train_loader, val_loader, device, num_epochs=10,
                 with torch.cuda.amp.autocast() if use_amp else nullcontext():
                     outputs = model(inputs)
                     loss = criterion(outputs, inputs)
+                    
+                    # Check for NaN loss
+                    if torch.isnan(loss):
+                        print(f"\nNaN loss detected! Inputs min/max: {inputs.min():.3f}/{inputs.max():.3f}")
+                        print(f"Outputs min/max: {outputs.min():.3f}/{outputs.max():.3f}")
+                        continue
                 
                 if use_amp:
                     scaler.scale(loss).backward()
+                    
+                    # Unscale before gradient clipping
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                    scaler.step(optimizer)
-                    scaler.update()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    
+                    # Skip step if gradients are NaN/inf
+                    if torch.isfinite(grad_norm):
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        print(f"\nSkipping step due to infinite gradient norm at epoch {epoch+1}")
                 else:
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                    optimizer.step()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    
+                    # Skip step if gradients are NaN/inf
+                    if torch.isfinite(grad_norm):
+                        optimizer.step()
+                    else:
+                        print(f"\nSkipping step due to infinite gradient norm at epoch {epoch+1}")
                 
-                train_loss += loss.item()
-                num_batches += 1
+                # Track maximum gradient norm
+                if torch.isfinite(grad_norm):
+                    max_grad_norm = max(max_grad_norm, grad_norm.item())
+                
+                train_losses.append(loss.item())
+                train_metrics['loss'].append(loss.item())
+                
+                # Update batch progress bar
+                batch_pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'avg_loss': f'{np.mean(train_losses):.4f}',
+                    'grad_norm': f'{grad_norm.item():.4f}'
+                })
                 
                 # Free up memory
                 del outputs, loss
                 if use_amp:
                     torch.cuda.empty_cache()
             
-            avg_train_loss = train_loss / num_batches
+            avg_train_loss = sum(train_losses) / len(train_losses)
+            train_metrics['avg_loss'] = avg_train_loss
             
             # Validation phase
             model.eval()
@@ -243,6 +314,174 @@ def pretrain_transformer(model, train_loader, val_loader, device, num_epochs=10,
                         inputs = inputs.to(device, non_blocking=True)
                         outputs = model(inputs)
                         loss = criterion(outputs, inputs)
+                        
+                        # Skip NaN losses
+                        if torch.isfinite(loss):
+                            val_loss += loss.item()
+                            num_val_batches += 1
+                        
+                        del outputs, loss
+                        if use_amp:
+                            torch.cuda.empty_cache()
+            
+            avg_val_loss = val_loss / num_val_batches if num_val_batches > 0 else float('inf')
+            
+            # Update learning rate scheduler based on validation loss
+            scheduler.step(avg_val_loss)
+            
+            # Update epoch progress bar
+            epoch_pbar.set_postfix({
+                'train_loss': f'{avg_train_loss:.4f}',
+                'val_loss': f'{avg_val_loss:.4f}',
+                'best': f'{best_loss:.4f}',
+                'lr': f'{optimizer.param_groups[0]["lr"]:.2e}',
+                'grad_norm': f'{max_grad_norm:.4f}'
+            })
+            
+            # Log metrics
+            if wandb.run is not None:
+                wandb.log({
+                    'pretrain/train_loss': avg_train_loss,
+                    'pretrain/val_loss': avg_val_loss,
+                    'pretrain/learning_rate': optimizer.param_groups[0]['lr'],
+                    'pretrain/max_grad_norm': max_grad_norm,
+                    'pretrain/epoch': epoch
+                })
+            
+            # Check for improvement
+            if avg_val_loss < best_loss:
+                best_loss = avg_val_loss
+                best_epoch = epoch
+                best_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
+                patience_counter = 0
+                print(f"\nNew best model found at epoch {epoch+1} with validation loss: {best_loss:.4f}")
+            else:
+                patience_counter += 1
+                
+                # Early stopping
+                if patience_counter >= patience:
+                    print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+                    break
+        
+        # After training loop, ensure we have a model state to return
+        if best_state is None:
+            print("\nWarning: No best model state was saved during training")
+            best_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
+        else:
+            print(f"\nPretraining completed. Best loss: {best_loss:.4f} at epoch {best_epoch+1}")
+        
+        return best_loss, best_epoch, best_state
+        
+    except Exception as e:
+        print(f"Error during pretraining: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
+        # Ensure we still return something valid even if training fails
+        current_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
+        return float('inf'), -1, current_state
+
+def finetune_transformer(model, train_loader, val_loader, device, config, num_epochs=150, patience=10, trial_dir=None, plots_dir=None, run_name=None):
+    """Finetune transformer model for joint angle prediction."""
+    try:
+        # Ensure model is in finetuning mode
+        model.set_pretraining(False)
+        model.train()
+        
+        # Initialize loss function and optimizer
+        criterion = nn.L1Loss().to(device)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config['finetune_lr'],  # Use learning rate from config
+            weight_decay=config['weight_decay']  # Use weight decay from config
+        )
+        
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        )
+        
+        best_loss = float('inf')
+        best_epoch = -1
+        best_state = None
+        patience_counter = 0
+        
+        # Enable gradient scaler for mixed precision training
+        use_amp = torch.cuda.is_available() and hasattr(torch.cuda.amp, 'autocast')
+        scaler = torch.cuda.amp.GradScaler() if use_amp else None
+        
+        # Create progress bar for epochs
+        epoch_pbar = tqdm(range(num_epochs), desc='Finetuning')
+        
+        for epoch in epoch_pbar:
+            model.train()
+            train_losses = []
+            train_metrics = defaultdict(list)
+            
+            # Create progress bar for batches
+            batch_pbar = tqdm(train_loader, leave=False, desc=f'Epoch {epoch+1}')
+            
+            for batch in batch_pbar:
+                # Handle both tuple and tensor inputs
+                if isinstance(batch, (tuple, list)):
+                    inputs, targets = batch
+                else:
+                    inputs = batch
+                    targets = batch  # For unsupervised case
+                    
+                inputs = inputs.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                
+                # Use AMP context manager if available
+                with torch.cuda.amp.autocast() if use_amp else nullcontext():
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                    optimizer.step()
+                
+                train_losses.append(loss.item())
+                train_metrics['loss'].append(loss.item())
+                
+                # Update batch progress bar
+                batch_pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'avg_loss': f'{np.mean(train_losses):.4f}'
+                })
+                
+                # Free up memory
+                del outputs, loss
+                if use_amp:
+                    torch.cuda.empty_cache()
+            
+            avg_train_loss = sum(train_losses) / len(train_losses)
+            train_metrics['avg_loss'] = avg_train_loss
+            
+            # Validation phase
+            model.eval()
+            val_loss = 0.0
+            num_val_batches = 0
+            
+            with torch.no_grad():
+                with torch.cuda.amp.autocast() if use_amp else nullcontext():
+                    for batch in val_loader:
+                        # Handle both tuple and tensor inputs
+                        if isinstance(batch, (tuple, list)):
+                            inputs, targets = batch
+                        else:
+                            inputs = batch
+                            targets = batch  # For unsupervised case
+                            
+                        inputs = inputs.to(device, non_blocking=True)
+                        targets = targets.to(device, non_blocking=True)
+                        outputs = model(inputs)
+                        loss = criterion(outputs, targets)
                         val_loss += loss.item()
                         num_val_batches += 1
                         
@@ -255,211 +494,54 @@ def pretrain_transformer(model, train_loader, val_loader, device, num_epochs=10,
             # Update learning rate scheduler based on validation loss
             scheduler.step(avg_val_loss)
             
-            # Update progress bar
+            # Update epoch progress bar
             epoch_pbar.set_postfix({
                 'train_loss': f'{avg_train_loss:.4f}',
                 'val_loss': f'{avg_val_loss:.4f}',
-                'best': f'{best_val_loss:.4f}',
+                'best': f'{best_loss:.4f}',
                 'lr': f'{optimizer.param_groups[0]["lr"]:.2e}',
-                'no_improve': epochs_no_improve
+                'no_improve': patience_counter
             })
             
             # Log metrics
             if wandb.run is not None:
                 wandb.log({
-                    'pretrain/train_loss': avg_train_loss,
-                    'pretrain/val_loss': avg_val_loss,
-                    'pretrain/learning_rate': optimizer.param_groups[0]['lr'],
-                    'pretrain/epoch': epoch
-                })
-            
-            # Check for improvement
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                best_model_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
-                best_epoch = epoch
-                epochs_no_improve = 0
-                print(f"\nNew best model found at epoch {epoch+1} with validation loss: {best_val_loss:.4f}")
-            else:
-                epochs_no_improve += 1
-                
-                # Early stopping
-                if epochs_no_improve >= patience:
-                    print(f"\nEarly stopping triggered after {epoch + 1} epochs")
-                    break
-        
-        # After training loop, ensure we have a model state to return
-        if best_model_state is None:
-            print("\nWarning: No best model state was saved during training")
-            best_model_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
-        else:
-            print(f"\nPretraining completed. Best loss: {best_val_loss:.4f} at epoch {best_epoch+1}")
-        
-        return best_val_loss, best_epoch, best_model_state
-        
-    except Exception as e:
-        print(f"Error during pretraining: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        # Ensure we still return something valid even if training fails
-        current_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
-        return float('inf'), -1, current_state
-
-def finetune_transformer(model, train_loader, val_loader, device, num_epochs=100, patience=10):
-    """Finetune transformer model for joint angle prediction."""
-    print("\nStarting finetuning...")
-    
-    # Use L1Loss (MAE) for both pretraining and finetuning
-    criterion = nn.L1Loss()
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=1e-4,
-        weight_decay=0.01
-    )
-    
-    # Initialize learning rate scheduler with adjusted patience
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=patience//3,
-        verbose=True, min_lr=1e-6
-    )
-    
-    # For monitoring only
-    mse_criterion = nn.MSELoss()
-    
-    # Initialize tracking variables
-    best_val_mae = float('inf')
-    best_model_state = None
-    best_epoch = 0
-    epochs_no_improve = 0
-    
-    # Initialize AMP
-    use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
-    
-    try:
-        for epoch in tqdm(range(num_epochs), desc="Finetuning"):
-            # Training phase
-            model.train()
-            train_mae = 0.0
-            train_mse = 0.0
-            num_batches = 0
-            
-            for inputs, targets in train_loader:
-                inputs = inputs.to(device, non_blocking=True)
-                targets = targets.to(device, non_blocking=True)
-                
-                optimizer.zero_grad(set_to_none=True)
-                
-                # Forward pass with AMP
-                with torch.cuda.amp.autocast() if use_amp else nullcontext():
-                    outputs = model(inputs)
-                    mae = criterion(outputs, targets)  # Primary loss (MAE)
-                    mse = mse_criterion(outputs, targets)  # For monitoring
-                
-                if use_amp:
-                    scaler.scale(mae).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    mae.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                    optimizer.step()
-                
-                train_mae += mae.item()
-                train_mse += mse.item()
-                num_batches += 1
-                
-                # Clean up memory
-                del outputs, mae, mse
-                if use_amp:
-                    torch.cuda.empty_cache()
-            
-            avg_train_mae = train_mae / num_batches
-            avg_train_mse = train_mse / num_batches
-            
-            # Validation phase
-            model.eval()
-            val_mae = 0.0
-            val_mse = 0.0
-            num_val_batches = 0
-            
-            with torch.no_grad():
-                with torch.cuda.amp.autocast() if use_amp else nullcontext():
-                    for inputs, targets in val_loader:
-                        inputs = inputs.to(device, non_blocking=True)
-                        targets = targets.to(device, non_blocking=True)
-                        outputs = model(inputs)
-                        
-                        mae = criterion(outputs, targets)
-                        mse = mse_criterion(outputs, targets)
-                        
-                        val_mae += mae.item()
-                        val_mse += mse.item()
-                        num_val_batches += 1
-                        
-                        del outputs, mae, mse
-                        if use_amp:
-                            torch.cuda.empty_cache()
-            
-            avg_val_mae = val_mae / num_val_batches
-            avg_val_mse = val_mse / num_val_batches
-            
-            # Update learning rate scheduler based on validation MAE
-            scheduler.step(avg_val_mae)
-            
-            # Update progress bar
-            tqdm.set_postfix({
-                'train_mae': f'{avg_train_mae:.4f}',
-                'val_mae': f'{avg_val_mae:.4f}',
-                'best': f'{best_val_mae:.4f}',
-                'lr': f'{optimizer.param_groups[0]["lr"]:.2e}',
-                'no_improve': epochs_no_improve
-            })
-            
-            # Log metrics
-            if wandb.run is not None:
-                wandb.log({
-                    'finetune/train_mae': avg_train_mae,
-                    'finetune/train_mse': avg_train_mse,
-                    'finetune/val_mae': avg_val_mae,
-                    'finetune/val_mse': avg_val_mse,
+                    'finetune/train_loss': avg_train_loss,
+                    'finetune/val_loss': avg_val_loss,
                     'finetune/learning_rate': optimizer.param_groups[0]['lr'],
                     'finetune/epoch': epoch
                 })
             
             # Check for improvement
-            if avg_val_mae < best_val_mae:
-                best_val_mae = avg_val_mae
-                best_model_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
+            if avg_val_loss < best_loss:
+                best_loss = avg_val_loss
                 best_epoch = epoch
-                epochs_no_improve = 0
-                print(f"\nNew best model found at epoch {epoch+1} with validation MAE: {best_val_mae:.4f}")
+                best_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
+                patience_counter = 0
+                print(f"\nNew best model found at epoch {epoch+1} with validation loss: {best_loss:.4f}")
             else:
-                epochs_no_improve += 1
+                patience_counter += 1
                 
                 # Early stopping
-                if epochs_no_improve >= patience:
+                if patience_counter >= patience:
                     print(f"\nEarly stopping triggered after {epoch + 1} epochs")
                     break
         
         # After training loop, ensure we have a model state to return
-        if best_model_state is None:
+        if best_state is None:
             print("\nWarning: No best model state was saved during training")
-            best_model_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
+            best_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
         else:
-            model.load_state_dict(best_model_state)
-            print(f"\nFinetuning completed. Best MAE: {best_val_mae:.4f} at epoch {best_epoch+1}")
+            print(f"\nFinetuning completed. Best loss: {best_loss:.4f} at epoch {best_epoch+1}")
         
-        return best_val_mae, best_epoch, model
+        return best_loss, best_epoch, best_state
         
     except Exception as e:
         print(f"Error during finetuning: {str(e)}")
         print(f"Traceback: {traceback.format_exc()}")
         # Ensure we still return something valid even if training fails
         current_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
-        model.load_state_dict(current_state)
-        return float('inf'), -1, model
+        return float('inf'), -1, current_state
 
 def train_model(model_params, train_loader, val_loader=None, num_epochs=50):
     """Train the transformer model with the given parameters."""

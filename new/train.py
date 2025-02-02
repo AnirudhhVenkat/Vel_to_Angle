@@ -26,6 +26,8 @@ from contextlib import redirect_stdout, nullcontext
 import torch.nn.functional as F
 from fastdtw import fastdtw
 from scipy.spatial.distance import euclidean
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
 
 from models import deep_lstm, transformer, tcn
 from models.unsupervised_transformer import (
@@ -104,64 +106,160 @@ def finish_wandb():
     if wandb.run is not None:
         wandb.finish()
 
-def plot_predictions(predictions, targets, joint_names, model_name, plots_dir=None, epoch=None, phase='train'):
-    """Plot predictions vs targets for each joint angle."""
-    try:
-        num_joints = len(joint_names)
-        fig, axes = plt.subplots(num_joints, 1, figsize=(15, 4*num_joints))
-        if num_joints == 1:
-            axes = [axes]
-        
-        metrics = {}
-        for i, (joint, ax) in enumerate(zip(joint_names, axes)):
-            # Get predictions and targets for this joint
-            pred = predictions[:, i].cpu().numpy()
-            targ = targets[:, i].cpu().numpy()
+def log_feature_specific_metrics(predictions, targets, phase='train'):
+    """Log metrics separately for positions, velocities, and joint angles."""
+    if wandb.run is not None:
+        if predictions.shape[-1] == 18:  # Pretraining mode
+            # Split predictions and targets into positions and velocities
+            pos_pred = predictions[..., :6]  # 6 TaG y-positions
+            vel_pred = predictions[..., 6:]  # 12 velocity features
+            pos_targ = targets[..., :6]
+            vel_targ = targets[..., 6:]
             
-            # Plot
-            ax.plot(targ, label='Target', alpha=0.7)
-            ax.plot(pred, label='Prediction', alpha=0.7)
-            ax.set_title(f'{joint} Prediction vs Target')
-            ax.set_xlabel('Time Step')
-            ax.set_ylabel('Angle (degrees)')
+            # Calculate metrics
+            pos_mae = torch.mean(torch.abs(pos_pred - pos_targ))
+            vel_mae = torch.mean(torch.abs(vel_pred - vel_targ))
+            
+            wandb.log({
+                f'{phase}/position_mae': pos_mae.item(),
+                f'{phase}/velocity_mae': vel_mae.item()
+            })
+        else:  # Finetuning mode (48 joint angles)
+            # Calculate metrics for each leg type
+            for leg_idx, leg in enumerate(['L1', 'R1', 'L2', 'R2', 'L3', 'R3']):
+                start_idx = leg_idx * 8
+                end_idx = start_idx + 8
+                leg_pred = predictions[..., start_idx:end_idx]
+                leg_targ = targets[..., start_idx:end_idx]
+                
+                # Calculate metrics for different angle types
+                flex_mae = torch.mean(torch.abs(leg_pred[..., [0,3,5,7]] - leg_targ[..., [0,3,5,7]]))  # A_flex, B_flex, C_flex, D_flex
+                rot_mae = torch.mean(torch.abs(leg_pred[..., [1,4,6]] - leg_targ[..., [1,4,6]]))      # A_rot, B_rot, C_rot
+                abduct_mae = torch.mean(torch.abs(leg_pred[..., 2] - leg_targ[..., 2]))               # A_abduct
+                
+                wandb.log({
+                    f'{phase}/{leg}_flex_mae': flex_mae.item(),
+                    f'{phase}/{leg}_rot_mae': rot_mae.item(),
+                    f'{phase}/{leg}_abduct_mae': abduct_mae.item()
+                })
+
+def plot_predictions(model, data_loader, feature_scaler, target_scaler, device, config, phase='test', max_samples=5):
+    """Plot predictions vs actual values for a subset of samples."""
+    model.eval()
+    predictions = []
+    targets = []
+    inputs = []
+    
+    with torch.no_grad():
+        for batch in data_loader:
+            if len(predictions) >= max_samples:
+                break
+                
+            batch_inputs, batch_targets = batch
+            batch_inputs = batch_inputs.to(device)
+            batch_targets = batch_targets.to(device)
+            
+            batch_pred = model(batch_inputs)
+            
+            predictions.extend(batch_pred.cpu().numpy())
+            targets.extend(batch_targets.cpu().numpy())
+            inputs.extend(batch_inputs.cpu().numpy())
+            
+            if len(predictions) >= max_samples:
+                predictions = predictions[:max_samples]
+                targets = targets[:max_samples]
+                inputs = inputs[:max_samples]
+                break
+    
+    predictions = np.array(predictions)
+    targets = np.array(targets)
+    inputs = np.array(inputs)
+    
+    # Create plots directory if it doesn't exist
+    plots_dir = Path('plots')
+    plots_dir.mkdir(exist_ok=True)
+    
+    if model.pretraining:  # Plotting pretraining results
+        fig, axes = plt.subplots(2, 1, figsize=(15, 10))
+        
+        # Plot TaG y-positions
+        ax = axes[0]
+        for i in range(6):
+            ax.plot(predictions[0, :, i], label=f'Pred TaG{i+1}')
+            ax.plot(targets[0, :, i], '--', label=f'True TaG{i+1}')
+        ax.set_title('TaG Y-Positions')
+        ax.legend()
+        ax.grid(True)
+        
+        # Plot velocities
+        ax = axes[1]
+        for i in range(12):
+            ax.plot(predictions[0, :, i+6], label=f'Pred Vel{i+1}')
+            ax.plot(targets[0, :, i+6], '--', label=f'True Vel{i+1}')
+        ax.set_title('Velocity Features')
+        ax.legend()
+        ax.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(plots_dir / f'{phase}_pretraining_predictions.png')
+        plt.close()
+        
+    else:  # Plotting finetuning results (joint angles)
+        # Create separate plots for each leg
+        for leg_idx, leg in enumerate(['L1', 'R1', 'L2', 'R2', 'L3', 'R3']):
+            fig, axes = plt.subplots(3, 1, figsize=(15, 12))
+            start_idx = leg_idx * 8
+            
+            # Plot flexion angles
+            ax = axes[0]
+            flex_indices = [start_idx + i for i in [0,3,5,7]]  # A_flex, B_flex, C_flex, D_flex
+            for i, angle in enumerate(['A_flex', 'B_flex', 'C_flex', 'D_flex']):
+                ax.plot(predictions[0, :, flex_indices[i]], label=f'Pred {angle}')
+                ax.plot(targets[0, :, flex_indices[i]], '--', label=f'True {angle}')
+            ax.set_title(f'{leg} Flexion Angles')
             ax.legend()
             ax.grid(True)
             
-            # Calculate metrics for this joint
-            mae = np.mean(np.abs(pred - targ))
-            mse = np.mean((pred - targ)**2)
-            metrics[f'{joint}_mae'] = mae
-            metrics[f'{joint}_mse'] = mse
+            # Plot rotation angles
+            ax = axes[1]
+            rot_indices = [start_idx + i for i in [1,4,6]]  # A_rot, B_rot, C_rot
+            for i, angle in enumerate(['A_rot', 'B_rot', 'C_rot']):
+                ax.plot(predictions[0, :, rot_indices[i]], label=f'Pred {angle}')
+                ax.plot(targets[0, :, rot_indices[i]], '--', label=f'True {angle}')
+            ax.set_title(f'{leg} Rotation Angles')
+            ax.legend()
+            ax.grid(True)
             
-            # Add metrics to plot
-            ax.text(0.02, 0.98, f'MAE: {mae:.2f}\nMSE: {mse:.2f}',
-                   transform=ax.transAxes, verticalalignment='top',
-                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            # Plot abduction angle
+            ax = axes[2]
+            abduct_idx = start_idx + 2  # A_abduct
+            ax.plot(predictions[0, :, abduct_idx], label='Pred A_abduct')
+            ax.plot(targets[0, :, abduct_idx], '--', label='True A_abduct')
+            ax.set_title(f'{leg} Abduction Angle')
+            ax.legend()
+            ax.grid(True)
         
         plt.tight_layout()
+        plt.savefig(plots_dir / f'{phase}_finetuning_{leg}_predictions.png')
+        plt.close()
         
-        # Save plot if directory is provided
-        if plots_dir is not None:
-            plots_dir = Path(plots_dir)
-            plots_dir.mkdir(parents=True, exist_ok=True)
-            epoch_str = f'_epoch_{epoch}' if epoch is not None else ''
-            plot_path = plots_dir / f'{model_name}_{phase}_predictions{epoch_str}.png'
-            plt.savefig(plot_path, bbox_inches='tight', dpi=300)
-            
-            # Log to wandb
-            if wandb.run is not None:
-                wandb.log({
-                    f'plots/{phase}_predictions': wandb.Image(str(plot_path)),
-                    **{f'metrics/{phase}/{k}': v for k, v in metrics.items()}
-                })
-        
-        plt.close(fig)
-        return metrics
-        
-    except Exception as e:
-        print(f"Error in plot_predictions: {str(e)}")
-        traceback.print_exc()
-        return {}
+        # Create a summary plot with all legs
+        plt.figure(figsize=(15, 10))
+        for leg_idx, leg in enumerate(['L1', 'R1', 'L2', 'R2', 'L3', 'R3']):
+            start_idx = leg_idx * 8
+            plt.plot(predictions[0, :, start_idx], label=f'{leg} A_flex Pred')
+            plt.plot(targets[0, :, start_idx], '--', label=f'{leg} A_flex True')
+        plt.title('A_flex Angles for All Legs')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(plots_dir / f'{phase}_finetuning_summary.png')
+        plt.close()
+    
+    if wandb.run is not None:
+        wandb.log({
+            f'{phase}/predictions_plot': wandb.Image(str(plots_dir / f'{phase}_predictions.png')),
+            f'{phase}/summary_plot': wandb.Image(str(plots_dir / f'{phase}_finetuning_summary.png'))
+        })
 
 def get_model_name(model_name, config):
     """Create descriptive model name with hyperparameters"""
@@ -525,20 +623,11 @@ def train_model(model_name, config):
         test_targets = np.concatenate(test_targets, axis=0)
         
         # Generate and log prediction plots
-        metrics = plot_predictions(
-            test_predictions, 
-            test_targets, 
-            joint_names=config['joint_angle_columns'],
-            model_name=model_name,
-            plots_dir=None,
-            epoch=None,
-            phase='test'
-        )
+        plot_predictions(model, test_loader, feature_scaler, target_scaler, device, config, phase='test')
         
         # Log final metrics
         log_wandb({
             'test/loss': test_loss,
-            'test/metrics': metrics,
             'training/total_epochs': config['num_epochs'],
             'training/best_epoch': best_epoch,
             'training/best_val_loss': best_loss,
@@ -548,7 +637,13 @@ def train_model(model_name, config):
         final_results = {
             'model_state_dict': best_model_state,
             'config': config,
-            'metrics': metrics,
+            'metrics': {
+                'train_loss': train_loss,
+                'val_loss': best_loss,
+                'best_epoch': best_epoch,
+                'total_epochs': config['num_epochs'],
+                'test_loss': test_loss
+            },
             'best_loss': best_loss,
             'best_epoch': best_epoch,
             'total_epochs': config['num_epochs'],
@@ -572,21 +667,23 @@ def get_default_config():
     """Get default configuration for the model."""
     return {
         'data_path': r'Z:\Divya\TEMP_transfers\toAni\BPN_P9LT_P9RT_flyCoords.csv',
-        'batch_size': 32,  # Reduced from 64 to prevent memory issues
+        'batch_size': 32,
         'learning_rate': 1e-4,
         'weight_decay': 0.01,
         'dropout': 0.1,
         'num_epochs': 100,
         'patience': 15,
-        'initial_epochs': 10,  # Minimum number of epochs before early stopping
+        'initial_epochs': 10,
+        'pretrain_epochs': 100,
+        'finetune_epochs': 150,
         
         # Data processing options
-        'use_windows': True,  # Enable windowed data
-        'window_size': 50,    # Size of the sliding window
+        'use_windows': True,
+        'window_size': 50,
         
         'model_params': {
-            'input_size': 10,  # 10 velocity features
-            'hidden_sizes': [128, 128],  # Reduced from 256 to prevent memory issues
+            'input_size': 15,  # Updated: 6 TaG positions + 9 velocity features
+            'hidden_sizes': [256, 256],
             'output_size': 18,  # 18 flexion angles
             'dropout': 0.1,
             'nhead': 8,
@@ -603,15 +700,23 @@ def get_default_config():
             'R3A_flex', 'R3B_flex', 'R3C_flex'
         ],
         
-        # Best correlated velocity features
+        # Updated feature list
+        'tag_position_features': [
+            'L-F-TaG_y', 'R-F-TaG_y',
+            'L-M-TaG_y', 'R-M-TaG_y',
+            'L-H-TaG_y', 'R-H-TaG_y'
+        ],
+        
         'velocity_features': [
-            # Z-velocity features (strongest correlations)
-            'z_vel', 'z_vel_ma5', 'z_vel_ma10', 'z_vel_ma20',
-            # X-velocity features (moderate correlations)
-            'x_vel', 'x_vel_ma5', 'x_vel_ma10', 'x_vel_ma20',
+            # Z-velocity features
+            'z_vel', 'z_vel_ma5', 'z_vel_ma10',
+            # X-velocity features
+            'x_vel', 'x_vel_ma5', 'x_vel_ma10',
             # Combined velocities
             'velocity_magnitude', 'xz_velocity'
-        ]
+        ],
+        
+        'device': torch.device("cuda" if torch.cuda.is_available() else "cpu")
     }
 
 def train_unsupervised_transformer(config):
@@ -1128,14 +1233,9 @@ def objective_unsupervised(trial, base_config, trial_num, total_trials):
         # Load and prepare data
         train_loader, val_loader, test_loader, feature_scaler, target_scaler = prepare_data(config)
         
-        # Get input size from the first batch
-        sample_batch = next(iter(train_loader))[0]
-        input_size = sample_batch.shape[-1]
-        print(f"\nInput size from data: {input_size}")
-        
-        # Initialize model
+        # Initialize model with correct input size (18 features: 6 positions + 12 velocities)
         model = UnsupervisedTransformerModel(
-            input_size=input_size,
+            input_size=18,
             hidden_size=config['hidden_size'],
             nhead=config['nhead'],
             num_layers=config['num_layers'],
@@ -1191,7 +1291,9 @@ def objective_unsupervised(trial, base_config, trial_num, total_trials):
             'pretrain_loss': pretrain_loss,
             'pretrain_epoch': pretrain_epoch,
             'finetune_loss': finetune_loss,
-            'finetune_epoch': finetune_epoch
+            'finetune_epoch': finetune_epoch,
+            'feature_scaler': feature_scaler,
+            'target_scaler': target_scaler
         }, trial_dir / 'final_model.pth')
         
         # Log final results
@@ -1213,437 +1315,166 @@ def objective_unsupervised(trial, base_config, trial_num, total_trials):
             wandb.finish()
         return float('inf')
 
-def pretrain_transformer(model, train_loader, val_loader, device, config, num_epochs=100, patience=10, trial_dir=None, plots_dir=None, run_name=None):
-    """Pretrain transformer model in an unsupervised manner."""
-    try:
-        # Ensure model is in pretraining mode
-        model.set_pretraining(True)
-        model.train()
-        
-        # Initialize loss function and optimizer
-        criterion = MAELoss().to(device)
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=config['pretrain_lr'],
-            weight_decay=config['weight_decay']
-        )
-        
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=5, verbose=True
-        )
-        
-        best_loss = float('inf')
-        best_epoch = -1
-        best_state = None
-        patience_counter = 0
-        
-        # Enable gradient scaler for mixed precision training
-        use_amp = torch.cuda.is_available() and hasattr(torch.cuda.amp, 'autocast')
-        scaler = torch.cuda.amp.GradScaler() if use_amp else None
-        
-        for epoch in range(num_epochs):
-            model.train()
-            train_losses = []
-            train_metrics = defaultdict(list)
+def prepare_data(config):
+    """Load and prepare data for training."""
+    print("\nPreparing data...")
+    
+    # Load data
+    df = pd.read_csv(config['data_path'])
+    print(f"Loaded data with shape: {df.shape}")
+    
+    # Calculate moving averages for velocities
+    raw_velocities = ['x_vel', 'y_vel', 'z_vel']
+    ma_windows = [5, 10, 20]
+    
+    # Ensure raw velocities exist
+    if not all(col in df.columns for col in raw_velocities):
+        raise ValueError(f"Raw velocity columns {raw_velocities} not found in data")
+    
+    # Calculate moving averages within each trial
+    trial_length = 600  # After filtering (frames 400-1000)
+    num_trials = len(df) // trial_length
+    
+    for vel in raw_velocities:
+        for window in ma_windows:
+            ma_col = f'{vel}_ma{window}'
+            ma_values = []
             
-            # Training loop with progress bar
-            train_loop = tqdm(train_loader, desc=f'Pretrain Epoch {epoch+1}')
-            for batch_idx, (batch_features, _) in enumerate(train_loop):
-                batch_features = batch_features.float().to(device)
+            for trial in range(num_trials):
+                start_idx = trial * trial_length
+                end_idx = (trial + 1) * trial_length
+                trial_data = df[vel].iloc[start_idx:end_idx]
                 
-                optimizer.zero_grad(set_to_none=True)
-                
-                with torch.cuda.amp.autocast(enabled=use_amp):
-                    # Forward pass - reconstruct input features
-                    reconstructed = model(batch_features)
-                    # Calculate reconstruction loss
-                    loss = criterion(reconstructed, batch_features)
-                
-                if scaler is not None:
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                    optimizer.step()
-                
-                # Store losses for logging
-                train_losses.append(loss.item())
-                for loss_name, loss_value in criterion.last_losses.items():
-                    train_metrics[f'train_{loss_name}_loss'].append(loss_value)
-                
-                # Update progress bar
-                train_loop.set_postfix({
-                    'loss': f'{loss.item():.4f}',
-                    'mae': f'{criterion.last_losses["mae"]:.4f}',
-                    'mse': f'{criterion.last_losses["mse"]:.4f}'
-                })
-                
-                # Clean up memory
-                del reconstructed, loss
-                if use_amp:
-                    torch.cuda.empty_cache()
+                # Calculate moving average for this trial
+                ma = trial_data.rolling(window=window, center=True, min_periods=1).mean()
+                ma_values.extend(ma)
             
-            # Validation loop
-            model.eval()
-            val_losses = []
-            val_metrics = defaultdict(list)
-            
-            with torch.no_grad():
-                val_loop = tqdm(val_loader, desc='Validation')
-                for batch_features, _ in val_loop:
-                    batch_features = batch_features.float().to(device)
-                    
-                    with torch.cuda.amp.autocast(enabled=use_amp):
-                        reconstructed = model(batch_features)
-                        loss = criterion(reconstructed, batch_features)
-                    
-                    val_losses.append(loss.item())
-                    for loss_name, loss_value in criterion.last_losses.items():
-                        val_metrics[f'val_{loss_name}_loss'].append(loss_value)
-                    
-                    # Update validation progress bar
-                    val_loop.set_postfix({
-                        'loss': f'{loss.item():.4f}',
-                        'mae': f'{criterion.last_losses["mae"]:.4f}',
-                        'mse': f'{criterion.last_losses["mse"]:.4f}'
-                    })
-                    
-                    # Clean up memory
-                    del reconstructed, loss
-                    if use_amp:
-                        torch.cuda.empty_cache()
-            
-            # Calculate average losses
-            avg_train_loss = np.mean(train_losses)
-            avg_val_loss = np.mean(val_losses)
-            
-            # Calculate average metrics
-            train_metric_avgs = {name: np.mean(values) for name, values in train_metrics.items()}
-            val_metric_avgs = {name: np.mean(values) for name, values in val_metrics.items()}
-            
-            # Update learning rate
-            scheduler.step(avg_val_loss)
-            
-            # Log metrics
-            if wandb.run is not None:
-                wandb.log({
-                    'pretrain/loss/train': avg_train_loss,
-                    'pretrain/loss/val': avg_val_loss,
-                    'pretrain/learning_rate': optimizer.param_groups[0]['lr'],
-                    'pretrain/metrics/train_mae': train_metric_avgs["train_mae_loss"],
-                    'pretrain/metrics/train_mse': train_metric_avgs["train_mse_loss"],
-                    'pretrain/metrics/val_mae': val_metric_avgs["val_mae_loss"],
-                    'pretrain/metrics/val_mse': val_metric_avgs["val_mse_loss"],
-                    'pretrain/epoch': epoch
-                })
-            
-            # Print epoch summary
-            print(f'\nEpoch {epoch+1}/{num_epochs}:')
-            print(f'Train Loss: {avg_train_loss:.4f} (MAE: {train_metric_avgs["train_mae_loss"]:.4f}, '
-                  f'MSE: {train_metric_avgs["train_mse_loss"]:.4f})')
-            print(f'Val Loss: {avg_val_loss:.4f} (MAE: {val_metric_avgs["val_mae_loss"]:.4f}, '
-                  f'MSE: {val_metric_avgs["val_mse_loss"]:.4f})')
-            print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
-            
-            # Save best model
-            if avg_val_loss < best_loss:
-                best_loss = avg_val_loss
-                best_epoch = epoch
-                best_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
-                patience_counter = 0
-                
-                # Save best model state
-                if trial_dir is not None:
-                    torch.save({
-                        'epoch': epoch,
-                        'model_state_dict': best_state,
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict(),
-                        'loss': best_loss,
-                        'metrics': {
-                            'train': train_metric_avgs,
-                            'val': val_metric_avgs
-                        }
-                    }, trial_dir / 'best_pretrain_model.pth')
-                    print(f"\nSaved new best model at epoch {epoch+1} with val_loss: {best_loss:.4f}")
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    print(f'\nEarly stopping triggered after {epoch+1} epochs')
-                    break
-            
-            # Generate prediction plots every 10 epochs
-            if epoch % 10 == 0 and plots_dir is not None:
-                model.eval()
-                with torch.no_grad():
-                    # Get a batch of validation data for plotting
-                    val_features, _ = next(iter(val_loader))
-                    val_features = val_features.float().to(device)
-                    
-                    # Generate reconstructions
-                    reconstructed = model(val_features)
-                    
-                    # Plot and log
-                    plot_predictions(
-                        predictions=reconstructed,
-                        targets=val_features,
-                        joint_names=config['velocity_features'],
-                        model_name='transformer',
-                        plots_dir=plots_dir,
-                        epoch=epoch,
-                        phase='pretrain_val'
-                    )
+            df[ma_col] = ma_values
+    
+    # Define feature columns
+    velocity_features = [
+        'x_vel_ma5', 'y_vel_ma5', 'z_vel_ma5',      # Moving averages
+        'x_vel_ma10', 'y_vel_ma10', 'z_vel_ma10',
+        'x_vel_ma20', 'y_vel_ma20', 'z_vel_ma20',
+        'x_vel', 'y_vel', 'z_vel'                    # Raw velocities
+    ]
+    
+    position_features = [
+        'L-F-TaG_y', 'R-F-TaG_y',  # Front legs
+        'L-M-TaG_y', 'R-M-TaG_y',  # Middle legs
+        'L-H-TaG_y', 'R-H-TaG_y'   # Hind legs
+    ]
+    
+    # Define joint angle columns for each leg
+    joint_angles = []
+    for leg in ['L1', 'R1', 'L2', 'R2', 'L3', 'R3']:
+        joint_angles.extend([
+            f'{leg}A_flex', f'{leg}A_rot', f'{leg}A_abduct',
+            f'{leg}B_flex', 'B_rot',
+            f'{leg}C_flex', 'C_rot',
+            f'{leg}D_flex'
+        ])
+    
+    # Verify all required columns exist
+    missing_cols = []
+    for col in position_features + velocity_features + joint_angles:
+        if col not in df.columns:
+            missing_cols.append(col)
+    
+    if missing_cols:
+        raise ValueError(f"Missing columns in data: {missing_cols}")
+    
+    # Combine input features
+    input_features = position_features + velocity_features
+    print(f"\nInput features ({len(input_features)}):")
+    print("Position features:", position_features)
+    print("Velocity features:", velocity_features)
+    
+    print(f"\nOutput features ({len(joint_angles)}):")
+    print("Joint angles:", joint_angles)
+    
+    # Extract features and targets
+    X = df[input_features].values
+    y = df[joint_angles].values
+    
+    # Create scalers
+    feature_scaler = StandardScaler()
+    target_scaler = StandardScaler()
+    
+    # Fit and transform the data
+    X_scaled = feature_scaler.fit_transform(X)
+    y_scaled = target_scaler.fit_transform(y)
+    
+    # Create windowed sequences if enabled
+    if config.get('use_windows', True):
+        window_size = config['window_size']
+        X_windows = []
+        y_windows = []
         
-        # Generate final reconstruction plots
-        model.eval()
-        with torch.no_grad():
-            val_features, _ = next(iter(val_loader))
-            val_features = val_features.float().to(device)
-            reconstructed = model(val_features)
+        # Create windows for each trial
+        for trial in range(num_trials):
+            start_idx = trial * trial_length
+            end_idx = (trial + 1) * trial_length
             
-            final_metrics = plot_predictions(
-                predictions=reconstructed,
-                targets=val_features,
-                joint_names=config['velocity_features'],
-                model_name='transformer',
-                plots_dir=plots_dir,
-                epoch='final',
-                phase='pretrain_val'
-            )
+            trial_X = X_scaled[start_idx:end_idx]
+            trial_y = y_scaled[start_idx:end_idx]
             
-            if wandb.run is not None:
-                wandb.log({
-                    'final/pretrain_metrics': final_metrics
-                })
+            # Create windows within trial
+            for i in range(0, trial_length - window_size + 1):
+                X_windows.append(trial_X[i:i+window_size])
+                y_windows.append(trial_y[i+window_size-1])  # Predict last frame
         
-        return best_loss, best_epoch, best_state
+        X_windows = np.array(X_windows)
+        y_windows = np.array(y_windows)
+        print(f"\nCreated windowed sequences:")
+        print(f"X shape: {X_windows.shape}")
+        print(f"y shape: {y_windows.shape}")
         
-    except Exception as e:
-        print(f"Error during pretraining: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        return float('inf'), -1, None
-
-def finetune_transformer(model, train_loader, val_loader, device, config, num_epochs=150, patience=10, trial_dir=None, plots_dir=None, run_name=None):
-    """Finetune transformer model for joint angle prediction."""
-    try:
-        # Ensure model is in finetuning mode
-        model.set_pretraining(False)
-        model.train()
-        
-        # Initialize loss function and optimizer
-        criterion = MAELoss().to(device)
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=config['finetune_lr'],
-            weight_decay=config['weight_decay']
-        )
-        
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=5, verbose=True
-        )
-        
-        best_loss = float('inf')
-        best_epoch = -1
-        best_state = None
-        patience_counter = 0
-        
-        # Enable gradient scaler for mixed precision training
-        use_amp = torch.cuda.is_available() and hasattr(torch.cuda.amp, 'autocast')
-        scaler = torch.cuda.amp.GradScaler() if use_amp else None
-        
-        for epoch in range(num_epochs):
-            model.train()
-            train_losses = []
-            train_metrics = defaultdict(list)
-            
-            # Training loop with progress bar
-            train_loop = tqdm(train_loader, desc=f'Finetune Epoch {epoch+1}')
-            for batch_idx, (batch_features, batch_targets) in enumerate(train_loop):
-                batch_features = batch_features.float().to(device)
-                batch_targets = batch_targets.float().to(device)
-                
-                optimizer.zero_grad(set_to_none=True)
-                
-                with torch.cuda.amp.autocast(enabled=use_amp):
-                    # Forward pass - predict joint angles
-                    predictions = model(batch_features)
-                    # Calculate prediction loss
-                    loss = criterion(predictions, batch_targets)
-                
-                if scaler is not None:
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                    optimizer.step()
-                
-                # Store losses for logging
-                train_losses.append(loss.item())
-                for loss_name, loss_value in criterion.last_losses.items():
-                    train_metrics[f'train_{loss_name}_loss'].append(loss_value)
-                
-                # Update progress bar
-                train_loop.set_postfix({
-                    'loss': f'{loss.item():.4f}',
-                    'mae': f'{criterion.last_losses["mae"]:.4f}',
-                    'mse': f'{criterion.last_losses["mse"]:.4f}'
-                })
-                
-                # Clean up memory
-                del predictions, loss
-                if use_amp:
-                    torch.cuda.empty_cache()
-            
-            # Validation loop
-            model.eval()
-            val_losses = []
-            val_metrics = defaultdict(list)
-            
-            with torch.no_grad():
-                val_loop = tqdm(val_loader, desc='Validation')
-                for batch_features, batch_targets in val_loop:
-                    batch_features = batch_features.float().to(device)
-                    batch_targets = batch_targets.float().to(device)
-                    
-                    with torch.cuda.amp.autocast(enabled=use_amp):
-                        predictions = model(batch_features)
-                        loss = criterion(predictions, batch_targets)
-                    
-                    val_losses.append(loss.item())
-                    for loss_name, loss_value in criterion.last_losses.items():
-                        val_metrics[f'val_{loss_name}_loss'].append(loss_value)
-                    
-                    # Update validation progress bar
-                    val_loop.set_postfix({
-                        'loss': f'{loss.item():.4f}',
-                        'mae': f'{criterion.last_losses["mae"]:.4f}',
-                        'mse': f'{criterion.last_losses["mse"]:.4f}'
-                    })
-                    
-                    # Clean up memory
-                    del predictions, loss
-                    if use_amp:
-                        torch.cuda.empty_cache()
-            
-            # Calculate average losses
-            avg_train_loss = np.mean(train_losses)
-            avg_val_loss = np.mean(val_losses)
-            
-            # Calculate average metrics
-            train_metric_avgs = {name: np.mean(values) for name, values in train_metrics.items()}
-            val_metric_avgs = {name: np.mean(values) for name, values in val_metrics.items()}
-            
-            # Update learning rate
-            scheduler.step(avg_val_loss)
-            
-            # Log metrics
-            if wandb.run is not None:
-                wandb.log({
-                    'finetune/loss/train': avg_train_loss,
-                    'finetune/loss/val': avg_val_loss,
-                    'finetune/learning_rate': optimizer.param_groups[0]['lr'],
-                    'finetune/metrics/train_mae': train_metric_avgs["train_mae_loss"],
-                    'finetune/metrics/train_mse': train_metric_avgs["train_mse_loss"],
-                    'finetune/metrics/val_mae': val_metric_avgs["val_mae_loss"],
-                    'finetune/metrics/val_mse': val_metric_avgs["val_mse_loss"],
-                    'finetune/epoch': epoch
-                })
-            
-            # Print epoch summary
-            print(f'\nEpoch {epoch+1}/{num_epochs}:')
-            print(f'Train Loss: {avg_train_loss:.4f} (MAE: {train_metric_avgs["train_mae_loss"]:.4f}, '
-                  f'MSE: {train_metric_avgs["train_mse_loss"]:.4f})')
-            print(f'Val Loss: {avg_val_loss:.4f} (MAE: {val_metric_avgs["val_mae_loss"]:.4f}, '
-                  f'MSE: {val_metric_avgs["val_mse_loss"]:.4f})')
-            print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
-            
-            # Save best model
-            if avg_val_loss < best_loss:
-                best_loss = avg_val_loss
-                best_epoch = epoch
-                best_state = {k: v.cpu().clone().detach() for k, v in model.state_dict().items()}
-                patience_counter = 0
-                
-                # Save best model state
-                if trial_dir is not None:
-                    torch.save({
-                        'epoch': epoch,
-                        'model_state_dict': best_state,
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict(),
-                        'loss': best_loss,
-                        'metrics': {
-                            'train': train_metric_avgs,
-                            'val': val_metric_avgs
-                        }
-                    }, trial_dir / 'best_finetune_model.pth')
-                    print(f"\nSaved new best model at epoch {epoch+1} with val_loss: {best_loss:.4f}")
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    print(f'\nEarly stopping triggered after {epoch+1} epochs')
-                    break
-            
-            # Generate prediction plots every 10 epochs
-            if epoch % 10 == 0 and plots_dir is not None:
-                model.eval()
-                with torch.no_grad():
-                    # Get a batch of validation data for plotting
-                    val_features, val_targets = next(iter(val_loader))
-                    val_features = val_features.float().to(device)
-                    val_targets = val_targets.float().to(device)
-                    
-                    # Generate predictions
-                    predictions = model(val_features)
-                    
-                    # Plot and log
-                    plot_predictions(
-                        predictions=predictions,
-                        targets=val_targets,
-                        joint_names=config['joint_angle_columns'],
-                        model_name='transformer',
-                        plots_dir=plots_dir,
-                        epoch=epoch,
-                        phase='val'
-                    )
-        
-        # Generate final prediction plots
-        model.eval()
-        with torch.no_grad():
-            val_features, val_targets = next(iter(val_loader))
-            val_features = val_features.float().to(device)
-            val_targets = val_targets.float().to(device)
-            predictions = model(val_features)
-            
-            final_metrics = plot_predictions(
-                predictions=predictions,
-                targets=val_targets,
-                joint_names=config['joint_angle_columns'],
-                model_name='transformer',
-                plots_dir=plots_dir,
-                epoch='final',
-                phase='val'
-            )
-            
-            if wandb.run is not None:
-                wandb.log({
-                    'final/metrics': final_metrics
-                })
-        
-        return best_loss, best_epoch, model
-        
-    except Exception as e:
-        print(f"Error during finetuning: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        return float('inf'), -1, model
+        # Use windowed data
+        X_scaled = X_windows
+        y_scaled = y_windows
+    
+    # Split data
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X_scaled, y_scaled, test_size=0.3, random_state=42
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.5, random_state=42
+    )
+    
+    # Create dataloaders
+    train_data = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
+    val_data = TensorDataset(torch.FloatTensor(X_val), torch.FloatTensor(y_val))
+    test_data = TensorDataset(torch.FloatTensor(X_test), torch.FloatTensor(y_test))
+    
+    train_loader = DataLoader(
+        train_data,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        pin_memory=True,
+        num_workers=0
+    )
+    val_loader = DataLoader(
+        val_data,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        pin_memory=True,
+        num_workers=0
+    )
+    test_loader = DataLoader(
+        test_data,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        pin_memory=True,
+        num_workers=0
+    )
+    
+    print("\nData preparation completed:")
+    print(f"Train set: {len(train_data)} samples")
+    print(f"Val set: {len(val_data)} samples")
+    print(f"Test set: {len(test_data)} samples")
+    
+    return train_loader, val_loader, test_loader, feature_scaler, target_scaler
 
 if __name__ == "__main__":
     total_start = time.time()
@@ -1687,25 +1518,57 @@ if __name__ == "__main__":
         'use_windows': True,  # Enable windowed data processing
         'window_size': 50,    # This will be overridden by optuna trials
         'model_params': {
-            'input_size': 10,  # 10 velocity features: 4 z-vel, 4 x-vel, 2 combined
+            'input_size': 18,  # 6 TaG y-positions + 12 velocity features
             'hidden_sizes': [256, 256],
+            'output_size': 48,  # 8 angles per leg × 6 legs
             'dropout': 0.1,
             'nhead': 8,
-            'num_layers': 4,
-            'output_size': 18  # Changed to 18 flexion angles
+            'num_layers': 4
         },
-        'joint_angle_columns': [
-            'L1A_flex', 'L1B_flex', 'L1C_flex',
-            'L2A_flex', 'L2B_flex', 'L2C_flex',
-            'L3A_flex', 'L3B_flex', 'L3C_flex',
-            'R1A_flex', 'R1B_flex', 'R1C_flex',
-            'R2A_flex', 'R2B_flex', 'R2C_flex',
-            'R3A_flex', 'R3B_flex', 'R3C_flex'
+        # Input features
+        'position_features': [
+            'L-F-TaG_y', 'R-F-TaG_y',  # Front legs
+            'L-M-TaG_y', 'R-M-TaG_y',  # Middle legs
+            'L-H-TaG_y', 'R-H-TaG_y'   # Hind legs
         ],
         'velocity_features': [
-            'z_vel', 'z_vel_ma5', 'z_vel_ma10', 'z_vel_ma20',
-            'x_vel', 'x_vel_ma5', 'x_vel_ma10', 'x_vel_ma20',
-            'velocity_magnitude', 'xz_velocity'
+            'x_vel_ma5', 'y_vel_ma5', 'z_vel_ma5',      # Moving averages
+            'x_vel_ma10', 'y_vel_ma10', 'z_vel_ma10',
+            'x_vel_ma20', 'y_vel_ma20', 'z_vel_ma20',
+            'x_vel', 'y_vel', 'z_vel'                    # Raw velocities
+        ],
+        # Output features (joint angles)
+        'joint_angles': [
+            # Left Front Leg (L1)
+            'L1A_flex', 'L1A_rot', 'L1A_abduct',
+            'L1B_flex', 'L1B_rot',
+            'L1C_flex', 'L1C_rot',
+            'L1D_flex',
+            # Right Front Leg (R1)
+            'R1A_flex', 'R1A_rot', 'R1A_abduct',
+            'R1B_flex', 'R1B_rot',
+            'R1C_flex', 'R1C_rot',
+            'R1D_flex',
+            # Left Middle Leg (L2)
+            'L2A_flex', 'L2A_rot', 'L2A_abduct',
+            'L2B_flex', 'L2B_rot',
+            'L2C_flex', 'L2C_rot',
+            'L2D_flex',
+            # Right Middle Leg (R2)
+            'R2A_flex', 'R2A_rot', 'R2A_abduct',
+            'R2B_flex', 'R2B_rot',
+            'R2C_flex', 'R2C_rot',
+            'R2D_flex',
+            # Left Hind Leg (L3)
+            'L3A_flex', 'L3A_rot', 'L3A_abduct',
+            'L3B_flex', 'L3B_rot',
+            'L3C_flex', 'L3C_rot',
+            'L3D_flex',
+            # Right Hind Leg (R3)
+            'R3A_flex', 'R3A_rot', 'R3A_abduct',
+            'R3B_flex', 'R3B_rot',
+            'R3C_flex', 'R3C_rot',
+            'R3D_flex'
         ],
         'device': torch.device("cuda" if torch.cuda.is_available() else "cpu")
     }
@@ -1714,73 +1577,61 @@ if __name__ == "__main__":
     models_to_train = ['unsupervised_transformer']
     
     # Number of trials for hyperparameter optimization
-    n_trials = 10
+    n_trials = 1
     
     # Results dictionary to store best trials for each model
     results = {}
     
     # Train each model
     for model_name in models_to_train:
-        print(f"\n{'='*80}")
-        print(f"Training {model_name.upper()}")
-        print(f"{'='*80}\n")
+        print(f"\nTraining {model_name}...")
         
-        # Create study for this model
+        # Create study for hyperparameter optimization
         study = optuna.create_study(
             direction="minimize",
             sampler=optuna.samplers.TPESampler(seed=42),
             pruner=optuna.pruners.MedianPruner(
                 n_startup_trials=5,
                 n_warmup_steps=10,
-                interval_steps=1
+                interval_steps=5
             )
         )
         
-        # Run optimization based on model type
-        if model_name == 'unsupervised_transformer':
-            study.optimize(
-                lambda trial: objective_unsupervised(
-                    trial, base_config, trial.number + 1, n_trials
-                ),
-                n_trials=n_trials,
-                catch=(Exception,)
-            )
-        else:
-            study.optimize(
-                lambda trial: objective(
-                    trial, model_name, base_config, trial.number + 1, n_trials
-                ),
-                n_trials=n_trials,
-                catch=(Exception,)
-            )
+        # Run optimization
+        study.optimize(
+            lambda trial: objective_unsupervised(trial, base_config, len(study.trials), n_trials),
+            n_trials=n_trials,
+            timeout=None,
+            catch=(Exception,)
+        )
+        
+        # Print optimization results
+        print("\nOptimization Results:")
+        print(f"Number of finished trials: {len(study.trials)}")
+        print("\nBest trial:")
+        trial = study.best_trial
+        print(f"  Value: {trial.value}")
+        print("  Params: ")
+        for key, value in trial.params.items():
+            print(f"    {key}: {value}")
         
         # Store results
         results[model_name] = {
-            'best_value': study.best_value,
-            'best_params': study.best_trial.params
+            'best_value': trial.value,
+            'best_params': trial.params,
+            'n_trials': len(study.trials)
         }
-        
-        # Clear GPU memory between models
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        # Log completion of model training
-        print(f"\nCompleted training {model_name}")
-        print(f"Best validation loss: {study.best_value:.4f}")
-        print("Best hyperparameters:")
-        for param, value in study.best_trial.params.items():
-            print(f"  {param}: {value}")
     
     # Print final results
-    print("\n" + "="*80)
-    print("FINAL RESULTS")
-    print("="*80)
+    print("\nFinal Results:")
     for model_name, result in results.items():
-        print(f"\n{model_name.upper()}:")
-        print(f"Best validation loss: {result['best_value']:.4f}")
-        print("Best hyperparameters:")
-        for param, value in result['best_params'].items():
-            print(f"  {param}: {value}")
+        print(f"\n{model_name}:")
+        print(f"  Best validation loss: {result['best_value']}")
+        print("  Best parameters:")
+        for key, value in result['best_params'].items():
+            print(f"    {key}: {value}")
+        print(f"  Number of trials: {result['n_trials']}")
     
-    total_end = time.time()
-    print(f"\nTotal time taken for all models: {total_end - total_start:.2f} seconds")
+    # Calculate total runtime
+    total_time = time.time() - total_start
+    print(f"\nTotal runtime: {timedelta(seconds=int(total_time))}")
