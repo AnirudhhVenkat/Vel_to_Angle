@@ -12,6 +12,7 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 from datetime import datetime
 import math
+import json
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -481,7 +482,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     return best_model, best_r2  # Return the actual R² value instead of loss
 
 def evaluate_model(model, test_loader, criterion, device, output_features, output_scaler, save_dir):
-    """Evaluate the trained model."""
     model = model.to(device)
     model.eval()
     
@@ -489,54 +489,75 @@ def evaluate_model(model, test_loader, criterion, device, output_features, outpu
     all_targets = []
     test_loss = 0.0
     
-    # Use tqdm for test evaluation
-    test_pbar = tqdm(test_loader, desc='Evaluating')
-    
+    print("\nEvaluating model on test set...")
     with torch.no_grad():
-        for sequences, targets in test_pbar:
+        for sequences, targets in tqdm(test_loader, desc="Testing"):
             sequences, targets = sequences.to(device), targets.to(device)
             outputs = model(sequences)
             loss = criterion(outputs, targets)
             test_loss += loss.item()
-            test_pbar.set_postfix({'mae_loss': f'{loss.item():.4f}'})
             
+            # Store predictions and targets
             all_predictions.append(outputs.cpu().numpy())
             all_targets.append(targets.cpu().numpy())
     
-    # Concatenate all predictions and targets
+    # Concatenate all batches
     predictions = np.concatenate(all_predictions)
     targets = np.concatenate(all_targets)
     
-    # Calculate overall R² score
-    test_r2 = 1 - np.sum((targets - predictions) ** 2) / np.sum((targets - targets.mean()) ** 2)
-    print(f"\nTest MAE: {test_loss/len(test_loader):.4f}")
-    print(f"Test R²: {test_r2:.4f}")
+    # Calculate overall test loss
+    test_loss = test_loss / len(test_loader)
     
     # Inverse transform predictions and targets
     predictions = output_scaler.inverse_transform(predictions)
     targets = output_scaler.inverse_transform(targets)
     
-    # Create plots directory if it doesn't exist
-    plots_dir = Path(save_dir) / 'plots'
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Calculate metrics for each joint angle
-    metrics = {}
-    print("\nCalculating metrics for each joint angle...")
-    
     # Calculate frames per trial and number of trials
-    frames_per_trial = 600  # Full range from 400-1000
+    frames_per_trial = 601  # Frames 400-1000 inclusive
     num_trials = len(predictions) // frames_per_trial
-    print(f"\nNumber of trials: {num_trials}")
-    print(f"Frames per trial: {frames_per_trial}")
     
-    for i, feature in enumerate(tqdm(output_features, desc='Joint Angles')):
-        pred = predictions[:, i]
-        target = targets[:, i]
+    print(f"\nTotal samples: {len(predictions)}")
+    print(f"Frames per trial: {frames_per_trial}")
+    print(f"Number of trials: {num_trials}")
+    
+    # Create frame numbers array
+    frame_numbers = np.arange(400, 1001)  # 400 to 1000 inclusive
+    
+    # Reshape predictions and targets into trials
+    predictions_by_trial = predictions[:num_trials*frames_per_trial].reshape(num_trials, frames_per_trial, -1)
+    targets_by_trial = targets[:num_trials*frames_per_trial].reshape(num_trials, frames_per_trial, -1)
+    
+    # Save predictions to NPZ file
+    save_path = Path(save_dir) / 'predictions.npz'
+    np.savez(
+        save_path,
+        predictions=predictions_by_trial,
+        targets=targets_by_trial,
+        frame_numbers=frame_numbers,
+        feature_names=output_features
+    )
+    print(f"\nSaved predictions to: {save_path}")
+    
+    # Calculate metrics for each feature
+    metrics = {}
+    for i, feature in enumerate(output_features):
+        # Get predictions and targets for this feature
+        feature_pred = predictions[:, i]
+        feature_true = targets[:, i]
         
-        mae = np.mean(np.abs(pred - target))
-        rmse = np.sqrt(np.mean((pred - target) ** 2))
-        r2 = 1 - np.sum((target - pred) ** 2) / np.sum((target - target.mean()) ** 2)
+        # Calculate MAE
+        mae = np.mean(np.abs(feature_pred - feature_true))
+        
+        # Calculate RMSE
+        rmse = np.sqrt(np.mean((feature_pred - feature_true) ** 2))
+        
+        # Calculate R² score properly
+        ss_res = np.sum((feature_true - feature_pred) ** 2)
+        ss_tot = np.sum((feature_true - np.mean(feature_true)) ** 2)
+        r2 = 1 - (ss_res / ss_tot)
+        
+        # Ensure R² is capped at 1
+        r2 = min(r2, 1.0)
         
         metrics[feature] = {
             'mae': mae,
@@ -544,30 +565,20 @@ def evaluate_model(model, test_loader, criterion, device, output_features, outpu
             'r2': r2
         }
         
-        # Create scatter plot
-        plt.figure(figsize=(10, 6))
-        plt.scatter(target, pred, alpha=0.5)
-        plt.plot([target.min(), target.max()],
-                [target.min(), target.max()],
-                'r--', lw=2)
+        print(f"\n{feature}:")
+        print(f"  MAE: {mae:.4f}")
+        print(f"  RMSE: {rmse:.4f}")
+        print(f"  R²: {r2:.4f}")
+    
+    # Create plots directory
+    plots_dir = Path(save_dir) / 'plots'
+    plots_dir.mkdir(exist_ok=True)
+    
+    # Create PDF with time series plots for each feature
+    for i, feature in enumerate(output_features):
+        pdf_path = plots_dir / f'{feature}_predictions.pdf'
         
-        plt.xlabel(f'Actual {feature}')
-        plt.ylabel(f'Predicted {feature}')
-        plt.title(f'{feature} Predictions\nMAE: {mae:.3f}, R²: {r2:.3f}')
-        
-        # Add metrics text box
-        plt.text(0.05, 0.95,
-                f'MAE: {mae:.3f}\nRMSE: {rmse:.3f}\nR²: {r2:.3f}',
-                transform=plt.gca().transAxes,
-                bbox=dict(facecolor='white', alpha=0.8),
-                verticalalignment='top')
-        
-        plt.grid(True, alpha=0.3)
-        plt.savefig(plots_dir / f'{feature}_scatter.png')
-        plt.close()
-        
-        # Create PDF with time series plots for all trials
-        with PdfPages(plots_dir / f'{feature}_predictions.pdf') as pdf:
+        with PdfPages(pdf_path) as pdf:
             # Calculate number of rows and columns for subplots
             n_cols = 2
             n_rows = (num_trials + n_cols - 1) // n_cols
@@ -575,22 +586,32 @@ def evaluate_model(model, test_loader, criterion, device, output_features, outpu
             # Create figure with subplots
             fig = plt.figure(figsize=(15, 5 * n_rows))
             
+            # Calculate feature-specific metrics
+            feature_metrics = []
+            
             for trial in range(num_trials):
                 plt.subplot(n_rows, n_cols, trial + 1)
                 
                 # Get trial data
-                start_idx = trial * frames_per_trial
-                end_idx = start_idx + frames_per_trial
+                trial_pred = predictions_by_trial[trial, :, i]
+                trial_target = targets_by_trial[trial, :, i]
                 
-                trial_pred = pred[start_idx:end_idx]
-                trial_target = target[start_idx:end_idx]
-                
-                # Calculate trial-specific metrics
+                # Calculate trial metrics
                 trial_mae = np.mean(np.abs(trial_pred - trial_target))
-                trial_r2 = 1 - np.sum((trial_target - trial_pred) ** 2) / np.sum((trial_target - trial_target.mean()) ** 2)
+                trial_rmse = np.sqrt(np.mean((trial_pred - trial_target) ** 2))
                 
-                # Create frame numbers for x-axis (400 to 1000)
-                frame_numbers = np.linspace(400, 1000, frames_per_trial)
+                # Calculate trial R² properly
+                ss_res = np.sum((trial_target - trial_pred) ** 2)
+                ss_tot = np.sum((trial_target - np.mean(trial_target)) ** 2)
+                trial_r2 = 1 - (ss_res / ss_tot)
+                trial_r2 = min(trial_r2, 1.0)  # Cap at 1
+                
+                feature_metrics.append({
+                    'trial': trial + 1,
+                    'mae': trial_mae,
+                    'rmse': trial_rmse,
+                    'r2': trial_r2
+                })
                 
                 # Plot predictions vs actual
                 plt.plot(frame_numbers, trial_target, 'b-', label='Actual', alpha=0.7)
@@ -607,6 +628,53 @@ def evaluate_model(model, test_loader, criterion, device, output_features, outpu
             plt.tight_layout()
             pdf.savefig(fig)
             plt.close()
+            
+            # Create scatter plot for all trials combined
+            fig = plt.figure(figsize=(10, 6))
+            
+            # Get all predictions and targets for this feature
+            feature_pred = predictions[:, i]
+            feature_target = targets[:, i]
+            
+            # Calculate overall metrics
+            mae = metrics[feature]['mae']
+            rmse = metrics[feature]['rmse']
+            r2 = metrics[feature]['r2']
+            
+            # Create scatter plot
+            plt.scatter(feature_target, feature_pred, alpha=0.5)
+            
+            # Add diagonal line
+            min_val = min(feature_target.min(), feature_pred.min())
+            max_val = max(feature_target.max(), feature_pred.max())
+            plt.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2)
+            
+            plt.xlabel(f'Actual {feature}')
+            plt.ylabel(f'Predicted {feature}')
+            plt.title(f'{feature} Predictions vs Actual\nMAE: {mae:.3f}, RMSE: {rmse:.3f}, R²: {r2:.3f}')
+            plt.grid(True, alpha=0.3)
+            
+            # Add metrics text box
+            plt.text(0.05, 0.95, 
+                    f'Overall Metrics:\nMAE: {mae:.3f}\nRMSE: {rmse:.3f}\nR²: {r2:.3f}',
+                    transform=plt.gca().transAxes,
+                    bbox=dict(facecolor='white', alpha=0.8),
+                    verticalalignment='top')
+            
+            plt.tight_layout()
+            pdf.savefig(fig)
+            plt.close()
+    
+    # Save metrics to JSON
+    metrics_file = Path(save_dir) / 'metrics.json'
+    with open(metrics_file, 'w') as f:
+        json.dump(metrics, f, indent=4)
+    
+    # Calculate overall test R² properly
+    ss_res = np.sum((targets - predictions) ** 2)
+    ss_tot = np.sum((targets - np.mean(targets)) ** 2)
+    test_r2 = 1 - (ss_res / ss_tot)
+    test_r2 = min(test_r2, 1.0)  # Cap at 1
     
     return metrics, test_r2
 
@@ -629,27 +697,21 @@ def main():
     # Define legs and their features
     legs = {
         'R1': {
-            'input_coord': 'R-F-CTr_y',
             'angles': ['R1A_flex', 'R1A_rot', 'R1A_abduct', 'R1B_flex', 'R1B_rot', 'R1C_flex', 'R1C_rot', 'R1D_flex']
         },
         'L1': {
-            'input_coord': 'L-F-CTr_y',
             'angles': ['L1A_flex', 'L1A_rot', 'L1A_abduct', 'L1B_flex', 'L1B_rot', 'L1C_flex', 'L1C_rot', 'L1D_flex']
         },
         'R2': {
-            'input_coord': 'R-M-CTr_y',
             'angles': ['R2A_flex', 'R2A_rot', 'R2A_abduct', 'R2B_flex', 'R2B_rot', 'R2C_flex', 'R2C_rot', 'R2D_flex']
         },
         'L2': {
-            'input_coord': 'L-M-CTr_y',
             'angles': ['L2A_flex', 'L2A_rot', 'L2A_abduct', 'L2B_flex', 'L2B_rot', 'L2C_flex', 'L2C_rot', 'L2D_flex']
         },
         'R3': {
-            'input_coord': 'R-H-CTr_y',
             'angles': ['R3A_flex', 'R3A_rot', 'R3A_abduct', 'R3B_flex', 'R3B_rot', 'R3C_flex', 'R3C_rot', 'R3D_flex']
         },
         'L3': {
-            'input_coord': 'L-H-CTr_y',
             'angles': ['L3A_flex', 'L3A_rot', 'L3A_abduct', 'L3B_flex', 'L3B_rot', 'L3C_flex', 'L3C_rot', 'L3D_flex']
         }
     }
@@ -658,6 +720,14 @@ def main():
     results_dir = Path('transformer_results')
     results_dir.mkdir(exist_ok=True)
     print("\nCreated base results directory:", results_dir)
+    
+    # Define input features (same for all legs)
+    input_features = [
+        'x_vel', 'y_vel', 'z_vel',  # Raw velocities
+        'x_vel_ma5', 'y_vel_ma5', 'z_vel_ma5',  # 5-frame moving averages
+        'x_vel_ma10', 'y_vel_ma10', 'z_vel_ma10',  # 10-frame moving averages
+        'x_vel_ma20', 'y_vel_ma20', 'z_vel_ma20'  # 20-frame moving averages
+    ]
     
     # Train model for each leg
     for leg_name, leg_info in legs.items():
@@ -678,15 +748,6 @@ def main():
         print(f"- {leg_dir}")
         print(f"- {models_dir}")
         print(f"- {plots_dir}")
-        
-        # Define input features
-        input_features = [
-            'x_vel', 'y_vel', 'z_vel',  # Raw velocities
-            'x_vel_ma5', 'y_vel_ma5', 'z_vel_ma5',  # 5-frame moving averages
-            'x_vel_ma10', 'y_vel_ma10', 'z_vel_ma10',  # 10-frame moving averages
-            'x_vel_ma20', 'y_vel_ma20', 'z_vel_ma20',  # 20-frame moving averages
-            leg_info['input_coord']  # Leg-specific coordinate
-        ]
         
         # Use leg-specific output features
         output_features = leg_info['angles']
