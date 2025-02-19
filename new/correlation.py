@@ -196,7 +196,7 @@ def load_data(file_path, genotype=None):
         raise
 
 def compute_correlation(df):
-    """Compute the correlation matrix between inputs and outputs."""
+    """Compute the Pearson correlation matrix between inputs and outputs."""
     # Define output features (joint angles)
     output_features = [col for col in df.columns 
                       if col.endswith(('_flex', '_rot', '_abduct'))]
@@ -255,9 +255,9 @@ def compute_correlation(df):
                 x = x[mask]
                 y = y[mask]
                 
-                # Calculate Spearman correlation using scipy stats
+                # Calculate Pearson correlation using numpy corrcoef
                 if len(x) > 0 and len(y) > 0:
-                    correlation, _ = stats.spearmanr(x, y)
+                    correlation = np.corrcoef(x, y)[0, 1]  # Changed from spearmanr to corrcoef
                 else:
                     correlation = np.nan
                 correlation_matrix.loc[input_feat, output_feat] = correlation
@@ -271,7 +271,7 @@ def compute_correlation(df):
     return correlation_matrix
 
 def plot_correlation_heatmap(correlation_matrix, save_path=None):
-    """Plot and save correlation heatmap between inputs and outputs."""
+    """Plot and save Pearson correlation heatmap between inputs and outputs."""
     # Create output directory if it doesn't exist
     if save_path:
         save_dir = Path(save_path).parent
@@ -291,7 +291,7 @@ def plot_correlation_heatmap(correlation_matrix, save_path=None):
                 vmax=1,
                 cbar_kws={"shrink": .8})
     
-    plt.title('TaG Points and Velocities vs Joint Angles Correlation')
+    plt.title('TaG Points and Velocities vs Joint Angles Pearson Correlation')
     plt.xlabel('Joint Angles')
     plt.ylabel('TaG Points and Their Velocities')
     
@@ -309,8 +309,8 @@ def plot_correlation_heatmap(correlation_matrix, save_path=None):
     plt.close()
 
 def analyze_correlations(correlation_matrix, threshold=0.3, output_dir=None):
-    """Analyze and print significant correlations between inputs and outputs."""
-    print("\nSignificant Correlations Analysis:")
+    """Analyze and print significant Pearson correlations between inputs and outputs."""
+    print("\nSignificant Pearson Correlations Analysis:")
     print("-" * 50)
     
     # Store significant correlations
@@ -347,7 +347,7 @@ def analyze_correlations(correlation_matrix, threshold=0.3, output_dir=None):
         print(f"\nSaved significant correlations to: {sig_corr_path}")
     
     # Print top correlations
-    print("\nTop 20 strongest input-output correlations:")
+    print("\nTop 20 strongest input-output correlations (Pearson):")
     for i, corr in enumerate(significant_correlations[:20]):
         print(f"{corr['Feature']} -- {corr['Joint Angle']}: {corr['Correlation']:.3f}")
     
@@ -387,21 +387,21 @@ def main():
             # Load and process data for this genotype
             df = load_data(file_path, genotype)
             if df is not None:
-                # Compute correlations between inputs and outputs
+                # Compute Pearson correlations between inputs and outputs
                 correlation_matrix = compute_correlation(df)
                 
                 # Plot heatmap
                 plot_correlation_heatmap(
                     correlation_matrix,
-                    save_path=str(output_dir / f"enhanced_input_output_correlation_{genotype}.png")
+                    save_path=str(output_dir / f"pearson_input_output_correlation_{genotype}.png")
                 )
                 
                 # Analyze correlations and save to CSV
-                print(f"\nCorrelation Analysis for {genotype}:")
+                print(f"\nPearson Correlation Analysis for {genotype}:")
                 analyze_correlations(correlation_matrix, output_dir=output_dir)
                 
                 # Save correlation matrix to CSV
-                correlation_matrix.to_csv(output_dir / f"correlation_matrix_{genotype}.csv")
+                correlation_matrix.to_csv(output_dir / f"pearson_correlation_matrix_{genotype}.csv")
                 print(f"\nResults saved to {output_dir}")
     
     except FileNotFoundError as e:

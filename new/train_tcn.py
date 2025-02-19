@@ -992,7 +992,7 @@ def main():
                 'x_vel_ma10', 'y_vel_ma10', 'z_vel_ma10',
                 'x_vel_ma20', 'y_vel_ma20', 'z_vel_ma20',
                 'x_vel', 'y_vel', 'z_vel',
-                leg_config['position']
+             #   leg_config['position']
             ],
             'output_features': leg_config['angles'],
             'genotype': selected_genotype,

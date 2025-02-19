@@ -32,10 +32,21 @@ def calculate_spearman_correlation(data_path, genotype, output_dir='spearman_cor
     tag_cols = [col for col in df.columns if 'TaG' in col]
     windows = [5, 10, 20]  # Window sizes for moving averages
     
+    # Process each trial separately to avoid boundary issues
+    trial_size = 600  # After filtering (1000 - 400 = 600)
+    num_trials = len(df) // trial_size
+    
     for window in windows:
         for col in tag_cols:
-            ma_col = f"{col}_ma{window}"
-            df[ma_col] = df[col].rolling(window=window, center=True).mean()
+            ma_values = []
+            for trial in range(num_trials):
+                start_idx = trial * trial_size
+                end_idx = start_idx + trial_size
+                trial_data = df[col].iloc[start_idx:end_idx]
+                # Calculate moving average within the trial
+                ma = trial_data.rolling(window=window, center=True, min_periods=1).mean()
+                ma_values.extend(ma.tolist())
+            df[f"{col}_ma{window}"] = ma_values
     
     # Combine original data with enhanced features
     df_combined = pd.concat([df, enhanced_features], axis=1)
@@ -70,36 +81,39 @@ def calculate_spearman_correlation(data_path, genotype, output_dir='spearman_cor
         columns=joint_cols
     )
     
-    # Calculate correlations between each input-output pair
-    for feature in feature_cols:
-        for joint in joint_cols:
-            try:
-                # Get the data as numpy arrays, ensuring we get 1D arrays
-                x = df_combined[feature].to_numpy().ravel()
-                y = df_combined[joint].to_numpy().ravel()
-                
-                # Print debug info if shapes don't match
-                if len(x) != len(y):
-                    print(f"\nShape mismatch for {feature} vs {joint}:")
-                    print(f"Shape of {feature}: {x.shape}")
-                    print(f"Shape of {joint}: {y.shape}")
+    # Process each trial separately
+    for trial in range(num_trials):
+        start_idx = trial * trial_size
+        end_idx = start_idx + trial_size
+        
+        # Calculate correlations between each input-output pair
+        for feature in feature_cols:
+            for joint in joint_cols:
+                try:
+                    # Get the data for this trial
+                    x = df_combined[feature].iloc[start_idx:end_idx].to_numpy()
+                    y = df_combined[joint].iloc[start_idx:end_idx].to_numpy()
+                    
+                    # Remove any NaN values
+                    mask = ~(np.isnan(x) | np.isnan(y))
+                    x = x[mask]
+                    y = y[mask]
+                    
+                    # Calculate Spearman correlation if we have enough data
+                    if len(x) > 0 and len(y) > 0:
+                        correlation, _ = stats.spearmanr(x, y)
+                        # Accumulate correlations (we'll take the mean later)
+                        if np.isnan(correlation_matrix.loc[feature, joint]):
+                            correlation_matrix.loc[feature, joint] = correlation
+                        else:
+                            correlation_matrix.loc[feature, joint] += correlation
+                    
+                except Exception as e:
+                    print(f"\nError calculating correlation between {feature} and {joint} for trial {trial}: {e}")
                     continue
-                
-                # Remove any NaN values
-                mask = ~(np.isnan(x) | np.isnan(y))
-                x = x[mask]
-                y = y[mask]
-                
-                # Calculate Spearman correlation using scipy stats
-                if len(x) > 0 and len(y) > 0:
-                    correlation, _ = stats.spearmanr(x, y)
-                else:
-                    correlation = np.nan
-                correlation_matrix.loc[feature, joint] = correlation
-                
-            except Exception as e:
-                print(f"\nError calculating correlation between {feature} and {joint}: {e}")
-                correlation_matrix.loc[feature, joint] = np.nan
+    
+    # Take the mean of correlations across trials
+    correlation_matrix = correlation_matrix / num_trials
     
     # Save full correlation matrix to CSV
     correlation_csv = output_path / f'spearman_correlation_matrix_{genotype}.csv'
@@ -133,34 +147,37 @@ def calculate_spearman_correlation(data_path, genotype, output_dir='spearman_cor
     print("\nAnalyzing significant correlations...")
     significant_correlations = []
     
-    for feature in feature_cols:
-        for joint in joint_cols:
-            try:
-                # Get the data as numpy arrays, ensuring we get 1D arrays
-                x = df_combined[feature].to_numpy().ravel()
-                y = df_combined[joint].to_numpy().ravel()
-                
-                if len(x) != len(y):
+    # Process each trial separately
+    for trial in range(num_trials):
+        start_idx = trial * trial_size
+        end_idx = start_idx + trial_size
+        
+        for feature in feature_cols:
+            for joint in joint_cols:
+                try:
+                    # Get the data for this trial
+                    x = df_combined[feature].iloc[start_idx:end_idx].to_numpy()
+                    y = df_combined[joint].iloc[start_idx:end_idx].to_numpy()
+                    
+                    # Remove any NaN values
+                    mask = ~(np.isnan(x) | np.isnan(y))
+                    x = x[mask]
+                    y = y[mask]
+                    
+                    # Calculate correlation and p-value if we have enough data
+                    if len(x) > 0 and len(y) > 0:
+                        correlation, p_value = stats.spearmanr(x, y)
+                        if abs(correlation) > 0.3 and p_value < 0.05:  # Adjusted threshold to 0.3
+                            significant_correlations.append({
+                                'Feature': feature,
+                                'Joint Angle': joint,
+                                'Correlation': correlation,
+                                'P-value': p_value,
+                                'Trial': trial + 1
+                            })
+                except Exception as e:
+                    print(f"\nError analyzing correlation between {feature} and {joint} for trial {trial}: {e}")
                     continue
-                
-                # Remove any NaN values
-                mask = ~(np.isnan(x) | np.isnan(y))
-                x = x[mask]
-                y = y[mask]
-                
-                # Calculate correlation and p-value
-                if len(x) > 0 and len(y) > 0:
-                    correlation, p_value = stats.spearmanr(x, y)
-                    if abs(correlation) > 0.3 and p_value < 0.05:  # Adjusted threshold to 0.3
-                        significant_correlations.append({
-                            'Feature': feature,
-                            'Joint Angle': joint,
-                            'Correlation': correlation,
-                            'P-value': p_value
-                        })
-            except Exception as e:
-                print(f"\nError analyzing correlation between {feature} and {joint}: {e}")
-                continue
     
     # Sort by absolute correlation strength
     significant_correlations.sort(key=lambda x: abs(x['Correlation']), reverse=True)
@@ -177,45 +194,6 @@ def calculate_spearman_correlation(data_path, genotype, output_dir='spearman_cor
         print(sig_corr_df.head(20).to_string(index=False))
     else:
         print(f"\nNo significant correlations found for {genotype}.")
-    
-    # Create scatter plots for top correlations
-    if significant_correlations:
-        print("\nGenerating scatter plots for top correlations...")
-        scatter_dir = output_path / 'scatter_plots'
-        scatter_dir.mkdir(exist_ok=True)
-        
-        for i, corr in enumerate(significant_correlations[:20]):  # Top 20 correlations
-            try:
-                feature, joint = corr['Feature'], corr['Joint Angle']
-                
-                plt.figure(figsize=(10, 6))
-                x = df_combined[feature].to_numpy()
-                y = df_combined[joint].to_numpy()
-                
-                # Remove NaN values for plotting
-                mask = ~(np.isnan(x) | np.isnan(y))
-                x = x[mask]
-                y = y[mask]
-                
-                plt.scatter(x, y, alpha=0.5)
-                plt.title(f"{genotype}: Spearman Correlation: {corr['Correlation']:.3f} (p={corr['P-value']:.3e})")
-                plt.xlabel(feature)
-                plt.ylabel(joint)
-                
-                # Add trend line
-                z = np.polyfit(x, y, 1)
-                p = np.poly1d(z)
-                plt.plot(x, p(x), "r--", alpha=0.8)
-                
-                plt.tight_layout()
-                scatter_path = scatter_dir / f'scatter_{i+1}_{feature}_vs_{joint}.png'
-                plt.savefig(scatter_path, dpi=300, bbox_inches='tight')
-                plt.close()
-            except Exception as e:
-                print(f"\nError creating scatter plot for {feature} vs {joint}: {e}")
-                continue
-        
-        print(f"Saved scatter plots to: {scatter_dir}")
     
     return correlation_matrix
 

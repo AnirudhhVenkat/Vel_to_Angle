@@ -550,24 +550,25 @@ def evaluate_models(models, X_test, y_test, features, targets, genotype, parent_
                     trial_pred = predictions[start_idx:end_idx]
                     
                     # Calculate confidence band (using residuals)
-                    residuals = np.abs(trial_actual - trial_pred)
-                    conf_band = np.std(residuals) * 1.96  # 95% confidence interval
+                    residuals = trial_actual - trial_pred
+                    std_residuals = np.std(residuals)
+                    confidence_band = 1.96 * std_residuals  # 95% confidence interval
                     
-                    # Plot with confidence band
-                    time_points = np.arange(400, 1000)  # Actual frame numbers
-                    ax.plot(time_points, trial_actual, label='Actual', color='#2E86C1', linewidth=2)
-                    ax.plot(time_points, trial_pred, label='Predicted', color='#E74C3C', linewidth=2)
-                    ax.fill_between(time_points, 
-                                  trial_pred - conf_band,
-                                  trial_pred + conf_band,
-                                  color='#E74C3C', alpha=0.2, label='95% Confidence')
+                    # Plot actual vs predicted with confidence band
+                    ax.plot(trial_actual.index, trial_actual.values, 'b-', label='Actual', alpha=0.7)
+                    ax.plot(trial_actual.index, trial_pred, 'r-', label='Predicted', alpha=0.7)
+                    ax.fill_between(trial_actual.index,
+                                   trial_pred - confidence_band,
+                                   trial_pred + confidence_band,
+                                   color='gray', alpha=0.2,
+                                   label='95% Confidence')
                     
                     # Calculate trial-specific metrics
                     trial_mae = mean_absolute_error(trial_actual, trial_pred)
                     trial_r2 = r2_score(trial_actual, trial_pred)
                     
                     ax.set_title(f'Trial {trial+1} (MAE: {trial_mae:.3f}, R²: {trial_r2:.3f})')
-                    ax.set_xlabel('Frame Number')
+                    ax.set_xlabel('Frame')
                     ax.set_ylabel(f'{target} Value')
                     ax.legend()
                     ax.grid(True, alpha=0.3)
