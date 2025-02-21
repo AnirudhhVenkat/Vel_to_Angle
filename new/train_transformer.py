@@ -223,182 +223,179 @@ class ZScoreScaler:
         return X * self.stds + self.means
 
 def filter_trial_frames(X, y, sequence_length):
-    """Filter frames to include frames (400-sequence_length) to 1000 from each trial.
-    This ensures we have enough context frames to predict starting from frame 400.
-    
-    Args:
-        X: Input features array
-        y: Target values array
-        sequence_length: Length of sequence needed for prediction
-    
-    Returns:
-        X_filtered: Filtered input features
-        y_filtered: Filtered target values
-    """
-    # Calculate the number of context frames needed
+    """Filter frames to include context before frame 400."""
     context_frames = sequence_length - 1
-    
-    # Calculate start and end frames
     start_frame = 400 - context_frames
     end_frame = 1000
+    frames_per_trial = 1400
     
-    # Calculate indices for each trial (assuming 1400 frames per trial)
-    trial_size = 1400
-    num_trials = len(X) // trial_size
-    
-    # Initialize lists to store filtered data
-    X_filtered_list = []
-    y_filtered_list = []
+    filtered_X = []
+    filtered_y = []
     
     # Process each trial
+    num_trials = len(X) // frames_per_trial
     for trial in range(num_trials):
-        # Calculate indices for this trial
-        trial_start = trial * trial_size + start_frame
-        trial_end = trial * trial_size + end_frame + 1  # +1 to include frame 1000
+        trial_start = trial * frames_per_trial
+        trial_end = (trial + 1) * frames_per_trial
         
-        # Extract and store the frames for this trial
-        X_filtered_list.append(X[trial_start:trial_end])
-        y_filtered_list.append(y[trial_start:trial_end])
+        # Extract trial data
+        trial_X = X[trial_start:trial_end]
+        trial_y = y[trial_start:trial_end]
+        
+        # Extract frames from start_frame to end_frame
+        # This includes context frames before frame 400
+        filtered_trial_X = trial_X[start_frame:end_frame]
+        filtered_trial_y = trial_y[start_frame:end_frame]
+        
+        filtered_X.append(filtered_trial_X)
+        filtered_y.append(filtered_trial_y)
     
-    # Concatenate all trials
-    X_filtered = np.concatenate(X_filtered_list)
-    y_filtered = np.concatenate(y_filtered_list)
+    # Combine all trials
+    filtered_X = np.concatenate(filtered_X)
+    filtered_y = np.concatenate(filtered_y)
     
-    print(f"\nFiltering summary:")
-    print(f"Original shape: {X.shape}")
-    print(f"Filtered shape: {X_filtered.shape}")
-    print(f"Context frames included: {context_frames}")
-    print(f"Frame range per trial: {start_frame}-{end_frame}")
-    print(f"Total frames per trial: {end_frame - start_frame + 1}")
-    print(f"Number of trials: {num_trials}")
-    
-    return X_filtered, y_filtered
+    return filtered_X, filtered_y
 
 def prepare_data(data_path, input_features, output_features, sequence_length, genotype='ALL'):
     """Load and prepare data for training."""
-    try:
-        # Load data
-        df = pd.read_csv(data_path)
-        print(f"Loaded data with shape: {df.shape}")
+    print("\nPreparing data...")
+    
+    # Load data
+    df = pd.read_csv(data_path)
+    print(f"Loaded data with shape: {df.shape}")
+    
+    # Filter for specific genotype if requested
+    if genotype != 'ALL':
+        df = df[df['genotype'] == genotype].copy()
+        print(f"Filtered for {genotype} genotype: {df.shape}")
+    
+    # Create trial IDs based on frame numbers (guaranteed 1400 frames per trial)
+    trial_size = 1400
+    num_trials = len(df) // trial_size
+    print(f"\nNumber of trials detected: {num_trials}")
+    print(f"Frames per trial: {trial_size}")
+    
+    # Create trial IDs
+    df['trial_id'] = np.repeat(np.arange(num_trials), trial_size)
+    
+    # Calculate moving averages for velocities within each trial
+    base_velocities = ['x_vel', 'y_vel', 'z_vel']
+    for window in [5, 10, 20]:
+        for vel in base_velocities:
+            # Calculate moving average for each trial separately
+            ma_values = []
+            for trial in df['trial_id'].unique():
+                trial_data = df[df['trial_id'] == trial][vel]
+                # Calculate moving average and handle edges
+                ma = trial_data.rolling(window=window, center=True, min_periods=1).mean()
+                ma_values.extend(ma.tolist())
+            df[f'{vel}_ma{window}'] = ma_values
+    
+    print("Moving averages calculated.")
+    
+    # Define input features
+    base_features = [
+        'x_vel_ma5',    # Moving average velocities
+        'y_vel_ma5',
+        'z_vel_ma5',
+        'x_vel_ma10',
+        'y_vel_ma10',
+        'z_vel_ma10',
+        'x_vel_ma20',
+        'y_vel_ma20',
+        'z_vel_ma20',
+        'x_vel',        # Raw velocities
+        'y_vel',
+        'z_vel'
+    ]
+    
+    # Input features: base velocities only
+    input_features = base_features
+    
+    # Extract features and targets
+    X = df[input_features].values
+    y = df[output_features].values
+    
+    print(f"\nFeature Information:")
+    print(f"Input features ({len(input_features)}):")
+    for feat in input_features:
+        print(f"  - {feat}")
+        if feat in df.columns:
+            print(f"    NaN count: {df[feat].isna().sum()}")
+    
+    print(f"\nOutput features ({len(output_features)}):")
+    for feat in output_features:
+        print(f"  - {feat}")
+    
+    # Split into train, validation, and test sets by trials
+    train_size = int(0.7 * num_trials)
+    val_size = int(0.15 * num_trials)
+    test_size = num_trials - train_size - val_size
+    
+    print(f"\nSplitting data by trials:")
+    print(f"Train: {train_size} trials")
+    print(f"Validation: {val_size} trials")
+    print(f"Test: {test_size} trials")
+    
+    # Create masks for each split
+    train_mask = np.zeros(len(df), dtype=bool)
+    val_mask = np.zeros(len(df), dtype=bool)
+    test_mask = np.zeros(len(df), dtype=bool)
+    
+    # Assign trials to splits
+    for trial in range(num_trials):
+        start_idx = trial * trial_size
+        end_idx = (trial + 1) * trial_size
         
-        # Filter for specified genotype if not ALL
-        if genotype != 'ALL':
-            df = df[df['genotype'] == genotype].copy()
-            print(f"Filtered for {genotype}: {df.shape}")
-        
-        # Create trial IDs based on frame numbers (guaranteed 1400 frames per trial)
-        trial_size = 1400
-        num_trials = len(df) // trial_size
-        print(f"\nNumber of trials detected: {num_trials}")
-        print(f"Frames per trial: {trial_size}")
-        
-        # Create trial IDs
-        df['trial_id'] = np.repeat(np.arange(num_trials), trial_size)
-        
-        # Calculate moving averages for velocities within each trial
-        base_velocities = ['x_vel', 'y_vel', 'z_vel']
-        for window in [5, 10, 20]:
-            for vel in base_velocities:
-                # Calculate moving average for each trial separately
-                ma_values = []
-                for trial in df['trial_id'].unique():
-                    trial_data = df[df['trial_id'] == trial][vel]
-                    # Calculate moving average and handle edges
-                    ma = trial_data.rolling(window=window, center=True, min_periods=1).mean()
-                    ma_values.extend(ma.tolist())
-                df[f'{vel}_ma{window}'] = ma_values
-        
-        print("Moving averages calculated.")
-        
-        # Verify all required features exist
-        missing_inputs = [feat for feat in input_features if feat not in df.columns]
-        if missing_inputs:
-            raise ValueError(f"Missing input features: {missing_inputs}")
-        
-        missing_outputs = [feat for feat in output_features if feat not in df.columns]
-        if missing_outputs:
-            raise ValueError(f"Missing output features: {missing_outputs}")
-        
-        print("\nFeature Information:")
-        print(f"Input features ({len(input_features)}):")
-        for feat in input_features:
-            print(f"  - {feat}")
-            if feat in df.columns:
-                print(f"    NaN count: {df[feat].isna().sum()}")
-        
-        print(f"\nOutput features ({len(output_features)}):")
-        for feat in output_features:
-            print(f"  - {feat}")
-            if feat in df.columns:
-                print(f"    NaN count: {df[feat].isna().sum()}")
-        
-        # Extract features and targets
-        X = df[input_features].values
-        y = df[output_features].values
-        
-        # Split into train, validation, and test sets by trials
-        train_size = int(0.7 * num_trials)
-        val_size = int(0.15 * num_trials)
-        test_size = num_trials - train_size - val_size
-        
-        print(f"\nSplitting data by trials:")
-        print(f"Train: {train_size} trials")
-        print(f"Validation: {val_size} trials")
-        print(f"Test: {test_size} trials")
-        
-        # Create masks for each split
-        train_mask = np.zeros(len(df), dtype=bool)
-        val_mask = np.zeros(len(df), dtype=bool)
-        test_mask = np.zeros(len(df), dtype=bool)
-        
-        # Assign trials to splits
-        for trial in range(num_trials):
-            start_idx = trial * trial_size
-            end_idx = (trial + 1) * trial_size
-            
-            if trial < train_size:
-                train_mask[start_idx:end_idx] = True
-            elif trial < train_size + val_size:
-                val_mask[start_idx:end_idx] = True
-            else:
-                test_mask[start_idx:end_idx] = True
-        
-        # Scale the data
-        X_scaler = ZScoreScaler()
-        y_scaler = ZScoreScaler()
-        
-        # Fit scalers on training data only
-        X_train = X_scaler.fit_transform(X[train_mask])
-        y_train = y_scaler.fit_transform(y[train_mask])
-        
-        # Transform validation and test data
-        X_val = X_scaler.transform(X[val_mask])
-        y_val = y_scaler.transform(y[val_mask])
-        X_test = X_scaler.transform(X[test_mask])
-        y_test = y_scaler.transform(y[test_mask])
-        
-        print("\nData split sizes:")
-        print(f"X_train: {X_train.shape}")
-        print(f"X_val: {X_val.shape}")
-        print(f"X_test: {X_test.shape}")
-        
-        # Create sequence datasets
-        train_dataset = SequenceDataset(X_train, y_train, sequence_length)
-        val_dataset = SequenceDataset(X_val, y_val, sequence_length)
-        test_dataset = SequenceDataset(X_test, y_test, sequence_length)
-        
-        # Create data loaders
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=32)
-        test_loader = DataLoader(test_dataset, batch_size=32)
-        
-        return train_loader, val_loader, test_loader, X_scaler, y_scaler
-        
-    except Exception as e:
-        print(f"\nError in prepare_data:")
-        print(f"Type: {type(e).__name__}")
-        print(f"Message: {str(e)}")
-        raise
+        if trial < train_size:
+            train_mask[start_idx:end_idx] = True
+        elif trial < train_size + val_size:
+            val_mask[start_idx:end_idx] = True
+        else:
+            test_mask[start_idx:end_idx] = True
+    
+    # Scale the data
+    X_scaler = ZScoreScaler()
+    y_scaler = ZScoreScaler()
+    
+    # Fit scalers on training data only
+    X_train = X_scaler.fit_transform(X[train_mask])
+    y_train = y_scaler.fit_transform(y[train_mask])
+    
+    # Transform validation and test data
+    X_val = X_scaler.transform(X[val_mask])
+    y_val = y_scaler.transform(y[val_mask])
+    X_test = X_scaler.transform(X[test_mask])
+    y_test = y_scaler.transform(y[test_mask])
+    
+    print("\nData split sizes:")
+    print(f"X_train: {X_train.shape}")
+    print(f"X_val: {X_val.shape}")
+    print(f"X_test: {X_test.shape}")
+    
+    # Filter frames to include context before frame 400
+    context_frames = sequence_length - 1
+    start_frame = 400 - context_frames  # Start earlier to have context
+    end_frame = 1000
+    
+    print(f"\nFiltering frames {start_frame}-{end_frame} (includes {context_frames} context frames)")
+    
+    # Filter each split
+    X_train_filtered, y_train_filtered = filter_trial_frames(X_train, y_train, sequence_length)
+    X_val_filtered, y_val_filtered = filter_trial_frames(X_val, y_val, sequence_length)
+    X_test_filtered, y_test_filtered = filter_trial_frames(X_test, y_test, sequence_length)
+    
+    print("\nFiltered data sizes:")
+    print(f"X_train: {X_train_filtered.shape}")
+    print(f"X_val: {X_val_filtered.shape}")
+    print(f"X_test: {X_test_filtered.shape}")
+    
+    # Create sequence datasets
+    train_dataset = SequenceDataset(X_train_filtered, y_train_filtered, sequence_length)
+    val_dataset = SequenceDataset(X_val_filtered, y_val_filtered, sequence_length)
+    test_dataset = SequenceDataset(X_test_filtered, y_test_filtered, sequence_length)
+    
+    return train_dataset, val_dataset, test_dataset, X_scaler, y_scaler
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, patience=20):
     """Train the transformer model."""
@@ -657,22 +654,6 @@ def main():
         f.write(f"Training started at {datetime.now()}\n")
         f.write("-" * 80 + "\n\n")
     
-    # Define input features (same for all legs)
-    input_features = [
-        'x_vel_ma5',    # Moving average velocities
-        'y_vel_ma5',
-        'z_vel_ma5',
-        'x_vel_ma10',
-        'y_vel_ma10',
-        'z_vel_ma10',
-        'x_vel_ma20',
-        'y_vel_ma20',
-        'z_vel_ma20',
-        'x_vel',        # Raw velocities
-        'y_vel',
-        'z_vel'
-    ]
-    
     # Train model for each leg
     for leg_name, leg_info in legs.items():
         try:
@@ -706,7 +687,7 @@ def main():
                 print(f"  - {feat}")
             
             # Prepare data for this leg
-            train_loader, val_loader, test_loader, X_scaler, y_scaler = prepare_data(
+            train_dataset, val_dataset, test_dataset, X_scaler, y_scaler = prepare_data(
                 base_config['data_path'],
                 input_features,
                 output_features,
@@ -731,8 +712,8 @@ def main():
             # Train model
             best_model_state, best_val_loss = train_model(
                 model,
-                train_loader,
-                val_loader,
+                train_dataset,
+                val_dataset,
                 criterion,
                 optimizer,
                 base_config['num_epochs'],
@@ -748,7 +729,7 @@ def main():
             # Evaluate model
             metrics = evaluate_model(
                 model,
-                test_loader,
+                test_dataset,
                 criterion,
                 device,
                 output_features,

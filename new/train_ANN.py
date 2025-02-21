@@ -121,8 +121,8 @@ def prepare_data(config):
         'z_vel'
     ]
     
-    # Input features: base velocities + R-F-CTr_y
-    input_features = ['R-F-CTr_y'] + base_features
+    # Input features: only velocities
+    input_features = base_features
     
     # Output features: 8 angles of R1 leg
     output_features = [
@@ -149,27 +149,27 @@ def prepare_data(config):
     
     # Split into train, validation, and test sets by trials
     unique_trials = df['trial_id'].unique()
-    train_trials, temp_trials = train_test_split(unique_trials, test_size=0.3, random_state=42)
-    val_trials, test_trials = train_test_split(temp_trials, test_size=0.5, random_state=42)
+    train_size = int(0.7 * len(unique_trials))
+    val_size = int(0.15 * len(unique_trials))
     
-    # Create masks for each split
-    train_mask = df['trial_id'].isin(train_trials)
-    val_mask = df['trial_id'].isin(val_trials)
-    test_mask = df['trial_id'].isin(test_trials)
+    # Create train/val/test splits
+    train_trials = unique_trials[:train_size]
+    val_trials = unique_trials[train_size:train_size + val_size]
+    test_trials = unique_trials[train_size + val_size:]
     
     # Scale the data
     X_scaler = StandardScaler()
     y_scaler = StandardScaler()
     
     # Fit scalers on training data only
-    X_train = X_scaler.fit_transform(X[train_mask])
-    y_train = y_scaler.fit_transform(y[train_mask])
+    X_train = X_scaler.fit_transform(X[train_trials])
+    y_train = y_scaler.fit_transform(y[train_trials])
     
     # Transform validation and test data
-    X_val = X_scaler.transform(X[val_mask])
-    y_val = y_scaler.transform(y[val_mask])
-    X_test = X_scaler.transform(X[test_mask])
-    y_test = y_scaler.transform(y[test_mask])
+    X_val = X_scaler.transform(X[val_trials])
+    y_val = y_scaler.transform(y[val_trials])
+    X_test = X_scaler.transform(X[test_trials])
+    y_test = y_scaler.transform(y[test_trials])
     
     print("\nDataset Split Information:")
     print(f"Training: {len(train_trials)} trials ({len(X_train)} frames)")
