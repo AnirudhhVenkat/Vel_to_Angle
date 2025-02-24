@@ -12,6 +12,8 @@ import itertools
 from sklearn.model_selection import KFold
 from matplotlib.backends.backend_pdf import PdfPages
 from datetime import datetime
+import os
+import argparse
 
 def check_gpu_availability():
     """Check if GPU is available and can be used by XGBoost."""
@@ -111,143 +113,148 @@ def get_available_data_path():
 
 def prepare_data_for_xgboost(genotype, window_size=100):
     """Prepare data for XGBoost training."""
-    print(f"\nPreparing data for {genotype}...")
+    print("\nPreparing data...")
     
     # Load data
-    df = pd.read_csv("Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv")
+    file_path = get_available_data_path()
+    df = pd.read_csv(file_path)
     print(f"Loaded data with shape: {df.shape}")
     
-    # Filter for specific genotype
-    df = df[df['genotype'] == genotype].copy()
-    print(f"Filtered for {genotype}: {df.shape}")
+    # Filter for specific genotype if requested
+    if genotype != 'ALL':
+        df = df[df['genotype'] == genotype].copy()
+        print(f"Filtered for {genotype} genotype: {df.shape}")
     
     # Create trial IDs based on frame numbers
-    frame_nums = df['fnum'].values
-    trial_ids = []
-    current_trial = 0
-    last_frame = frame_nums[0]
-    
-    for frame in frame_nums:
-        if frame < last_frame:  # New trial starts when frame number resets
-            current_trial += 1
-        trial_ids.append(current_trial)
-        last_frame = frame
-    
-    df['trial_id'] = trial_ids
-    print(f"Initial number of trials: {len(df['trial_id'].unique())}")
-    print(f"Frames per trial: {len(df) / len(df['trial_id'].unique()):.1f}")
-    
-    # Verify trial lengths and keep only complete trials
-    trial_lengths = df.groupby('trial_id').size()
-    print("\nTrial length statistics before filtering:")
-    print(trial_lengths.describe())
-    
-    # Keep only trials with exactly 1400 frames
-    complete_trials = trial_lengths[trial_lengths == 1400].index
-    df = df[df['trial_id'].isin(complete_trials)].copy()
-    print(f"\nKeeping only complete 1400-frame trials:")
-    print(f"Remaining trials: {len(complete_trials)}")
+    trial_size = 1400
+    num_trials = len(df) // trial_size
+    print(f"\nInitial number of trials: {num_trials}")
     print(f"Total frames: {len(df)}")
+    print(f"Remainder frames: {len(df) % trial_size}")
     
-    # Calculate context start based on window size
-    context_start = 400 - window_size
-    print(f"\nWindow Configuration:")
-    print(f"Window size: {window_size}")
-    print(f"Using frames {context_start}-1000 for each trial")
-    print(f"This provides {window_size} frames of context to predict frames 400-1000")
+    # Keep only complete trials
+    complete_trials_data = df.iloc[:num_trials * trial_size].copy()
+    print(f"Keeping only complete trials: {len(complete_trials_data)} frames")
     
-    # Filter frames context_start-1000 from each trial
-    filtered_rows = []
-    for trial in df['trial_id'].unique():
-        trial_data = df[df['trial_id'] == trial]
-        filtered_rows.append(trial_data.iloc[context_start:1000])
+    # Create trial IDs
+    complete_trials_data['trial_id'] = np.repeat(np.arange(num_trials), trial_size)
     
-    df = pd.concat(filtered_rows, axis=0, ignore_index=True)
-    print(f"\nFiltered to frames {context_start}-1000:")
-    print(f"Number of trials: {len(filtered_rows)}")
-    print(f"Total frames: {len(df)} ({len(df) / len(filtered_rows):.1f} frames per trial)")
+    # Calculate split sizes
+    train_size = int(0.7 * num_trials)
+    val_size = int(0.15 * num_trials)
+    test_size = num_trials - train_size - val_size
     
-    # Calculate moving averages for velocities within each trial
+    print(f"\nSplitting data by trials:")
+    print(f"Train: {train_size} trials")
+    print(f"Validation: {val_size} trials")
+    print(f"Test: {test_size} trials")
+    
+    # Create random permutation of trial indices
+    np.random.seed(42)  # For reproducibility
+    trial_indices = np.random.permutation(num_trials)
+    
+    # Split trial indices into train/val/test
+    train_trials = trial_indices[:train_size]
+    val_trials = trial_indices[train_size:train_size + val_size]
+    test_trials = trial_indices[train_size + val_size:]
+    
+    print("\nTrial assignments:")
+    print(f"Training trials: {sorted(train_trials)}")
+    print(f"Validation trials: {sorted(val_trials)}")
+    print(f"Test trials: {sorted(test_trials)}")
+    
+    # Create masks for each split
+    train_mask = np.zeros(len(complete_trials_data), dtype=bool)
+    val_mask = np.zeros(len(complete_trials_data), dtype=bool)
+    test_mask = np.zeros(len(complete_trials_data), dtype=bool)
+    
+    # Assign trials to splits using the random indices
+    for trial in train_trials:
+        start_idx = trial * trial_size
+        end_idx = (trial + 1) * trial_size
+        train_mask[start_idx:end_idx] = True
+    
+    for trial in val_trials:
+        start_idx = trial * trial_size
+        end_idx = (trial + 1) * trial_size
+        val_mask[start_idx:end_idx] = True
+    
+    for trial in test_trials:
+        start_idx = trial * trial_size
+        end_idx = (trial + 1) * trial_size
+        test_mask[start_idx:end_idx] = True
+    
+    # Split data
+    train_data = complete_trials_data[train_mask].copy()
+    val_data = complete_trials_data[val_mask].copy()
+    test_data = complete_trials_data[test_mask].copy()
+    
+    return train_data, val_data, test_data
+
+def prepare_features_and_targets(train_data, val_data, test_data, window_size=100):
+    """Prepare features and targets for XGBoost training."""
+    
+    # Calculate moving averages for velocities within each split
     base_velocities = ['x_vel', 'y_vel', 'z_vel']
-    for window in [5, 10, 20]:
-        for vel in base_velocities:
-            # Calculate moving average for each trial separately
-            ma_values = []
-            for trial in df['trial_id'].unique():
-                trial_data = df[df['trial_id'] == trial][vel]
-                # Calculate moving average and handle edges
-                ma = trial_data.rolling(window=window, center=True, min_periods=1).mean()
-                ma_values.extend(ma.tolist())
-            df[f'{vel}_ma{window}'] = ma_values
+    for data in [train_data, val_data, test_data]:
+        for window in [5, 10, 20]:
+            for vel in base_velocities:
+                data[f'{vel}_ma{window}'] = data[vel].rolling(window=window, center=True, min_periods=1).mean()
     
-    # Define base features for all predictions
+    # Define features and targets
     features = [
         'R-F-CTr_y',    # Starting point for prediction chain
-        'x_vel_ma5',    # Moving average velocities
-        'y_vel_ma5',
-        'z_vel_ma5',
-        'x_vel_ma10',
-        'y_vel_ma10',
-        'z_vel_ma10',
-        'x_vel_ma20',
-        'y_vel_ma20',
-        'z_vel_ma20',
-        'x_vel',
-        'y_vel',
-        'z_vel'
+        'x_vel_ma5', 'y_vel_ma5', 'z_vel_ma5',
+        'x_vel_ma10', 'y_vel_ma10', 'z_vel_ma10',
+        'x_vel_ma20', 'y_vel_ma20', 'z_vel_ma20',
+        'x_vel', 'y_vel', 'z_vel'
     ]
     
-    # All targets in the prediction chain
     targets = [
-        'R1A_flex',     # First predict joint angles
-        'R1A_rot',
-        'R1A_abduct',
-        'R1B_flex',
-        'R1B_rot',
-        'R1C_flex',
-        'R1C_rot',
+        'R1A_flex', 'R1A_rot', 'R1A_abduct',
+        'R1B_flex', 'R1B_rot',
+        'R1C_flex', 'R1C_rot',
         'R1D_flex'
     ]
     
-    # Print all column names for debugging
-    print("\nAll available columns:")
-    print(sorted(df.columns.tolist()))
+    # Filter frames 400-1000 for prediction
+    context_start = 400 - window_size
+    train_data = train_data.iloc[context_start:1000].copy()
+    val_data = val_data.iloc[context_start:1000].copy()
+    test_data = test_data.iloc[context_start:1000].copy()
     
-    # Print target columns that exist in the data
-    print("\nTarget columns found in data:")
-    for target in targets:
-        if target in df.columns:
-            print(f"  ✓ {target}")
-            print(f"    NaN count: {df[target].isna().sum()}")
-        else:
-            print(f"  ✗ {target} (not found)")
-            
-    # Print feature columns that exist in the data
-    print("\nFeature columns found in data:")
+    print("\nFeature and Target Information:")
+    print(f"Features ({len(features)}):")
     for feature in features:
-        if feature in df.columns:
+        if feature in train_data.columns:
             print(f"  ✓ {feature}")
-            print(f"    NaN count: {df[feature].isna().sum()}")
+            print(f"    NaN count: {train_data[feature].isna().sum()}")
         else:
             print(f"  ✗ {feature} (not found)")
     
-    # Split into train, validation, and test sets by trials
-    unique_trials = df['trial_id'].unique()
-    train_trials, temp_trials = train_test_split(unique_trials, test_size=0.3, random_state=42)
-    val_trials, test_trials = train_test_split(temp_trials, test_size=0.5, random_state=42)
+    print(f"\nTargets ({len(targets)}):")
+    for target in targets:
+        if target in train_data.columns:
+            print(f"  ✓ {target}")
+            print(f"    NaN count: {train_data[target].isna().sum()}")
+        else:
+            print(f"  ✗ {target} (not found)")
     
-    # Create masks for each split
-    train_mask = df['trial_id'].isin(train_trials)
-    val_mask = df['trial_id'].isin(val_trials)
-    test_mask = df['trial_id'].isin(test_trials)
+    # Prepare feature matrices and target vectors
+    X_train = train_data[features]
+    X_val = val_data[features]
+    X_test = test_data[features]
     
-    print("\nDataset Split Information:")
-    print(f"Training: {len(train_trials)} trials ({train_mask.sum()} frames)")
-    print(f"Validation: {len(val_trials)} trials ({val_mask.sum()} frames)")
-    print(f"Test: {len(test_trials)} trials ({test_mask.sum()} frames)")
-    print(f"Frames per trial: {1000 - context_start} (frames {context_start}-1000)")
+    y_train = train_data[targets]
+    y_val = val_data[targets]
+    y_test = test_data[targets]
     
-    return df, features, targets, (train_mask, val_mask, test_mask)
+    print("\nDataset Shapes:")
+    print(f"X_train: {X_train.shape}")
+    print(f"X_val: {X_val.shape}")
+    print(f"X_test: {X_test.shape}")
+    
+    return (X_train, X_val, X_test), (y_train, y_val, y_test), features, targets
 
 def find_optimal_params(X_train, X_val, y_train, y_val, target_name, parent_dir, genotype, use_gpu=False):
     """Find optimal hyperparameters using validation set."""
@@ -1130,4 +1137,10 @@ def main():
     print("\nXGBoost analysis completed!")
 
 if __name__ == "__main__":
-    main() 
+    parser = argparse.ArgumentParser(description='Train XGBoost models for joint angle prediction')
+    parser.add_argument('--genotype', type=str, default='BPN', help='Genotype to train on')
+    parser.add_argument('--window_size', type=int, default=100, help='Window size for context')
+    parser.add_argument('--use_gpu', action='store_true', help='Use GPU for training')
+    
+    args = parser.parse_args()
+    main(args.genotype, args.window_size, args.use_gpu) 

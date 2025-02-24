@@ -257,78 +257,95 @@ class ZScoreScaler:
             return X * self.stds + self.means
 
 def prepare_data(data_path, input_features, output_features, sequence_length, genotype='ALL'):
-    """Prepare sequences of data for TCN"""
+    """Load and prepare data for training."""
     print("\nPreparing data...")
     
-    # Load and preprocess data
+    # Load data
     df = pd.read_csv(data_path)
     print(f"Loaded data with shape: {df.shape}")
     
-    # Filter for specified genotype if not ALL
+    # Filter for specific genotype if requested
     if genotype != 'ALL':
         df = df[df['genotype'] == genotype].copy()
-        print(f"Filtered for {genotype}: {df.shape}")
+        print(f"Filtered for {genotype} genotype: {df.shape}")
     
-    # Get trial indices (assuming 1400 frames per trial)
+    # Create trial IDs based on frame numbers
     trial_size = 1400
     num_trials = len(df) // trial_size
-    print(f"\nTotal number of trials: {num_trials}")
+    print(f"\nInitial number of trials: {num_trials}")
+    print(f"Total frames: {len(df)}")
+    print(f"Remainder frames: {len(df) % trial_size}")
     
-    # Calculate moving averages for velocities within each trial
-    base_velocities = ['x_vel', 'y_vel', 'z_vel']
-    for window in [5, 10, 20]:
-        for vel in base_velocities:
-            # Calculate moving average for each trial separately
-            ma_values = []
-            for trial in range(num_trials):
-                start_idx = trial * trial_size
-                end_idx = (trial + 1) * trial_size
-                trial_data = df[vel].iloc[start_idx:end_idx]
-                # Calculate moving average and handle edges
-                ma = trial_data.rolling(window=window, center=True, min_periods=1).mean()
-                ma_values.extend(ma.tolist())
-            df[f'{vel}_ma{window}'] = ma_values
+    # Keep only complete trials
+    complete_trials_data = df.iloc[:num_trials * trial_size].copy()
+    print(f"Keeping only complete trials: {len(complete_trials_data)} frames")
+    
+    # Create trial IDs
+    complete_trials_data['trial_id'] = np.repeat(np.arange(num_trials), trial_size)
+    
+    # Calculate split sizes
+    train_size = int(0.7 * num_trials)
+    val_size = int(0.15 * num_trials)
+    test_size = num_trials - train_size - val_size
+    
+    print(f"\nSplitting data by trials:")
+    print(f"Train: {train_size} trials")
+    print(f"Validation: {val_size} trials")
+    print(f"Test: {test_size} trials")
+    
+    # Create random permutation of trial indices
+    np.random.seed(42)  # For reproducibility
+    trial_indices = np.random.permutation(num_trials)
+    
+    # Split trial indices into train/val/test
+    train_trials = trial_indices[:train_size]
+    val_trials = trial_indices[train_size:train_size + val_size]
+    test_trials = trial_indices[train_size + val_size:]
+    
+    print("\nTrial assignments:")
+    print(f"Training trials: {sorted(train_trials)}")
+    print(f"Validation trials: {sorted(val_trials)}")
+    print(f"Test trials: {sorted(test_trials)}")
+    
+    # Create masks for each split
+    train_mask = np.zeros(len(complete_trials_data), dtype=bool)
+    val_mask = np.zeros(len(complete_trials_data), dtype=bool)
+    test_mask = np.zeros(len(complete_trials_data), dtype=bool)
+    
+    # Assign trials to splits using the random indices
+    for trial in train_trials:
+        start_idx = trial * trial_size
+        end_idx = (trial + 1) * trial_size
+        train_mask[start_idx:end_idx] = True
+    
+    for trial in val_trials:
+        start_idx = trial * trial_size
+        end_idx = (trial + 1) * trial_size
+        val_mask[start_idx:end_idx] = True
+    
+    for trial in test_trials:
+        start_idx = trial * trial_size
+        end_idx = (trial + 1) * trial_size
+        test_mask[start_idx:end_idx] = True
+    
+    # Split data
+    train_data = complete_trials_data[train_mask].copy()
+    val_data = complete_trials_data[val_mask].copy()
+    test_data = complete_trials_data[test_mask].copy()
     
     # Extract features and targets
-    X = df[input_features].values
-    y = df[output_features].values
+    X = train_data[input_features].values
+    y = train_data[output_features].values
     
     # Reshape data into trials
     X_trials = X.reshape(num_trials, trial_size, -1)
     y_trials = y.reshape(num_trials, trial_size, -1)
     
-    # Create trial indices and shuffle
-    trial_indices = np.arange(num_trials)
-    np.random.seed(42)  # For reproducible splits
-    np.random.shuffle(trial_indices)
-    
-    # Split into train, validation, and test sets
-    train_size = int(0.7 * num_trials)
-    val_size = int(0.15 * num_trials)
-    test_size = num_trials - train_size - val_size
-    
-    train_trials = trial_indices[:train_size]
-    val_trials = trial_indices[train_size:train_size + val_size]
-    test_trials = trial_indices[train_size + val_size:]
-    
-    print("\nSplit Information:")
-    print(f"Training: {len(train_trials)} trials")
-    print(f"Validation: {len(val_trials)} trials")
-    print(f"Test: {len(test_trials)} trials")
-    
-    # Get data for each split
-    X_train = X_trials[train_trials].reshape(-1, X_trials.shape[-1])
-    y_train = y_trials[train_trials].reshape(-1, y_trials.shape[-1])
-    X_val = X_trials[val_trials].reshape(-1, X_trials.shape[-1])
-    y_val = y_trials[val_trials].reshape(-1, y_trials.shape[-1])
-    X_test = X_trials[test_trials].reshape(-1, X_trials.shape[-1])
-    y_test = y_trials[test_trials].reshape(-1, y_trials.shape[-1])
-    
     # Scale input features
     X_scaler = StandardScaler()
-    X_train_scaled = X_scaler.fit_transform(X_train)
-    X_val_scaled = X_scaler.transform(X_val)
-    X_test_scaled = X_scaler.transform(X_test)
+    X_train_scaled = X_scaler.fit_transform(X)
+    X_val_scaled = X_scaler.transform(val_data[input_features].values)
+    X_test_scaled = X_scaler.transform(test_data[input_features].values)
     
     # Calculate z-score parameters for each target independently
     y_means = {}
@@ -357,8 +374,8 @@ def prepare_data(data_path, input_features, output_features, sequence_length, ge
     
     # Scale targets
     y_train_scaled = y_scaler.transform(y_train)
-    y_val_scaled = y_scaler.transform(y_val)
-    y_test_scaled = y_scaler.transform(y_test)
+    y_val_scaled = y_scaler.transform(val_data[output_features].values)
+    y_test_scaled = y_scaler.transform(test_data[output_features].values)
     
     print("\nFinal Dataset Sizes:")
     print(f"Training: {len(X_train_scaled)} frames")

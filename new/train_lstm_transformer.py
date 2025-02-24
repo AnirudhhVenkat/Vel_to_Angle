@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 import json
 from losses import create_derivative_loss, create_weighted_mae_loss, create_combined_loss
+from datetime import datetime
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -149,35 +150,21 @@ def prepare_data(data_path, input_features, output_features, sequence_length, ge
         df = df[df['genotype'] == genotype].copy()
         print(f"Filtered for {genotype}: {df.shape}")
     
-    # Create trial IDs based on frame numbers (guaranteed 1400 frames per trial)
+    # Create trial IDs based on frame numbers
     trial_size = 1400
     num_trials = len(df) // trial_size
-    print(f"\nNumber of trials detected: {num_trials}")
-    print(f"Frames per trial: {trial_size}")
+    print(f"\nInitial number of trials: {num_trials}")
+    print(f"Total frames: {len(df)}")
+    print(f"Remainder frames: {len(df) % trial_size}")
+    
+    # Keep only complete trials
+    complete_trials_data = df.iloc[:num_trials * trial_size].copy()
+    print(f"Keeping only complete trials: {len(complete_trials_data)} frames")
     
     # Create trial IDs
-    df['trial_id'] = np.repeat(np.arange(num_trials), trial_size)
+    complete_trials_data['trial_id'] = np.repeat(np.arange(num_trials), trial_size)
     
-    # Calculate moving averages for velocities within each trial
-    base_velocities = ['x_vel', 'y_vel', 'z_vel']
-    for window in [5, 10, 20]:
-        for vel in base_velocities:
-            # Calculate moving average for each trial separately
-            ma_values = []
-            for trial in df['trial_id'].unique():
-                trial_data = df[df['trial_id'] == trial][vel]
-                # Calculate moving average and handle edges
-                ma = trial_data.rolling(window=window, center=True, min_periods=1).mean()
-                ma_values.extend(ma.tolist())
-            df[f'{vel}_ma{window}'] = ma_values
-    
-    print("Moving averages calculated.")
-    
-    # Extract features and targets
-    X = df[input_features].values
-    y = df[output_features].values
-    
-    # Split into train, validation, and test sets by trials
+    # Calculate split sizes
     train_size = int(0.7 * num_trials)
     val_size = int(0.15 * num_trials)
     test_size = num_trials - train_size - val_size
@@ -187,22 +174,61 @@ def prepare_data(data_path, input_features, output_features, sequence_length, ge
     print(f"Validation: {val_size} trials")
     print(f"Test: {test_size} trials")
     
-    # Create masks for each split
-    train_mask = np.zeros(len(df), dtype=bool)
-    val_mask = np.zeros(len(df), dtype=bool)
-    test_mask = np.zeros(len(df), dtype=bool)
+    # Create random permutation of trial indices
+    np.random.seed(42)  # For reproducibility
+    trial_indices = np.random.permutation(num_trials)
     
-    # Assign trials to splits
-    for trial in range(num_trials):
+    # Split trial indices into train/val/test
+    train_trials = trial_indices[:train_size]
+    val_trials = trial_indices[train_size:train_size + val_size]
+    test_trials = trial_indices[train_size + val_size:]
+    
+    print("\nTrial assignments:")
+    print(f"Training trials: {sorted(train_trials)}")
+    print(f"Validation trials: {sorted(val_trials)}")
+    print(f"Test trials: {sorted(test_trials)}")
+    
+    # Create masks for each split
+    train_mask = np.zeros(len(complete_trials_data), dtype=bool)
+    val_mask = np.zeros(len(complete_trials_data), dtype=bool)
+    test_mask = np.zeros(len(complete_trials_data), dtype=bool)
+    
+    # Assign trials to splits using the random indices
+    for trial in train_trials:
         start_idx = trial * trial_size
         end_idx = (trial + 1) * trial_size
-        
-        if trial < train_size:
-            train_mask[start_idx:end_idx] = True
-        elif trial < train_size + val_size:
-            val_mask[start_idx:end_idx] = True
-        else:
-            test_mask[start_idx:end_idx] = True
+        train_mask[start_idx:end_idx] = True
+    
+    for trial in val_trials:
+        start_idx = trial * trial_size
+        end_idx = (trial + 1) * trial_size
+        val_mask[start_idx:end_idx] = True
+    
+    for trial in test_trials:
+        start_idx = trial * trial_size
+        end_idx = (trial + 1) * trial_size
+        test_mask[start_idx:end_idx] = True
+    
+    # Calculate moving averages for velocities within each trial
+    base_velocities = ['x_vel', 'y_vel', 'z_vel']
+    for window in [5, 10, 20]:
+        for vel in base_velocities:
+            # Calculate moving average for each trial separately
+            ma_values = []
+            for trial in range(num_trials):
+                start_idx = trial * trial_size
+                end_idx = (trial + 1) * trial_size
+                trial_data = complete_trials_data[vel].iloc[start_idx:end_idx]
+                # Calculate moving average and handle edges
+                ma = trial_data.rolling(window=window, center=True, min_periods=1).mean()
+                ma_values.extend(ma.tolist())
+            complete_trials_data[f'{vel}_ma{window}'] = ma_values
+    
+    print("Moving averages calculated.")
+    
+    # Extract features and targets
+    X = complete_trials_data[input_features].values
+    y = complete_trials_data[output_features].values
     
     # Scale the data
     X_scaler = StandardScaler()
@@ -228,7 +254,7 @@ def prepare_data(data_path, input_features, output_features, sequence_length, ge
     val_loader = DataLoader(val_dataset, batch_size=32)
     test_loader = DataLoader(test_dataset, batch_size=32)
     
-    return train_loader, val_loader, test_loader, X_scaler, y_scaler
+    return (train_loader, val_loader, test_loader), (X_scaler, y_scaler), (input_features, output_features), (train_trials, val_trials, test_trials)
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, 
                 num_epochs, device, patience=20):
@@ -293,7 +319,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer,
     return best_model, best_val_loss
 
 def evaluate_model(model, test_loader, criterion, device, output_features, 
-                  output_scaler, save_dir):
+                  output_scaler, save_dir, test_trials):
     """Evaluate the trained model"""
     model.eval()
     test_loss = 0.0
@@ -348,6 +374,16 @@ def evaluate_model(model, test_loader, criterion, device, output_features,
         plt.savefig(save_dir / f'{feature}_predictions.png')
         plt.close()
     
+    # Save predictions and metadata
+    predictions_dir = save_dir / 'predictions'
+    predictions_dir.mkdir(exist_ok=True)
+    
+    np.savez(predictions_dir / 'predictions.npz',
+             predictions=predictions,
+             targets=targets,
+             output_features=output_features,
+             trial_indices=test_trials)
+    
     # Save metrics
     with open(save_dir / 'metrics.json', 'w') as f:
         json.dump(metrics, f, indent=4)
@@ -358,7 +394,7 @@ def main():
     """Main function to train and evaluate the hybrid model"""
     # Configuration
     config = {
-        'data_path': "path/to/your/data.csv",
+        'data_path': "Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv",
         'input_features': [
             'x_vel', 'y_vel', 'z_vel',
             'x_vel_ma5', 'y_vel_ma5', 'z_vel_ma5',
@@ -386,15 +422,20 @@ def main():
     }
     
     # Create directories
-    results_dir = Path('hybrid_results')
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    results_dir = Path('hybrid_results') / f'hybrid_{timestamp}'
     models_dir = results_dir / 'models'
     plots_dir = results_dir / 'plots'
     
     for dir_path in [results_dir, models_dir, plots_dir]:
         dir_path.mkdir(exist_ok=True, parents=True)
     
+    # Save configuration
+    with open(results_dir / 'config.json', 'w') as f:
+        json.dump(config, f, indent=4)
+    
     # Prepare data
-    train_loader, val_loader, test_loader, X_scaler, y_scaler = prepare_data(
+    (train_loader, val_loader, test_loader), (X_scaler, y_scaler), (input_features, output_features), (train_trials, val_trials, test_trials) = prepare_data(
         config['data_path'],
         config['input_features'],
         config['output_features'],
@@ -431,16 +472,21 @@ def main():
     # Evaluate model
     metrics = evaluate_model(
         model, test_loader, criterion, device,
-        config['output_features'], y_scaler, plots_dir
+        config['output_features'], y_scaler, plots_dir,
+        test_trials
     )
     
-    # Save model and config
+    # Save model and metadata
     torch.save({
         'model_state_dict': best_model_state,
         'config': config,
         'X_scaler': X_scaler,
         'y_scaler': y_scaler,
-        'metrics': metrics
+        'metrics': metrics,
+        'train_trials': train_trials.tolist(),
+        'val_trials': val_trials.tolist(),
+        'test_trials': test_trials.tolist(),
+        'best_val_loss': best_val_loss
     }, models_dir / 'best_model.pt')
     
     print("\nTraining completed successfully!")
