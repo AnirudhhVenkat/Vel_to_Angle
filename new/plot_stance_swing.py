@@ -78,16 +78,7 @@ def load_predictions(npz_path):
     # Get number of trials
     num_trials = predictions.shape[0]
     
-    # Use the same random trial assignment as in training
-    np.random.seed(42)  # Same seed as in training
-    trial_indices = np.random.permutation(num_trials)
-    
-    # Sort predictions and targets by trial indices
-    predictions = predictions[trial_indices]
-    targets = targets[trial_indices]
-    
-    print(f"Using random trial assignment with {num_trials} trials")
-    print(f"Random trial order: {trial_indices}")  # Show actual permutation
+    print(f"Loaded {num_trials} trials")
     
     return predictions, targets, output_features, frames
 
@@ -250,6 +241,42 @@ def plot_trial_phases(predictions, targets, frames, trial_idx, leg_name, pdf):
     pdf.savefig(fig)
     plt.close()
 
+def get_trial_genotypes(data_path, trial_indices=None):
+    """Load the original data and get genotype for each trial."""
+    # Load data
+    df = pd.read_csv(data_path)
+    print(f"Loaded genotype data with shape: {df.shape}")
+    print(f"Available genotypes: {df['genotype'].unique()}")
+    
+    # Get trial indices and genotypes
+    trial_size = 1400
+    num_trials = len(df) // trial_size
+    print(f"Number of trials in genotype data: {num_trials}")
+    
+    # Get genotype for each trial (using first frame of trial)
+    trial_genotypes = {}
+    for trial in range(num_trials):
+        start_idx = trial * trial_size
+        genotype = df.iloc[start_idx]['genotype']
+        trial_genotypes[trial] = genotype
+    
+    # If trial_indices is provided, reorder genotypes according to the permutation
+    if trial_indices is not None:
+        reordered_genotypes = {}
+        for new_idx, old_idx in enumerate(trial_indices):
+            reordered_genotypes[new_idx] = trial_genotypes[old_idx]
+        trial_genotypes = reordered_genotypes
+    
+    # Print genotype distribution
+    genotype_counts = {}
+    for genotype in trial_genotypes.values():
+        genotype_counts[genotype] = genotype_counts.get(genotype, 0) + 1
+    print("\nGenotype distribution:")
+    for genotype, count in genotype_counts.items():
+        print(f"{genotype}: {count} trials")
+    
+    return trial_genotypes
+
 def process_leg_predictions(leg_name, results_dir='lstm_results'):
     """Process predictions for B_flex angle of a specific leg."""
     print(f"\nProcessing {leg_name}B_flex predictions...")
@@ -258,13 +285,13 @@ def process_leg_predictions(leg_name, results_dir='lstm_results'):
     leg_dir = Path(results_dir) / leg_name
     if not leg_dir.exists():
         print(f"No results directory found for {leg_name}")
-        return None, None, None, None
+        return None
     
     # Look for predictions file
     predictions_path = leg_dir / 'plots' / 'predictions' / 'trial_predictions.npz'
     if not predictions_path.exists():
         print(f"No predictions found for {leg_name}")
-        return None, None, None, None
+        return None
     
     print(f"Found predictions at: {predictions_path}")
     
@@ -273,9 +300,50 @@ def process_leg_predictions(leg_name, results_dir='lstm_results'):
     output_dir.mkdir(exist_ok=True, parents=True)
     
     try:
+        # Load original data first to get trial indices
+        data_path = "Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv"
+        df = pd.read_csv(data_path)
+        print(f"Loaded original data with shape: {df.shape}")
+        
+        # Get trial indices using same logic as train_lstm.py
+        trial_size = 1400
+        num_trials = len(df) // trial_size
+        print(f"Total number of trials in original data: {num_trials}")
+        
+        # Create random permutation of trial indices (same as train_lstm.py)
+        np.random.seed(42)  # Same seed as train_lstm.py
+        trial_indices = np.random.permutation(num_trials)
+        
+        # Calculate split sizes (same as train_lstm.py)
+        train_size = int(0.7 * num_trials)
+        val_size = int(0.15 * num_trials)
+        
+        # Split trial indices
+        train_trials = trial_indices[:train_size]
+        val_trials = trial_indices[train_size:train_size + val_size]
+        test_trials = trial_indices[train_size + val_size:]
+        
+        print("\nTrial split information:")
+        print(f"Training trials: {len(train_trials)}")
+        print(f"Validation trials: {len(val_trials)}")
+        print(f"Test trials: {len(test_trials)}")
+        
+        # Get genotype for each trial using full 1400 frames
+        trial_genotypes = {}
+        for trial in range(num_trials):
+            start_idx = trial * trial_size
+            end_idx = (trial + 1) * trial_size
+            trial_data = df.iloc[start_idx:end_idx]
+            genotype_counts = trial_data['genotype'].value_counts()
+            majority_genotype = genotype_counts.index[0]
+            
+            if len(genotype_counts) > 1:
+                print(f"Warning: Trial {trial} has multiple genotypes: {dict(genotype_counts)}")
+            
+            trial_genotypes[trial] = majority_genotype
+        
         # Load predictions
         predictions, targets, output_features, frames = load_predictions(predictions_path)
-        num_trials = predictions.shape[0]
         
         # Find B_flex index
         b_flex_idx = None
@@ -286,121 +354,284 @@ def process_leg_predictions(leg_name, results_dir='lstm_results'):
         
         if b_flex_idx is None:
             print(f"No B_flex angle found for {leg_name}")
-            return None, None, None, None
+            return None
         
-        print(f"Found {num_trials} trials")
+        # Initialize dictionaries to store phase durations by genotype
+        genotype_data = {
+            'P9RT': {'actual_stance': [], 'actual_swing': [], 'pred_stance': [], 'pred_swing': [], 'trials': [], 'pred_indices': []},
+            'P9LT': {'actual_stance': [], 'actual_swing': [], 'pred_stance': [], 'pred_swing': [], 'trials': [], 'pred_indices': []},
+            'BPN': {'actual_stance': [], 'actual_swing': [], 'pred_stance': [], 'pred_swing': [], 'trials': [], 'pred_indices': []},
+            'ES': {'actual_stance': [], 'actual_swing': [], 'pred_stance': [], 'pred_swing': [], 'trials': [], 'pred_indices': []}
+        }
         
-        # Initialize lists to store phase durations
-        actual_stance_durations = []
-        actual_swing_durations = []
-        pred_stance_durations = []
-        pred_swing_durations = []
+        # Process test trials only (since predictions are for test set)
+        print("\nProcessing test trials...")
+        for i, trial_idx in enumerate(test_trials):
+            # Get trial genotype
+            genotype = trial_genotypes[trial_idx]
+            if genotype not in genotype_data:
+                print(f"Unknown genotype {genotype} for trial {trial_idx}, skipping...")
+                continue
+            
+            # Get B_flex predictions and targets for this trial
+            pred = predictions[i, :, b_flex_idx]  # Use i since predictions are already in test order
+            target = targets[i, :, b_flex_idx]
+            
+            # Skip if either predictions or targets contain NaN values
+            if np.isnan(pred).any() or np.isnan(target).any():
+                print(f"Skipping trial {trial_idx} due to NaN values")
+                continue
+            
+            # Calculate phase durations for actual data
+            actual_phases, _ = detect_phases(target)
+            trial_actual_stance, trial_actual_swing = calculate_phase_durations(actual_phases)
+            
+            # Calculate phase durations for predicted data
+            pred_phases, _ = detect_phases(pred)
+            trial_pred_stance, trial_pred_swing = calculate_phase_durations(pred_phases)
+            
+            # Store results by genotype
+            genotype_data[genotype]['actual_stance'].extend(trial_actual_stance)
+            genotype_data[genotype]['actual_swing'].extend(trial_actual_swing)
+            genotype_data[genotype]['pred_stance'].extend(trial_pred_stance)
+            genotype_data[genotype]['pred_swing'].extend(trial_pred_swing)
+            genotype_data[genotype]['trials'].append(trial_idx)
+            genotype_data[genotype]['pred_indices'].append(i)  # Store the prediction index
         
-        # Create PDF for all trials
-        pdf_path = output_dir / f'{leg_name}_B_flex_all_trials.pdf'
-        with PdfPages(pdf_path) as pdf:
-            # First page: Summary statistics
-            plt.figure(figsize=(12, 8))
-            plt.axis('off')
-            plt.text(0.1, 0.95, f'{leg_name}B_flex Phase Analysis', fontsize=16, fontweight='bold')
-            plt.text(0.1, 0.85, f'Number of trials: {num_trials}', fontsize=12)
-            plt.text(0.1, 0.75, 'Color coding:', fontsize=12)
-            plt.text(0.1, 0.7, '  Green: Stance phase (leading to peak)', fontsize=12)
-            plt.text(0.1, 0.65, '  Blue: Swing phase (after peak)', fontsize=12)
-            plt.text(0.1, 0.6, '  Black triangles: Detected peaks', fontsize=12)
-            plt.text(0.1, 0.55, '  Blue line: Actual angle', fontsize=12)
-            plt.text(0.1, 0.5, '  Red dashed line: Predicted angle', fontsize=12)
-            pdf.savefig()
-            plt.close()
+        # Print final genotype distribution for test set
+        print("\nGenotype distribution in test set:")
+        for genotype in genotype_data:
+            num_trials = len(genotype_data[genotype]['trials'])
+            print(f"{genotype}: {num_trials} trials")
+        
+        # Filter trials based on velocity thresholds
+        filtered_trials = []
+        for trial in range(num_trials):
+            # Different frame ranges for ES vs other genotypes
+            if genotype == 'ES':
+                start_idx = trial * trial_size  # Start from frame 0 for ES
+                end_idx = trial * trial_size + 650  # End at frame 650 for ES
+            else:
+                start_idx = trial * trial_size + 350  # Start from frame 350 for others
+                end_idx = trial * trial_size + 1000   # End at frame 1000 for others
             
-            # Process each trial
-            for trial_idx in range(num_trials):
-                print(f"Processing trial {trial_idx + 1}/{num_trials}")
-                
-                # Get B_flex predictions and targets
-                pred = predictions[trial_idx, :, b_flex_idx]
-                target = targets[trial_idx, :, b_flex_idx]
-                
-                # Skip if either predictions or targets contain NaN values
-                if np.isnan(pred).any() or np.isnan(target).any():
-                    print(f"Skipping trial {trial_idx + 1} due to NaN values")
-                    continue
-                
-                # Create trial plot
-                plot_trial_phases(pred, target, frames, trial_idx, leg_name, pdf)
-                
-                # Calculate phase durations for actual data
-                actual_phases, _ = detect_phases(target)
-                trial_actual_stance, trial_actual_swing = calculate_phase_durations(actual_phases)
-                actual_stance_durations.extend(trial_actual_stance)
-                actual_swing_durations.extend(trial_actual_swing)
-                
-                # Calculate phase durations for predicted data
-                pred_phases, _ = detect_phases(pred)
-                trial_pred_stance, trial_pred_swing = calculate_phase_durations(pred_phases)
-                pred_stance_durations.extend(trial_pred_stance)
-                pred_swing_durations.extend(trial_pred_swing)
+            trial_data = df.iloc[start_idx:end_idx]
             
-            # Add final page with phase duration statistics
-            plt.figure(figsize=(12, 8))
-            plt.axis('off')
-            plt.text(0.1, 0.95, f'{leg_name}B_flex Phase Duration Statistics', fontsize=16, fontweight='bold')
+            # Calculate average velocity for the trial
+            if genotype in ['P9RT', 'P9LT']:
+                avg_vel = trial_data['z_vel'].mean()
+                threshold = 3
+                vel_type = 'z'
+            else:  # BPN or ES
+                avg_vel = trial_data['x_vel'].mean()
+                threshold = 5
+                vel_type = 'x'
             
-            # Calculate statistics for both actual and predicted
-            stats = {
-                'actual_stance': {
-                    'mean': float(np.mean(actual_stance_durations)),
-                    'std': float(np.std(actual_stance_durations)),
-                    'median': float(np.median(actual_stance_durations)),
-                    'min': float(np.min(actual_stance_durations)),
-                    'max': float(np.max(actual_stance_durations))
-                },
-                'actual_swing': {
-                    'mean': float(np.mean(actual_swing_durations)),
-                    'std': float(np.std(actual_swing_durations)),
-                    'median': float(np.median(actual_swing_durations)),
-                    'min': float(np.min(actual_swing_durations)),
-                    'max': float(np.max(actual_swing_durations))
-                },
-                'predicted_stance': {
-                    'mean': float(np.mean(pred_stance_durations)),
-                    'std': float(np.std(pred_stance_durations)),
-                    'median': float(np.median(pred_stance_durations)),
-                    'min': float(np.min(pred_stance_durations)),
-                    'max': float(np.max(pred_stance_durations))
-                },
-                'predicted_swing': {
-                    'mean': float(np.mean(pred_swing_durations)),
-                    'std': float(np.std(pred_swing_durations)),
-                    'median': float(np.median(pred_swing_durations)),
-                    'min': float(np.min(pred_swing_durations)),
-                    'max': float(np.max(pred_swing_durations))
+            # Keep trial if it meets the threshold
+            if abs(avg_vel) >= threshold:
+                filtered_trials.append(trial)
+        
+        print(f"\nVelocity filtering criteria for {genotype}:")
+        print(f"Using {vel_type}_vel with threshold {threshold}")
+        print(f"Trials remaining after filtering: {len(filtered_trials)} out of {num_trials}")
+        
+        # Create PDF for each genotype
+        for genotype, data in genotype_data.items():
+            if not data['trials']:  # Skip if no trials for this genotype
+                continue
+                
+            print(f"\nProcessing {genotype} trials for {leg_name}...")
+            genotype_dir = output_dir / genotype
+            genotype_dir.mkdir(exist_ok=True)
+            
+            # Create PDF for this genotype's trials
+            pdf_path = genotype_dir / f'{leg_name}_B_flex_trials.pdf'
+            with PdfPages(pdf_path) as pdf:
+                # First page: Summary statistics
+                plt.figure(figsize=(12, 8))
+                plt.axis('off')
+                plt.text(0.1, 0.95, f'{leg_name}B_flex Phase Analysis - {genotype}', fontsize=16, fontweight='bold')
+                plt.text(0.1, 0.85, f'Number of trials: {len(data["trials"])}', fontsize=12)
+                plt.text(0.1, 0.75, 'Color coding:', fontsize=12)
+                plt.text(0.1, 0.7, '  Green: Stance phase (leading to peak)', fontsize=12)
+                plt.text(0.1, 0.65, '  Blue: Swing phase (after peak)', fontsize=12)
+                plt.text(0.1, 0.6, '  Black triangles: Detected peaks', fontsize=12)
+                plt.text(0.1, 0.55, '  Blue line: Actual angle', fontsize=12)
+                plt.text(0.1, 0.5, '  Red dashed line: Predicted angle', fontsize=12)
+                pdf.savefig()
+                plt.close()
+                
+                # Plot each trial for this genotype
+                for trial_idx, pred_idx in zip(data['trials'], data['pred_indices']):
+                    # Get B_flex predictions and targets using the correct prediction index
+                    pred = predictions[pred_idx, :, b_flex_idx]
+                    target = targets[pred_idx, :, b_flex_idx]
+                    
+                    # Create trial plot
+                    plot_trial_phases(pred, target, frames, trial_idx, leg_name, pdf)
+                
+                # Add final page with phase duration statistics
+                plt.figure(figsize=(12, 8))
+                plt.axis('off')
+                plt.text(0.1, 0.95, f'{leg_name}B_flex Phase Duration Statistics - {genotype}', fontsize=16, fontweight='bold')
+                
+                # Calculate statistics for this genotype
+                stats = {
+                    'actual_stance': {
+                        'mean': float(np.mean(data['actual_stance'])),
+                        'std': float(np.std(data['actual_stance'])),
+                        'median': float(np.median(data['actual_stance'])),
+                        'min': float(np.min(data['actual_stance'])),
+                        'max': float(np.max(data['actual_stance']))
+                    },
+                    'actual_swing': {
+                        'mean': float(np.mean(data['actual_swing'])),
+                        'std': float(np.std(data['actual_swing'])),
+                        'median': float(np.median(data['actual_swing'])),
+                        'min': float(np.min(data['actual_swing'])),
+                        'max': float(np.max(data['actual_swing']))
+                    },
+                    'predicted_stance': {
+                        'mean': float(np.mean(data['pred_stance'])),
+                        'std': float(np.std(data['pred_stance'])),
+                        'median': float(np.median(data['pred_stance'])),
+                        'min': float(np.min(data['pred_stance'])),
+                        'max': float(np.max(data['pred_stance']))
+                    },
+                    'predicted_swing': {
+                        'mean': float(np.mean(data['pred_swing'])),
+                        'std': float(np.std(data['pred_swing'])),
+                        'median': float(np.median(data['pred_swing'])),
+                        'min': float(np.min(data['pred_swing'])),
+                        'max': float(np.max(data['pred_swing']))
+                    }
                 }
-            }
-            
-            # Add statistics to plot
-            y_pos = 0.85
-            for phase in ['actual_stance', 'predicted_stance', 'actual_swing', 'predicted_swing']:
-                plt.text(0.1, y_pos, f"\n{phase.replace('_', ' ').title()}:", fontsize=14, fontweight='bold')
-                y_pos -= 0.08
-                for stat, value in stats[phase].items():
-                    plt.text(0.1, y_pos, f"  {stat}: {value:.2f} frames")
+                
+                # Add statistics to plot
+                y_pos = 0.85
+                for phase in ['actual_stance', 'predicted_stance', 'actual_swing', 'predicted_swing']:
+                    plt.text(0.1, y_pos, f"\n{phase.replace('_', ' ').title()}:", fontsize=14, fontweight='bold')
+                    y_pos -= 0.08
+                    for stat, value in stats[phase].items():
+                        plt.text(0.1, y_pos, f"  {stat}: {value:.2f} frames")
+                        y_pos -= 0.05
                     y_pos -= 0.05
-                y_pos -= 0.05
+                
+                pdf.savefig()
+                plt.close()
             
-            pdf.savefig()
-            plt.close()
+            # Save statistics to JSON
+            with open(genotype_dir / 'phase_duration_stats.json', 'w') as f:
+                json.dump({f'{leg_name}B_flex': stats}, f, indent=4)
+            
+            print(f"PDF and statistics saved to {genotype_dir}")
         
-        # Save statistics to JSON
-        with open(output_dir / 'phase_duration_stats.json', 'w') as f:
-            json.dump({f'{leg_name}B_flex': stats}, f, indent=4)
+        # Create combined box plots comparing genotypes
+        plt.figure(figsize=(15, 10))
+        plt.suptitle(f'{leg_name} Phase Durations by Genotype', fontsize=16)
         
-        print(f"PDF and statistics saved to {output_dir}")
-        return actual_stance_durations, actual_swing_durations, pred_stance_durations, pred_swing_durations
+        # Stance phase comparison
+        plt.subplot(2, 1, 1)
+        data = []
+        labels = []
+        for genotype in ['P9RT', 'P9LT', 'BPN']:
+            if genotype_data[genotype]['actual_stance']:
+                data.append(genotype_data[genotype]['actual_stance'])
+                data.append(genotype_data[genotype]['pred_stance'])
+                labels.extend([f'{genotype}\nActual', f'{genotype}\nPred'])
+        
+        plt.boxplot(data, labels=labels)
+        plt.title('Stance Phase Duration')
+        plt.ylabel('Duration (frames)')
+        plt.grid(True, alpha=0.3)
+        
+        # Swing phase comparison
+        plt.subplot(2, 1, 2)
+        data = []
+        labels = []
+        for genotype in ['P9RT', 'P9LT', 'BPN']:
+            if genotype_data[genotype]['actual_swing']:
+                data.append(genotype_data[genotype]['actual_swing'])
+                data.append(genotype_data[genotype]['pred_swing'])
+                labels.extend([f'{genotype}\nActual', f'{genotype}\nPred'])
+        
+        plt.boxplot(data, labels=labels)
+        plt.title('Swing Phase Duration')
+        plt.ylabel('Duration (frames)')
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(output_dir / f'{leg_name}_phase_durations_by_genotype.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        return genotype_data
     
     except Exception as e:
         print(f"Error processing {leg_name} for {results_dir}: {str(e)}")
-        return None, None, None, None
+        return None
+
+def create_genotype_summary_plot(genotype, all_leg_data, output_dir):
+    """Create a summary plot for all legs of a given genotype."""
+    plt.figure(figsize=(20, 10))
+    plt.suptitle(f'{genotype} Phase Durations - All Legs', fontsize=16)
+    
+    # Stance phase comparison (top subplot)
+    plt.subplot(2, 1, 1)
+    data = []
+    labels = []
+    for leg_name, leg_data in all_leg_data.items():
+        if leg_data['actual_stance']:  # Only include if we have data
+            data.append(leg_data['actual_stance'])
+            data.append(leg_data['pred_stance'])
+            labels.extend([f'{leg_name}\nActual', f'{leg_name}\nPred'])
+    
+    bp = plt.boxplot(data, labels=labels, patch_artist=True)
+    
+    # Color boxes
+    for i in range(0, len(bp['boxes']), 2):
+        bp['boxes'][i].set_facecolor('lightblue')  # Actual
+        bp['boxes'][i+1].set_facecolor('lightgreen')  # Predicted
+    
+    plt.title('Stance Phase Duration')
+    plt.ylabel('Duration (frames)')
+    plt.grid(True, alpha=0.3)
+    plt.xticks(rotation=45, ha='right')
+    
+    # Add legend
+    plt.plot([], [], 'lightblue', label='Actual')
+    plt.plot([], [], 'lightgreen', label='Predicted')
+    plt.legend()
+    
+    # Swing phase comparison (bottom subplot)
+    plt.subplot(2, 1, 2)
+    data = []
+    labels = []
+    for leg_name, leg_data in all_leg_data.items():
+        if leg_data['actual_swing']:  # Only include if we have data
+            data.append(leg_data['actual_swing'])
+            data.append(leg_data['pred_swing'])
+            labels.extend([f'{leg_name}\nActual', f'{leg_name}\nPred'])
+    
+    bp = plt.boxplot(data, labels=labels, patch_artist=True)
+    
+    # Color boxes
+    for i in range(0, len(bp['boxes']), 2):
+        bp['boxes'][i].set_facecolor('lightblue')  # Actual
+        bp['boxes'][i+1].set_facecolor('lightgreen')  # Predicted
+    
+    plt.title('Swing Phase Duration')
+    plt.ylabel('Duration (frames)')
+    plt.grid(True, alpha=0.3)
+    plt.xticks(rotation=45, ha='right')
+    
+    # Add legend
+    plt.plot([], [], 'lightblue', label='Actual')
+    plt.plot([], [], 'lightgreen', label='Predicted')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / f'{genotype}_all_legs_phase_durations.png', dpi=300, bbox_inches='tight')
+    plt.close()
 
 def main():
     """Process B_flex predictions for all legs."""
@@ -409,13 +640,6 @@ def main():
     
     # Define model types to check
     model_types = ['lstm_results', 'transformer_results', 'tcn_results', 'hybrid_results']
-    
-    # Store all phase durations
-    all_actual_stance = []
-    all_actual_swing = []
-    all_pred_stance = []
-    all_pred_swing = []
-    processed_legs = []
     
     # Create base output directory
     base_output_dir = Path('stance_swing_analysis')
@@ -429,70 +653,270 @@ def main():
             continue
             
         print(f"\nProcessing {model_type}...")
+        
+        # Create model-specific output directory
         model_output_dir = base_output_dir / model_type
         model_output_dir.mkdir(exist_ok=True)
         
-        model_actual_stance = []
-        model_actual_swing = []
-        model_pred_stance = []
-        model_pred_swing = []
-        model_processed_legs = []
+        # Store results by genotype
+        genotype_results = {
+            'P9RT': {},
+            'P9LT': {},
+            'BPN': {}
+        }
         
+        # Process each leg
         for leg_name in legs:
             try:
-                actual_stance, actual_swing, pred_stance, pred_swing = process_leg_predictions(leg_name, model_type)
-                if actual_stance is not None:
-                    model_actual_stance.append(actual_stance)
-                    model_actual_swing.append(actual_swing)
-                    model_pred_stance.append(pred_stance)
-                    model_pred_swing.append(pred_swing)
-                    model_processed_legs.append(leg_name)
+                genotype_data = process_leg_predictions(leg_name, model_type)
+                if genotype_data is not None:
+                    for genotype in ['P9RT', 'P9LT', 'BPN']:
+                        if genotype_data[genotype]['trials']:
+                            # Store leg data for this genotype
+                            genotype_results[genotype][leg_name] = {
+                                'actual_stance': genotype_data[genotype]['actual_stance'],
+                                'actual_swing': genotype_data[genotype]['actual_swing'],
+                                'pred_stance': genotype_data[genotype]['pred_stance'],
+                                'pred_swing': genotype_data[genotype]['pred_swing']
+                            }
             except Exception as e:
                 print(f"Error processing {leg_name} for {model_type}: {str(e)}")
                 continue
         
-        # Create combined box plot for this model type if we have data
-        if len(model_processed_legs) > 1:
-            plot_phase_durations(model_actual_stance, model_actual_swing,
-                               model_pred_stance, model_pred_swing,
-                               model_processed_legs,
-                               model_output_dir / 'combined_phase_durations_boxplot.png')
-            
-            # Save combined statistics
-            combined_stats = {
-                'actual_stance': {leg: np.mean(durations) for leg, durations in zip(model_processed_legs, model_actual_stance)},
-                'actual_swing': {leg: np.mean(durations) for leg, durations in zip(model_processed_legs, model_actual_swing)},
-                'predicted_stance': {leg: np.mean(durations) for leg, durations in zip(model_processed_legs, model_pred_stance)},
-                'predicted_swing': {leg: np.mean(durations) for leg, durations in zip(model_processed_legs, model_pred_swing)}
-            }
-            
-            with open(model_output_dir / 'combined_phase_stats.json', 'w') as f:
-                json.dump(combined_stats, f, indent=4)
-            
-            # Add to overall results
-            all_actual_stance.extend(model_actual_stance)
-            all_actual_swing.extend(model_actual_swing)
-            all_pred_stance.extend(model_pred_stance)
-            all_pred_swing.extend(model_pred_swing)
-            processed_legs.extend([f"{leg}_{model_type}" for leg in model_processed_legs])
-    
-    # Create overall combined box plot if we have data from multiple models
-    if len(processed_legs) > 1:
-        plot_phase_durations(all_actual_stance, all_actual_swing,
-                           all_pred_stance, all_pred_swing,
-                           processed_legs,
-                           base_output_dir / 'overall_combined_phase_durations_boxplot.png')
+        # Create genotype-specific directories and plots
+        for genotype, leg_data in genotype_results.items():
+            if leg_data:  # Only if we have data for this genotype
+                # Create genotype directory
+                genotype_dir = model_output_dir / genotype
+                genotype_dir.mkdir(exist_ok=True)
+                
+                # Create summary plot
+                plt.figure(figsize=(20, 8))
+                plt.suptitle(f'{genotype} Phase Durations - {model_type}', fontsize=16)
+                
+                # Prepare data for stance phase
+                stance_data = []
+                stance_labels = []
+                for leg_name in sorted(leg_data.keys()):  # Sort legs for consistent order
+                    phase_data = leg_data[leg_name]
+                    stance_data.extend([
+                        phase_data['actual_stance'],
+                        phase_data['pred_stance']
+                    ])
+                    stance_labels.extend([
+                        f'{leg_name}\nActual',
+                        f'{leg_name}\nPred'
+                    ])
+                
+                # Stance phase comparison
+                plt.subplot(1, 2, 1)
+                bp = plt.boxplot(stance_data, labels=stance_labels, patch_artist=True)
+                
+                # Color boxes
+                for i in range(0, len(bp['boxes']), 2):
+                    bp['boxes'][i].set_facecolor('lightblue')  # Actual
+                    bp['boxes'][i+1].set_facecolor('lightgreen')  # Predicted
+                
+                plt.title('Stance Phase Duration')
+                plt.ylabel('Duration (frames)')
+                plt.grid(True, alpha=0.3)
+                plt.xticks(rotation=45, ha='right')
+                
+                # Add legend
+                plt.plot([], [], 'lightblue', label='Actual')
+                plt.plot([], [], 'lightgreen', label='Predicted')
+                plt.legend()
+                
+                # Prepare data for swing phase
+                swing_data = []
+                swing_labels = []
+                for leg_name in sorted(leg_data.keys()):  # Sort legs for consistent order
+                    phase_data = leg_data[leg_name]
+                    swing_data.extend([
+                        phase_data['actual_swing'],
+                        phase_data['pred_swing']
+                    ])
+                    swing_labels.extend([
+                        f'{leg_name}\nActual',
+                        f'{leg_name}\nPred'
+                    ])
+                
+                # Swing phase comparison
+                plt.subplot(1, 2, 2)
+                bp = plt.boxplot(swing_data, labels=swing_labels, patch_artist=True)
+                
+                # Color boxes
+                for i in range(0, len(bp['boxes']), 2):
+                    bp['boxes'][i].set_facecolor('lightblue')  # Actual
+                    bp['boxes'][i+1].set_facecolor('lightgreen')  # Predicted
+                
+                plt.title('Swing Phase Duration')
+                plt.ylabel('Duration (frames)')
+                plt.grid(True, alpha=0.3)
+                plt.xticks(rotation=45, ha='right')
+                
+                # Add legend
+                plt.plot([], [], 'lightblue', label='Actual')
+                plt.plot([], [], 'lightgreen', label='Predicted')
+                plt.legend()
+                
+                plt.tight_layout()
+                plt.savefig(genotype_dir / 'phase_durations.png', dpi=300, bbox_inches='tight')
+                plt.close()
+                
+                # Save statistics
+                stats = {}
+                for leg_name, phase_data in leg_data.items():
+                    stats[leg_name] = {
+                        'actual_stance': {
+                            'mean': float(np.mean(phase_data['actual_stance'])),
+                            'std': float(np.std(phase_data['actual_stance'])),
+                            'median': float(np.median(phase_data['actual_stance'])),
+                            'min': float(np.min(phase_data['actual_stance'])),
+                            'max': float(np.max(phase_data['actual_stance']))
+                        },
+                        'actual_swing': {
+                            'mean': float(np.mean(phase_data['actual_swing'])),
+                            'std': float(np.std(phase_data['actual_swing'])),
+                            'median': float(np.median(phase_data['actual_swing'])),
+                            'min': float(np.min(phase_data['actual_swing'])),
+                            'max': float(np.max(phase_data['actual_swing']))
+                        },
+                        'predicted_stance': {
+                            'mean': float(np.mean(phase_data['pred_stance'])),
+                            'std': float(np.std(phase_data['pred_stance'])),
+                            'median': float(np.median(phase_data['pred_stance'])),
+                            'min': float(np.min(phase_data['pred_stance'])),
+                            'max': float(np.max(phase_data['pred_stance']))
+                        },
+                        'predicted_swing': {
+                            'mean': float(np.mean(phase_data['pred_swing'])),
+                            'std': float(np.std(phase_data['pred_swing'])),
+                            'median': float(np.median(phase_data['pred_swing'])),
+                            'min': float(np.min(phase_data['pred_swing'])),
+                            'max': float(np.max(phase_data['pred_swing']))
+                        }
+                    }
+                
+                with open(genotype_dir / 'phase_stats.json', 'w') as f:
+                    json.dump(stats, f, indent=4)
         
-        # Save overall combined statistics
-        overall_combined_stats = {
-            'actual_stance': {leg: np.mean(durations) for leg, durations in zip(processed_legs, all_actual_stance)},
-            'actual_swing': {leg: np.mean(durations) for leg, durations in zip(processed_legs, all_actual_swing)},
-            'predicted_stance': {leg: np.mean(durations) for leg, durations in zip(processed_legs, all_pred_stance)},
-            'predicted_swing': {leg: np.mean(durations) for leg, durations in zip(processed_legs, all_pred_swing)}
+        # Create model summary plot comparing genotypes
+        plt.figure(figsize=(20, 8))
+        plt.suptitle(f'Phase Durations by Genotype - {model_type}', fontsize=16)
+        
+        # Prepare data for stance phase comparison
+        stance_data = []
+        stance_labels = []
+        colors = {
+            'P9RT': 'lightblue',
+            'P9LT': 'lightgreen',
+            'BPN': 'lightpink'
         }
+        box_colors = []
         
-        with open(base_output_dir / 'overall_combined_phase_stats.json', 'w') as f:
-            json.dump(overall_combined_stats, f, indent=4)
+        for genotype in ['P9RT', 'P9LT', 'BPN']:
+            if genotype in genotype_results and genotype_results[genotype]:
+                for leg_name in sorted(genotype_results[genotype].keys()):
+                    phase_data = genotype_results[genotype][leg_name]
+                    stance_data.extend([
+                        phase_data['actual_stance'],
+                        phase_data['pred_stance']
+                    ])
+                    stance_labels.extend([
+                        f'{genotype}\n{leg_name}\nActual',
+                        f'{genotype}\n{leg_name}\nPred'
+                    ])
+                    box_colors.extend([colors[genotype], colors[genotype]])
+        
+        # Stance phase comparison
+        plt.subplot(1, 2, 1)
+        if stance_data:  # Only create plot if we have data
+            bp = plt.boxplot(stance_data, labels=stance_labels, patch_artist=True)
+            
+            # Color boxes
+            for box, color in zip(bp['boxes'], box_colors):
+                box.set_facecolor(color)
+            
+            plt.title('Stance Phase Duration')
+            plt.ylabel('Duration (frames)')
+            plt.grid(True, alpha=0.3)
+            plt.xticks(rotation=45, ha='right')
+            
+            # Add legend
+            for genotype, color in colors.items():
+                plt.plot([], [], color=color, label=genotype)
+            plt.legend()
+        
+        # Prepare data for swing phase comparison
+        swing_data = []
+        swing_labels = []
+        box_colors = []
+        
+        for genotype in ['P9RT', 'P9LT', 'BPN']:
+            if genotype in genotype_results and genotype_results[genotype]:
+                for leg_name in sorted(genotype_results[genotype].keys()):
+                    phase_data = genotype_results[genotype][leg_name]
+                    swing_data.extend([
+                        phase_data['actual_swing'],
+                        phase_data['pred_swing']
+                    ])
+                    swing_labels.extend([
+                        f'{genotype}\n{leg_name}\nActual',
+                        f'{genotype}\n{leg_name}\nPred'
+                    ])
+                    box_colors.extend([colors[genotype], colors[genotype]])
+        
+        # Swing phase comparison
+        plt.subplot(1, 2, 2)
+        if swing_data:  # Only create plot if we have data
+            bp = plt.boxplot(swing_data, labels=swing_labels, patch_artist=True)
+            
+            # Color boxes
+            for box, color in zip(bp['boxes'], box_colors):
+                box.set_facecolor(color)
+            
+            plt.title('Swing Phase Duration')
+            plt.ylabel('Duration (frames)')
+            plt.grid(True, alpha=0.3)
+            plt.xticks(rotation=45, ha='right')
+            
+            # Add legend
+            for genotype, color in colors.items():
+                plt.plot([], [], color=color, label=genotype)
+            plt.legend()
+        
+        plt.tight_layout()
+        plt.savefig(model_output_dir / 'all_genotypes_comparison.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Save model summary statistics
+        model_stats = {}
+        for genotype, leg_data in genotype_results.items():
+            if leg_data:  # Only if we have data for this genotype
+                model_stats[genotype] = {}
+                for leg_name, phase_data in leg_data.items():
+                    model_stats[genotype][leg_name] = {
+                        'actual_stance': {
+                            'mean': float(np.mean(phase_data['actual_stance'])),
+                            'std': float(np.std(phase_data['actual_stance']))
+                        },
+                        'actual_swing': {
+                            'mean': float(np.mean(phase_data['actual_swing'])),
+                            'std': float(np.std(phase_data['actual_swing']))
+                        },
+                        'predicted_stance': {
+                            'mean': float(np.mean(phase_data['pred_stance'])),
+                            'std': float(np.std(phase_data['pred_stance']))
+                        },
+                        'predicted_swing': {
+                            'mean': float(np.mean(phase_data['pred_swing'])),
+                            'std': float(np.std(phase_data['pred_swing']))
+                        }
+                    }
+        
+        with open(model_output_dir / 'model_summary_stats.json', 'w') as f:
+            json.dump(model_stats, f, indent=4)
     
     print("\nProcessing completed!")
 

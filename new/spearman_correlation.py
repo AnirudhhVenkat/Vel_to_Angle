@@ -25,10 +25,13 @@ def filter_frames(df):
     return filtered_df
 
 def load_data(file_path, genotype=None):
-    """Load and preprocess the dataset from a CSV file."""
+    """Load and preprocess the dataset from a CSV file or parquet file."""
     try:
-        # Load the full data
-        df = pd.read_csv(file_path)
+        # Load the full data based on file extension
+        if file_path.endswith('.parquet'):
+            df = pd.read_parquet(file_path)
+        else:
+            df = pd.read_csv(file_path)
         print(f"Raw data loaded successfully with shape: {df.shape}")
         
         # Filter for genotype
@@ -43,7 +46,6 @@ def load_data(file_path, genotype=None):
             raise ValueError(f"Missing required velocity columns: {missing_cols}")
         
         # Create trial IDs based on frame numbers
-        # Each trial should be 1400 frames
         trial_size = 1400
         num_trials = len(df) // trial_size
         df['trial_id'] = np.repeat(range(num_trials), trial_size)[:len(df)]
@@ -55,7 +57,7 @@ def load_data(file_path, genotype=None):
         print(f"Trial length statistics:")
         print(trial_lengths.describe())
         
-        # Filter frames 400-1000 from each trial
+        # Filter frames based on genotype
         filtered_rows = []
         skipped_trials = []
         short_trials = []
@@ -70,7 +72,11 @@ def load_data(file_path, genotype=None):
             
             try:
                 trial_data = df.iloc[start_idx:end_idx]
-                filtered_rows.append(trial_data.iloc[400:1000])
+                # Different frame ranges for ES vs other genotypes
+                if genotype == 'ES':
+                    filtered_rows.append(trial_data.iloc[0:600])  # Frames 0-600 for ES
+                else:
+                    filtered_rows.append(trial_data.iloc[400:1000])  # Frames 400-1000 for others
             except Exception as e:
                 skipped_trials.append((trial, str(e)))
         
@@ -89,7 +95,8 @@ def load_data(file_path, genotype=None):
         
         # Concatenate all filtered trials
         df = pd.concat(filtered_rows, axis=0, ignore_index=True)
-        print(f"\nFiltered to frames 400-1000, new shape: {df.shape}")
+        frame_range = "0-600" if genotype == 'ES' else "400-1000"
+        print(f"\nFiltered to frames {frame_range}, new shape: {df.shape}")
         
         return df
         
@@ -272,17 +279,82 @@ def calculate_spearman_correlation(data_path, genotype, output_dir='spearman_cor
     Calculate Spearman's rank correlation coefficient between variables in the dataset.
     
     Args:
-        data_path (str): Path to the CSV file containing the data
-        genotype (str): Genotype to analyze ('P9RT', 'BPN', or 'P9LT')
+        data_path (str): Path to the CSV/parquet file containing the data
+        genotype (str): Genotype to analyze ('P9RT', 'BPN', 'P9LT', or 'ES')
         output_dir (str): Directory to save the correlation results and plots
     """
     # Create output directory if it doesn't exist
     output_path = Path(output_dir) / genotype
     output_path.mkdir(parents=True, exist_ok=True)
     
-    # Load and preprocess data
-    print(f"\nLoading and preprocessing data for {genotype} from: {data_path}")
-    df = load_data(data_path, genotype)
+    # Load raw data first (before filtering frames)
+    print(f"\nLoading data for {genotype} from: {data_path}")
+    if data_path.endswith('.parquet'):
+        df = pd.read_parquet(data_path)
+    else:
+        df = pd.read_csv(data_path)
+    print(f"Raw data loaded with shape: {df.shape}")
+    
+    # Filter for genotype
+    if genotype:
+        df = df[df['genotype'] == genotype].copy()
+        print(f"Filtered for {genotype}: {df.shape}")
+    
+    # Get trial indices (assuming 1400 frames per trial)
+    trial_size = 1400
+    num_trials = len(df) // trial_size
+    print(f"\nTotal number of trials before velocity filtering: {num_trials}")
+    
+    # Filter trials based on velocity thresholds
+    filtered_trials = []
+    for trial in range(num_trials):
+        # Different frame ranges for ES vs other genotypes
+        if genotype == 'ES':
+            start_idx = trial * trial_size  # Start from frame 0 for ES
+            end_idx = trial * trial_size + 600  # End at frame 600 for ES
+        else:
+            start_idx = trial * trial_size + 400  # Start from frame 400 for others
+            end_idx = trial * trial_size + 1000   # End at frame 1000 for others
+            
+        trial_data = df.iloc[start_idx:end_idx]
+        
+        # Calculate average velocity for the trial
+        if genotype in ['P9RT', 'P9LT']:
+            avg_vel = trial_data['z_vel'].mean()
+            threshold = 3
+            vel_type = 'z'
+        else:  # BPN or ES
+            avg_vel = trial_data['x_vel'].mean()
+            threshold = 5
+            vel_type = 'x'
+        
+        # Keep trial if it meets the threshold
+        if abs(avg_vel) >= threshold:
+            filtered_trials.append(trial)
+    
+    print(f"\nVelocity filtering criteria for {genotype}:")
+    print(f"Using {vel_type}_vel with threshold {threshold}")
+    print(f"Trials remaining after filtering: {len(filtered_trials)} out of {num_trials}")
+    
+    # Keep only the filtered trials
+    filtered_rows = []
+    for trial in filtered_trials:
+        if genotype == 'ES':
+            start_idx = trial * trial_size  # Start from frame 0 for ES
+            end_idx = trial * trial_size + 600  # End at frame 600 for ES
+        else:
+            start_idx = trial * trial_size + 400  # Start from frame 400 for others
+            end_idx = trial * trial_size + 1000   # End at frame 1000 for others
+        filtered_rows.append(df.iloc[start_idx:end_idx])
+    
+    if not filtered_rows:
+        print(f"No trials remain after velocity filtering for {genotype}")
+        return None
+    
+    # Create filtered dataframe
+    df = pd.concat(filtered_rows, axis=0, ignore_index=True)
+    frame_range = "0-600" if genotype == 'ES' else "400-1000"
+    print(f"Shape after velocity filtering and frame selection ({frame_range}): {df.shape}")
     
     # Calculate enhanced features
     print("\nCalculating enhanced features (velocities and their derivatives)...")
@@ -301,7 +373,7 @@ def calculate_spearman_correlation(data_path, genotype, output_dir='spearman_cor
     # Each trial has 600 frames after filtering (1000-400)
     trial_size = 600
     num_trials = len(df) // trial_size
-    print(f"\nNumber of trials after filtering: {num_trials}")
+    print(f"\nNumber of trials after all filtering: {num_trials}")
     
     # Calculate moving averages
     for window in windows:
@@ -508,44 +580,195 @@ def calculate_spearman_correlation(data_path, genotype, output_dir='spearman_cor
     
     return correlation_matrix
 
-def get_available_data_path():
-    """Try multiple possible data paths and return the first available one."""
-    possible_paths = [
-        "Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv",  # Network drive path
-        "/Users/anivenkat/Downloads/BPN_P9LT_P9RT_flyCoords.csv",      # Local Mac path
-        "C:/Users/bidayelab/Downloads/BPN_P9LT_P9RT_flyCoords.csv"     # Local Windows path
-    ]
+def calculate_coordinate_joint_correlations(data_path, genotype, output_dir='coordinate_joint_correlations'):
+    """Calculate Spearman correlations between coordinates and joint angles."""
+    # Create output directory
+    output_path = Path(output_dir) / genotype
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Load and preprocess data
+    print(f"\nLoading and preprocessing data for {genotype}...")
+    df = pd.read_csv(data_path)
+    print(f"Raw data loaded with shape: {df.shape}")
+    
+    # Filter for genotype
+    if genotype:
+        df = df[df['genotype'] == genotype].copy()
+        print(f"Filtered for {genotype}: {df.shape}")
+    
+    # Get trial indices (assuming 1400 frames per trial)
+    trial_size = 1400
+    num_trials = len(df) // trial_size
+    print(f"\nTotal number of trials before velocity filtering: {num_trials}")
+    
+    # Filter trials based on velocity thresholds
+    filtered_trials = []
+    for trial in range(num_trials):
+        start_idx = trial * trial_size + 400  # Start from frame 400
+        end_idx = trial * trial_size + 1000   # End at frame 1000
+        trial_data = df.iloc[start_idx:end_idx]
+        
+        # Calculate average velocity for the trial
+        if genotype in ['P9RT', 'P9LT']:
+            avg_vel = trial_data['z_vel'].mean()
+            threshold = 3
+            vel_type = 'z'
+        else:  # BPN
+            avg_vel = trial_data['x_vel'].mean()
+            threshold = 5
+            vel_type = 'x'
+        
+        # Keep trial if it meets the threshold
+        if abs(avg_vel) >= threshold:
+            filtered_trials.append(trial)
+    
+    print(f"\nVelocity filtering criteria for {genotype}:")
+    print(f"Using {vel_type}_vel with threshold {threshold}")
+    print(f"Trials remaining after filtering: {len(filtered_trials)} out of {num_trials}")
+    
+    # Keep only the filtered trials
+    filtered_rows = []
+    for trial in filtered_trials:
+        start_idx = trial * trial_size + 400
+        end_idx = trial * trial_size + 1000
+        filtered_rows.append(df.iloc[start_idx:end_idx])
+    
+    if not filtered_rows:
+        print(f"No trials remain after velocity filtering for {genotype}")
+        return None
+    
+    df = pd.concat(filtered_rows, axis=0, ignore_index=True)
+    print(f"Final shape after filtering: {df.shape}")
+    
+    # Get coordinate columns (ending in _x, _y, _z)
+    coord_cols = [col for col in df.columns if col.endswith(('_x', '_y', '_z'))]
+    
+    # Get joint angle columns
+    joint_cols = [col for col in df.columns if col.endswith(('_flex', '_rot', '_abduct'))]
+    
+    print(f"\nAnalyzing correlations between {len(coord_cols)} coordinates and {len(joint_cols)} joint angles")
+    
+    # Initialize results list
+    correlations = []
+    
+    # Calculate correlations
+    print("\nCalculating Spearman correlations...")
+    for coord in coord_cols:
+        for joint in joint_cols:
+            try:
+                # Get data as numpy arrays
+                x = df[coord].to_numpy().ravel()
+                y = df[joint].to_numpy().ravel()
+                
+                # Remove NaN values
+                mask = ~(np.isnan(x) | np.isnan(y))
+                x = x[mask]
+                y = y[mask]
+                
+                # Calculate correlation
+                if len(x) > 0 and len(y) > 0:
+                    correlation, p_value = stats.spearmanr(x, y)
+                    
+                    # Store significant correlations (p < 0.05 and |correlation| > 0.3)
+                    if abs(correlation) > 0.3 and p_value < 0.05:
+                        correlations.append({
+                            'Coordinate': coord,
+                            'Joint Angle': joint,
+                            'Correlation': correlation,
+                            'P-value': p_value
+                        })
+                        
+            except Exception as e:
+                print(f"\nError calculating correlation between {coord} and {joint}: {e}")
+                continue
+    
+    # Convert to DataFrame and sort by absolute correlation
+    if correlations:
+        corr_df = pd.DataFrame(correlations)
+        corr_df['Abs_Correlation'] = corr_df['Correlation'].abs()
+        corr_df = corr_df.sort_values('Abs_Correlation', ascending=False)
+        corr_df = corr_df.drop('Abs_Correlation', axis=1)
+        
+        # Save to CSV
+        csv_path = output_path / f'coordinate_joint_correlations_{genotype}.csv'
+        corr_df.to_csv(csv_path, index=False)
+        print(f"\nSaved correlations to: {csv_path}")
+        
+        # Create correlation matrix for heatmap
+        pivot_df = corr_df.pivot(index='Coordinate', 
+                                columns='Joint Angle', 
+                                values='Correlation')
+        
+        # Plot heatmap
+        plt.figure(figsize=(20, 10))
+        sns.heatmap(pivot_df, 
+                   annot=True, 
+                   cmap='coolwarm',
+                   center=0,
+                   fmt='.2f',
+                   vmin=-1,
+                   vmax=1)
+        
+        plt.title(f'Coordinate-Joint Angle Correlations ({genotype})\nFiltered by {vel_type}_vel ≥ {threshold}')
+        plt.tight_layout()
+        
+        # Save heatmap
+        heatmap_path = output_path / f'coordinate_joint_correlations_heatmap_{genotype}.png'
+        plt.savefig(heatmap_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Print top correlations
+        print(f"\nTop 20 strongest correlations for {genotype}:")
+        print(corr_df.head(20).to_string(index=False))
+        
+        return corr_df
+    else:
+        print(f"\nNo significant correlations found for {genotype}")
+        return None
+
+def get_available_data_path(genotype):
+    """Try multiple possible data paths and return the first available one based on genotype."""
+    if genotype == 'ES':
+        possible_paths = [
+            r"Z:\Divya\TEMP_transfers\toAni\4_StopProjectData_forES\df_preproc_fly_centric.parquet"
+        ]
+    else:
+        possible_paths = [
+            "Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv",  # Network drive path
+            "/Users/anivenkat/Downloads/BPN_P9LT_P9RT_flyCoords.csv",      # Local Mac path
+            "C:/Users/bidayelab/Downloads/BPN_P9LT_P9RT_flyCoords.csv"     # Local Windows path
+        ]
     
     for path in possible_paths:
         if Path(path).exists():
             print(f"Using data file: {path}")
             return path
     
-    raise FileNotFoundError("Could not find the data file in any of the expected locations")
+    raise FileNotFoundError(f"Could not find the data file for genotype {genotype}")
 
 def main():
     try:
-        # Get the first available data path
-        file_path = get_available_data_path()
+        # Process each genotype
+        genotypes = ['P9RT', 'BPN', 'P9LT', 'ES']  # Added ES genotype
         
         parent_dir = Path("spearman_correlation_results")
         parent_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Process each genotype
-        genotypes = ['P9RT', 'BPN', 'P9LT']
         
         for genotype in genotypes:
             print(f"\nProcessing {genotype} genotype...")
             output_dir = parent_dir / genotype
             output_dir.mkdir(parents=True, exist_ok=True)
             
-            # Calculate correlations and generate plots
-            calculate_spearman_correlation(file_path, genotype, output_dir)
-            print(f"\nResults saved to {output_dir}")
+            # Get appropriate data path for the genotype
+            try:
+                file_path = get_available_data_path(genotype)
+                # Calculate correlations and generate plots
+                calculate_spearman_correlation(file_path, genotype, output_dir)
+                print(f"\nResults saved to {output_dir}")
+            except FileNotFoundError as e:
+                print(f"Skipping {genotype}: {e}")
+                continue
     
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
-        print("Please ensure the data file is available in one of the expected locations.")
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
         raise
