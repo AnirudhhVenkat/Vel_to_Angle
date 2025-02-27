@@ -381,6 +381,121 @@ def calculate_psd_features(data, fs=200):
     
     return features
 
+def filter_es_data_by_genotype(df, target_genotype="ES"):
+    """
+    Filter the ES parquet data to only include rows with genotype 'ES'.
+    
+    Args:
+        df: DataFrame loaded from the parquet file
+        target_genotype: The target genotype to filter for (default: 'ES')
+        
+    Returns:
+        Filtered DataFrame
+    """
+    print(f"Filtering ES data for genotype: {target_genotype}")
+    print(f"Original data shape: {df.shape}")
+    
+    # Check if genotype column exists
+    if 'genotype' in df.columns:
+        # Check what unique genotypes exist
+        unique_genotypes = df['genotype'].unique()
+        print(f"Found genotypes in data: {unique_genotypes}")
+        
+        # Check if our target genotype exists
+        if target_genotype in unique_genotypes:
+            # Filter to only keep rows with target genotype
+            filtered_df = df[df['genotype'] == target_genotype]
+            print(f"After filtering for {target_genotype}: {filtered_df.shape} rows")
+            return filtered_df
+        else:
+            print(f"WARNING: {target_genotype} not found in genotypes. Available: {unique_genotypes}")
+            
+            # If there's only one genotype, assume it's equivalent to ES
+            if len(unique_genotypes) == 1:
+                print(f"Using the only available genotype: {unique_genotypes[0]}")
+                return df
+            
+            # If there are multiple genotypes but not ES, ask for guidance
+            print(f"Multiple genotypes found, but no '{target_genotype}'. Please specify which to use.")
+            return df  # Return unfiltered for now with warning
+    else:
+        print(f"WARNING: No 'genotype' column found in data. Columns: {df.columns.tolist()}")
+    
+    # If we get here, we couldn't filter by genotype
+    print("Could not filter by genotype. Using all data.")
+    return df
+
+def add_psd_features(df, base_velocities=None):
+    """Add power spectral density features efficiently to avoid fragmentation."""
+    print("Calculating power spectral density features...")
+    
+    if base_velocities is None:
+        base_velocities = ['x_vel', 'y_vel', 'z_vel']
+    
+    bands = {
+        'very_low': (0, 10),    # 0-10 Hz: Very slow movements
+        'low': (10, 30),        # 10-30 Hz: Slow movements
+        'medium': (30, 60),     # 30-60 Hz: Medium speed movements
+        'high': (60, 100),      # 60-100 Hz: Fast movements
+        'very_high': (100, 200) # 100-200 Hz: Very fast movements/noise
+    }
+    
+    # Create a dictionary to hold all new columns
+    new_columns = {}
+    
+    # Initialize all new columns at once
+    for vel in base_velocities:
+        # Basic PSD features
+        new_columns[f'{vel}_total_power'] = np.zeros(len(df))
+        new_columns[f'{vel}_peak_freq'] = np.zeros(len(df))
+        new_columns[f'{vel}_mean_freq'] = np.zeros(len(df))
+        
+        # Band power features
+        for band_name in bands.keys():
+            new_columns[f'{vel}_{band_name}_power'] = np.zeros(len(df))
+            new_columns[f'{vel}_{band_name}_relative_power'] = np.zeros(len(df))
+    
+    # Calculate frames per trial
+    frames_per_trial = 650  # All trials are now 650 frames
+    num_filtered_trials = len(df) // frames_per_trial
+    
+    # Calculate PSD features for each velocity and trial
+    for vel in base_velocities:
+        print(f"  Processing {vel}...")
+        for trial in range(num_filtered_trials):
+            start_idx = trial * frames_per_trial
+            end_idx = start_idx + frames_per_trial
+            trial_data = df.loc[start_idx:end_idx-1, vel].values
+            
+            # Calculate PSD using Welch's method
+            fs = 200  # 200Hz sampling frequency
+            frequencies, psd = signal.welch(trial_data, fs=fs, nperseg=fs)
+            
+            # Calculate PSD features
+            total_power = np.sum(psd)
+            peak_frequency = frequencies[np.argmax(psd)]
+            mean_frequency = np.sum(frequencies * psd) / total_power if total_power > 0 else 0
+            
+            # Store features for this trial in our arrays
+            new_columns[f'{vel}_total_power'][start_idx:end_idx] = total_power
+            new_columns[f'{vel}_peak_freq'][start_idx:end_idx] = peak_frequency
+            new_columns[f'{vel}_mean_freq'][start_idx:end_idx] = mean_frequency
+            
+            # Calculate and store band powers
+            for band_name, (low_freq, high_freq) in bands.items():
+                mask = (frequencies >= low_freq) & (frequencies < high_freq)
+                band_power = np.sum(psd[mask])
+                relative_power = band_power / total_power if total_power > 0 else 0
+                
+                new_columns[f'{vel}_{band_name}_power'][start_idx:end_idx] = band_power
+                new_columns[f'{vel}_{band_name}_relative_power'][start_idx:end_idx] = relative_power
+    
+    # Create a new DataFrame with all the new columns
+    new_df = pd.DataFrame(new_columns)
+    
+    # Join with the original DataFrame efficiently
+    return pd.concat([df, new_df], axis=1)
+
 def prepare_data(data_path, input_features, output_features, sequence_length):
     """Load and prepare data for training."""
     print("\nPreparing data...")
@@ -390,6 +505,9 @@ def prepare_data(data_path, input_features, output_features, sequence_length):
     regular_df = pd.read_csv("Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv")
     print("Loading ES data...")
     es_df = pd.read_parquet(r"Z:\Divya\TEMP_transfers\toAni\4_StopProjectData_forES\df_preproc_fly_centric.parquet")
+    
+    # Filter ES data by genotype
+    es_df = filter_es_data_by_genotype(es_df, target_genotype="ES")
     
     print(f"Regular data shape: {regular_df.shape}")
     print(f"ES data shape: {es_df.shape}")
@@ -430,27 +548,31 @@ def prepare_data(data_path, input_features, output_features, sequence_length):
             filtered_trials.append(frames)
             print(f"Added {genotype} trial with {vel_type}_vel = {avg_vel:.2f}")
     
-    # Process ES trials
+    # Process ES trials with velocity thresholding
     num_es_trials = len(es_df) // trial_size
     print(f"\nProcessing {num_es_trials} ES trials...")
-    
+
     for trial in range(num_es_trials):
         start_idx = trial * trial_size
-        end_idx = (trial + 1) * trial_size
+        end_idx = min((trial + 1) * trial_size, len(es_df))
         trial_data = es_df.iloc[start_idx:end_idx]
         
-        # Skip if not ES genotype
-        if trial_data['genotype'].iloc[0] != 'ES':
+        # Skip incomplete trials
+        if len(trial_data) < trial_size:
+            print(f"Skipping incomplete trial {trial} with only {len(trial_data)} frames")
             continue
         
         # Get frames 0-650 for ES trials (650 frames)
         frames = trial_data.iloc[0:650]
         
-        # Apply same velocity threshold as BPN
+        # Apply velocity threshold for ES data (same as BPN)
         avg_vel = abs(frames['x_vel'].mean())
-        if avg_vel >= 5:  # Same threshold as BPN
+        threshold = 5  # Using same threshold as BPN
+        
+        # Keep trial if it meets the threshold
+        if avg_vel >= threshold:
             filtered_trials.append(frames)
-            print(f"Added ES trial with x_vel = {avg_vel:.2f}")
+            print(f"Added ES trial {trial} with x_vel = {avg_vel:.2f}")
     
     if not filtered_trials:
         raise ValueError("No trials remain after velocity filtering!")
@@ -564,54 +686,11 @@ def prepare_data(data_path, input_features, output_features, sequence_length):
                 df.loc[start_idx:end_idx-1, feature_name] = lagged_values
     
     # Calculate PSD features
-    print("\nCalculating power spectral density features...")
+    df = add_psd_features(df, base_velocities)
     
-    for vel in base_velocities:
-        # Initialize PSD feature columns outside the trial loop
-        df[f'{vel}_total_power'] = 0.0
-        df[f'{vel}_peak_freq'] = 0.0
-        df[f'{vel}_mean_freq'] = 0.0
-        
-        bands = {
-            'very_low': (0, 10),    # 0-10 Hz: Very slow movements
-            'low': (10, 30),        # 10-30 Hz: Slow movements
-            'medium': (30, 60),     # 30-60 Hz: Medium speed movements
-            'high': (60, 100),      # 60-100 Hz: Fast movements
-            'very_high': (100, 200) # 100-200 Hz: Very fast movements/noise
-        }
-        
-        for band_name in bands:
-            df[f'{vel}_{band_name}_power'] = 0.0
-            df[f'{vel}_{band_name}_relative_power'] = 0.0
-        
-        for trial in range(num_filtered_trials):
-            start_idx = trial * frames_per_trial
-            end_idx = start_idx + frames_per_trial
-            trial_data = df.loc[start_idx:end_idx-1, vel].values
-            
-            # Calculate PSD using Welch's method
-            fs = 200  # 200Hz sampling frequency
-            frequencies, psd = signal.welch(trial_data, fs=fs, nperseg=fs)
-            
-            # Calculate PSD features
-            total_power = np.sum(psd)
-            peak_frequency = frequencies[np.argmax(psd)]
-            mean_frequency = np.sum(frequencies * psd) / total_power if total_power > 0 else 0
-            
-            # Store features for this trial using loc
-            df.loc[start_idx:end_idx-1, f'{vel}_total_power'] = total_power
-            df.loc[start_idx:end_idx-1, f'{vel}_peak_freq'] = peak_frequency
-            df.loc[start_idx:end_idx-1, f'{vel}_mean_freq'] = mean_frequency
-            
-            # Calculate and store band powers
-            for band_name, (low_freq, high_freq) in bands.items():
-                mask = (frequencies >= low_freq) & (frequencies < high_freq)
-                band_power = np.sum(psd[mask])
-                relative_power = band_power / total_power if total_power > 0 else 0
-                
-                df.loc[start_idx:end_idx-1, f'{vel}_{band_name}_power'] = band_power
-                df.loc[start_idx:end_idx-1, f'{vel}_{band_name}_relative_power'] = relative_power
-
+    # At the end of your feature calculation code, after all columns are added, add this line:
+    df = df.copy()  # Creates a defragmented copy of the DataFrame
+    
     # Define extended input features
     extended_features = [
         # Base features (already included)
@@ -763,7 +842,7 @@ def prepare_data(data_path, input_features, output_features, sequence_length):
     val_loader = DataLoader(val_dataset, batch_size=32)
     test_loader = DataLoader(test_dataset, batch_size=32)
     
-    return (train_loader, val_loader, test_loader), (X_scaler, y_scaler), (input_features, output_features)
+    return (train_loader, val_loader, test_loader), (X_scaler, y_scaler), (input_features, output_features), df, test_trials
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, patience=20):
     """Train the LSTM model."""
@@ -826,7 +905,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     
     return best_model, best_val_loss
 
-def evaluate_model(model, test_loader, criterion, device, output_features, output_scaler, save_dir):
+def evaluate_model(model, test_loader, criterion, device, output_features, output_scaler, save_dir, df=None, test_trials=None):
     """Evaluate the trained model."""
     model.eval()
     all_predictions = []
@@ -881,18 +960,44 @@ def evaluate_model(model, test_loader, criterion, device, output_features, outpu
     predictions_original = predictions_original.reshape(predictions.shape)
     targets_original = targets_original.reshape(targets.shape)
     
+    # Initialize dictionary to store trial predictions
+    trial_predictions_data = {}
+    
     # Save predictions and targets in NPZ file
     predictions_dir = save_dir / 'predictions'
     predictions_dir.mkdir(exist_ok=True, parents=True)
     
-    # Save all trial predictions in one NPZ file
-    np.savez(
-        predictions_dir / 'trial_predictions.npz',
-        predictions=predictions_original,
-        targets=targets_original,
-        output_features=output_features,
-        frames=np.arange(400, 1000)  # Original frame numbers
-    )
+    # Create genotype array that matches the shape of predictions
+    genotype_info = []
+    
+    # If we have dataframe and test trials info, add genotype info
+    if df is not None and test_trials is not None:
+        for trial in range(num_trials):
+            # Get genotype for this trial
+            trial_idx = test_trials[trial]
+            start_idx = trial_idx * frames_per_trial
+            trial_genotype = df.iloc[start_idx]['genotype']
+            genotype_info.append(trial_genotype)
+        
+        # Save with genotype information
+        np.savez(
+            predictions_dir / 'trial_predictions.npz',
+            predictions=predictions_original,
+            targets=targets_original,
+            output_features=output_features,
+            frames=np.arange(400, 1000),
+            genotypes=genotype_info
+        )
+    else:
+        # Save without genotype info if DataFrame not available
+        np.savez(
+            predictions_dir / 'trial_predictions.npz',
+            predictions=predictions_original,
+            targets=targets_original,
+            output_features=output_features,
+            frames=np.arange(400, 1000)
+        )
+    
     print(f"\nSaved predictions to: {predictions_dir / 'trial_predictions.npz'}")
     
     # Calculate metrics for each feature
@@ -958,12 +1063,32 @@ def evaluate_model(model, test_loader, criterion, device, output_features, outpu
                 trial_pred = predictions_original[trial, :, i]
                 trial_target = targets_original[trial, :, i]
                 
-                # Create time axis (frames 400-1000)
-                x_axis = np.arange(400, 1000)
+                # Set default frame range
+                frame_range = np.arange(400, 400 + len(trial_pred))
+                
+                # Get genotype info if available
+                if df is not None and test_trials is not None and trial < len(test_trials):
+                    trial_idx = test_trials[trial]
+                    start_idx = trial_idx * frames_per_trial
+                    if 'genotype' in df.columns:
+                        trial_genotype = df.iloc[start_idx]['genotype']
+                        
+                        # Set appropriate frame range based on genotype
+                        if trial_genotype == 'ES':
+                            frame_start = 50  # ES data: 0-650, but first 50 frames used for sequence
+                            frame_range = np.arange(frame_start, frame_start + len(trial_pred))
+                        
+                        # Store trial info
+                        trial_predictions_data[f'trial_{trial}'] = {
+                            'predictions': trial_pred,
+                            'targets': trial_target,
+                            'frames': frame_range,
+                            'genotype': trial_genotype
+                        }
                 
                 # Plot predictions and targets
-                ax.plot(x_axis, trial_target, 'b-', label='Actual', alpha=0.7)
-                ax.plot(x_axis, trial_pred, 'r-', label='Predicted', alpha=0.7)
+                ax.plot(frame_range, trial_target, 'b-', label='Actual', alpha=0.7)
+                ax.plot(frame_range, trial_pred, 'r-', label='Predicted', alpha=0.7)
                 
                 # Calculate trial-specific metrics
                 mae = np.mean(np.abs(trial_pred - trial_target))
@@ -1193,7 +1318,7 @@ def main():
                 print(f"  - {feat}")
             
             # Prepare data for this leg
-            (train_loader, val_loader, test_loader), (X_scaler, y_scaler), (input_features, output_features) = prepare_data(
+            (train_loader, val_loader, test_loader), (X_scaler, y_scaler), (input_features, output_features), df, test_trials = prepare_data(
                 data_path,
                 input_features,
                 output_features,
@@ -1239,7 +1364,9 @@ def main():
                 device,
                 output_features,
                 y_scaler,
-                leg_plots_dir
+                leg_plots_dir,
+                df=df,
+                test_trials=test_trials
             )
             
             # Save model and results
