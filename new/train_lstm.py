@@ -1046,9 +1046,17 @@ def evaluate_model(model, test_loader, criterion, device, output_features, outpu
         
         # Plot each trial
         for trial in range(num_trials):
+            # Get genotype for this trial if available
+            trial_genotype = "Unknown"
+            if df is not None and test_trials is not None and trial < len(test_trials):
+                trial_idx = test_trials[trial]
+                start_idx = trial_idx * frames_per_trial
+                if 'genotype' in df.columns:
+                    trial_genotype = df.iloc[start_idx]['genotype']
+            
             # Create a figure with subplots for each feature
             fig = plt.figure(figsize=(15, 10))
-            plt.suptitle(f'Trial {trial + 1} Predictions', fontsize=16, y=0.95)
+            plt.suptitle(f'Trial {trial + 1} - Genotype: {trial_genotype}', fontsize=16, y=0.95)
             
             # Calculate number of rows and columns for subplots
             n_features = len(output_features)
@@ -1066,25 +1074,13 @@ def evaluate_model(model, test_loader, criterion, device, output_features, outpu
                 # Set default frame range
                 frame_range = np.arange(400, 400 + len(trial_pred))
                 
-                # Get genotype info if available
-                if df is not None and test_trials is not None and trial < len(test_trials):
-                    trial_idx = test_trials[trial]
-                    start_idx = trial_idx * frames_per_trial
-                    if 'genotype' in df.columns:
-                        trial_genotype = df.iloc[start_idx]['genotype']
-                        
-                        # Set appropriate frame range based on genotype
-                        if trial_genotype == 'ES':
-                            frame_start = 50  # ES data: 0-650, but first 50 frames used for sequence
-                            frame_range = np.arange(frame_start, frame_start + len(trial_pred))
-                        
-                        # Store trial info
-                        trial_predictions_data[f'trial_{trial}'] = {
-                            'predictions': trial_pred,
-                            'targets': trial_target,
-                            'frames': frame_range,
-                            'genotype': trial_genotype
-                        }
+                # Store trial info
+                trial_predictions_data[f'trial_{trial}'] = {
+                    'predictions': trial_pred,
+                    'targets': trial_target,
+                    'frames': frame_range,
+                    'genotype': trial_genotype
+                }
                 
                 # Plot predictions and targets
                 ax.plot(frame_range, trial_target, 'b-', label='Actual', alpha=0.7)
