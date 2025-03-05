@@ -20,81 +20,40 @@ from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from matplotlib.backends.backend_pdf import PdfPages
 from scipy import signal
 
-class SequenceDataset(Dataset):
-    def __init__(self, X, y, sequence_length=50):
-        """Initialize sequence dataset.
-        
-        Args:
-            X: Input features array
-            y: Target values array
-            sequence_length: Length of sequence needed for prediction
-        """
+class TrialAwareSequenceDataset(Dataset):
+    def __init__(self, X, y, sequence_length, frames_per_trial):
+        # Explicitly cast to float32 to match PyTorch's expected type
         self.X = np.asarray(X, dtype=np.float32)
         self.y = np.asarray(y, dtype=np.float32)
         self.sequence_length = sequence_length
+        self.frames_per_trial = frames_per_trial
+        self.valid_indices = self._get_valid_indices()
         
-        # Get trial information from the data
-        self.trial_info = []  # List of (start_idx, end_idx) for each trial
-        current_pos = 0
+    def _get_valid_indices(self):
+        """Get indices that don't cross trial boundaries."""
+        valid_indices = []
+        num_trials = len(self.X) // self.frames_per_trial
         
-        while current_pos < len(self.X):
-            # Check if we have enough data for a trial (either 600 or 650 frames)
-            if current_pos + 600 <= len(self.X):
-                # Check the next chunk of data to determine if it's ES (600) or regular (650)
-                if current_pos + 650 <= len(self.X):
-                    # Check if the next 50 frames after 600 contain valid data
-                    next_chunk = self.X[current_pos + 600:current_pos + 650]
-                    if not np.all(np.isnan(next_chunk)):
-                        # This is a regular trial (650 frames)
-                        self.trial_info.append((current_pos, current_pos + 650))
-                        current_pos += 650
-                        continue
-                
-                # This is an ES trial (600 frames) or we're at the end
-                self.trial_info.append((current_pos, current_pos + 600))
-                current_pos += 600
-            else:
-                break
+        for trial in range(num_trials):
+            start = trial * self.frames_per_trial
+            end = (trial + 1) * self.frames_per_trial - self.sequence_length
+            
+            # Add all valid starting indices for this trial
+            valid_indices.extend(range(start, end + 1))
+            
+        return valid_indices
         
-        print(f"\nSequenceDataset initialized:")
-        print(f"Number of trials: {len(self.trial_info)}")
-        print(f"Sequence length: {sequence_length}")
-        print(f"Total sequences possible: {self.__len__()}")
-    
     def __len__(self):
-        """Return total number of sequences we can create."""
-        total_sequences = 0
-        for start_idx, end_idx in self.trial_info:
-            trial_length = end_idx - start_idx
-            total_sequences += trial_length - self.sequence_length + 1
-        return total_sequences
-    
+        return len(self.valid_indices)
+        
     def __getitem__(self, idx):
-        """Get a sequence and its target.
+        # Get the actual index from our valid indices list
+        start_idx = self.valid_indices[idx]
+        X_seq = self.X[start_idx:start_idx + self.sequence_length]
+        y_target = self.y[start_idx + self.sequence_length - 1]
         
-        Args:
-            idx: Index of the sequence to get
-        
-        Returns:
-            sequence: Input sequence of shape (sequence_length, num_features)
-            target: Target value for the last frame in sequence
-        """
-        # Find which trial this index belongs to
-        current_idx = idx
-        for trial_start, trial_end in self.trial_info:
-            trial_length = trial_end - trial_start
-            num_sequences = trial_length - self.sequence_length + 1
-            
-            if current_idx < num_sequences:
-                # This sequence belongs to this trial
-                sequence_start = trial_start + current_idx
-                sequence_end = sequence_start + self.sequence_length
-                return (torch.FloatTensor(self.X[sequence_start:sequence_end]),
-                       torch.FloatTensor(self.y[sequence_end - 1]))
-            
-            current_idx -= num_sequences
-        
-        raise IndexError("Sequence index out of range")
+        # Convert to PyTorch tensors with explicit float32 type
+        return torch.FloatTensor(X_seq), torch.FloatTensor(y_target)
 
 class LSTMPredictor(nn.Module):
     """LSTM model for predicting joint angles from velocity features."""
@@ -833,9 +792,9 @@ def prepare_data(data_path, input_features, output_features, sequence_length):
     y_test = y_scaler.transform(y[test_mask])
     
     # Create sequence datasets
-    train_dataset = SequenceDataset(X_train, y_train, sequence_length)
-    val_dataset = SequenceDataset(X_val, y_val, sequence_length)
-    test_dataset = SequenceDataset(X_test, y_test, sequence_length)
+    train_dataset = TrialAwareSequenceDataset(X_train, y_train, sequence_length, frames_per_trial)
+    val_dataset = TrialAwareSequenceDataset(X_val, y_val, sequence_length, frames_per_trial)
+    test_dataset = TrialAwareSequenceDataset(X_test, y_test, sequence_length, frames_per_trial)
     
     # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
@@ -908,155 +867,143 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
 def evaluate_model(model, test_loader, criterion, device, output_features, output_scaler, save_dir, df=None, test_trials=None):
     """Evaluate the trained model."""
     model.eval()
+    
+    # Track the correct frames corresponding to each prediction
     all_predictions = []
     all_targets = []
+    sequence_indices = []  # Track which frame each prediction corresponds to
     
+    # Collect predictions and their corresponding target indices
     with torch.no_grad():
-        for inputs, targets in test_loader:
+        for batch_idx, (inputs, targets) in enumerate(test_loader):
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = model(inputs)
+            
+            # Store predictions and targets
             all_predictions.append(outputs.cpu().numpy())
             all_targets.append(targets.cpu().numpy())
+            
+            # Get valid indices for this batch
+            if hasattr(test_loader.dataset, 'valid_indices'):
+                # For TrialAwareSequenceDataset
+                batch_size = inputs.shape[0]
+                batch_start = batch_idx * batch_size
+                # Get the actual indices these predictions correspond to
+                for i in range(min(batch_size, len(test_loader.dataset.valid_indices) - batch_start)):
+                    sequence_indices.append(test_loader.dataset.valid_indices[batch_start + i])
     
-    # Concatenate all batches
-    predictions = np.concatenate(all_predictions)
-    targets = np.concatenate(all_targets)
+    # Convert to numpy arrays
+    predictions = np.vstack(all_predictions)
+    targets = np.vstack(all_targets)
+    sequence_indices = np.array(sequence_indices)
     
-    # Print shapes for debugging
-    print(f"\nRaw predictions shape: {predictions.shape}")
-    print(f"Raw targets shape: {targets.shape}")
+    # Inverse transform to get original units
+    predictions_original = output_scaler.inverse_transform(predictions)
+    targets_original = output_scaler.inverse_transform(targets)
     
-    # Calculate the actual number of trials based on the data size
-    # Each trial should have 600 frames (frames 400-1000)
-    frames_per_trial = 600
-    num_trials = len(predictions) // frames_per_trial
+    # Get frame indices for each prediction
+    sequence_length = test_loader.dataset.sequence_length
+    frames_per_trial = test_loader.dataset.frames_per_trial
     
-    # Ensure we have complete trials
-    total_frames = num_trials * frames_per_trial
-    predictions = predictions[:total_frames]
-    targets = targets[:total_frames]
+    # Map predictions to their correct trial and frame
+    frame_mapped_predictions = {}
+    frame_mapped_targets = {}
     
-    print(f"\nReshaping arrays:")
-    print(f"Number of trials: {num_trials}")
-    print(f"Frames per trial: {frames_per_trial}")
-    print(f"Total frames to use: {total_frames}")
-    
-    # Reshape predictions and targets
-    try:
-        predictions = predictions.reshape(num_trials, frames_per_trial, -1)
-        targets = targets.reshape(num_trials, frames_per_trial, -1)
-        print(f"Successfully reshaped arrays to: {predictions.shape}")
-    except ValueError as e:
-        print(f"Error reshaping arrays: {e}")
-        print(f"Predictions size: {predictions.size}")
-        print(f"Target shape: {targets.shape}")
-        raise
-    
-    # Inverse transform predictions and targets
-    predictions_original = output_scaler.inverse_transform(predictions.reshape(-1, predictions.shape[-1]))
-    targets_original = output_scaler.inverse_transform(targets.reshape(-1, targets.shape[-1]))
-    
-    # Reshape back to (num_trials, frames_per_trial, num_features)
-    predictions_original = predictions_original.reshape(predictions.shape)
-    targets_original = targets_original.reshape(targets.shape)
-    
-    # Initialize dictionary to store trial predictions
-    trial_predictions_data = {}
-    
-    # Save predictions and targets in NPZ file
-    predictions_dir = save_dir / 'predictions'
-    predictions_dir.mkdir(exist_ok=True, parents=True)
-    
-    # Create genotype array that matches the shape of predictions
-    genotype_info = []
-    
-    # If we have dataframe and test trials info, add genotype info
+    # Create dictionary of test trials for tracking
+    test_trial_metadata = {}
     if df is not None and test_trials is not None:
-        for trial in range(num_trials):
-            # Get genotype for this trial
-            trial_idx = test_trials[trial]
-            start_idx = trial_idx * frames_per_trial
-            trial_genotype = df.iloc[start_idx]['genotype']
-            genotype_info.append(trial_genotype)
+        for i, trial_idx in enumerate(test_trials):
+            trial_start = trial_idx * frames_per_trial
+            if 'genotype' in df.columns:
+                genotype = df.iloc[trial_start]['genotype']
+                test_trial_metadata[i] = {
+                    'genotype': genotype,
+                    'original_idx': trial_idx
+                }
+    
+    # For each prediction, determine which trial and frame it belongs to
+    for i, seq_idx in enumerate(sequence_indices):
+        if i >= len(predictions_original):
+            # Skip if we've run out of predictions
+            continue
+            
+        # Which trial does this belong to?
+        trial_idx = seq_idx // frames_per_trial
+        # Which frame within the trial?
+        frame_in_trial = (seq_idx % frames_per_trial) + sequence_length
         
-        # Save with genotype information
-        np.savez(
-            predictions_dir / 'trial_predictions.npz',
-            predictions=predictions_original,
-            targets=targets_original,
-            output_features=output_features,
-            frames=np.arange(400, 1000),
-            genotypes=genotype_info
-        )
-    else:
-        # Save without genotype info if DataFrame not available
-        np.savez(
-            predictions_dir / 'trial_predictions.npz',
-            predictions=predictions_original,
-            targets=targets_original,
-            output_features=output_features,
-            frames=np.arange(400, 1000)
-        )
+        # Skip if we're past the end of a trial
+        if frame_in_trial >= frames_per_trial:
+            continue
+            
+        # Initialize trial data if needed
+        if trial_idx not in frame_mapped_predictions:
+            frame_mapped_predictions[trial_idx] = {}
+            frame_mapped_targets[trial_idx] = {}
+            
+        # Store this prediction with its correct frame index
+        for j, feature in enumerate(output_features):
+            if feature not in frame_mapped_predictions[trial_idx]:
+                frame_mapped_predictions[trial_idx][feature] = np.zeros(frames_per_trial) * np.nan
+                frame_mapped_targets[trial_idx][feature] = np.zeros(frames_per_trial) * np.nan
+                
+            # Store at the correct frame location
+            frame_mapped_predictions[trial_idx][feature][frame_in_trial] = predictions_original[i, j]
+            frame_mapped_targets[trial_idx][feature][frame_in_trial] = targets_original[i, j]
     
-    print(f"\nSaved predictions to: {predictions_dir / 'trial_predictions.npz'}")
-    
-    # Calculate metrics for each feature
+    # Create metrics dictionary
     metrics = {}
     for i, feature in enumerate(output_features):
-        # Calculate MAE and RMSE
-        mae = float(np.mean(np.abs(predictions_original[:, :, i] - targets_original[:, :, i])))
-        rmse = float(np.sqrt(np.mean((predictions_original[:, :, i] - targets_original[:, :, i])**2)))
-        r2 = float(1 - np.sum((targets_original[:, :, i] - predictions_original[:, :, i])**2) / np.sum((targets_original[:, :, i] - targets_original[:, :, i].mean())**2))
+        # Filter out NaN values when calculating metrics
+        valid_predictions = []
+        valid_targets = []
         
-        metrics[feature] = {
-            'mae': mae,
-            'rmse': rmse,
-            'r2': r2
-        }
+        for trial_idx in frame_mapped_predictions:
+            if feature in frame_mapped_predictions[trial_idx]:
+                trial_preds = frame_mapped_predictions[trial_idx][feature]
+                trial_targets = frame_mapped_targets[trial_idx][feature]
+                
+                # Only include points where both pred and target are not NaN
+                valid_mask = ~np.isnan(trial_preds) & ~np.isnan(trial_targets)
+                valid_predictions.extend(trial_preds[valid_mask])
+                valid_targets.extend(trial_targets[valid_mask])
+        
+        # Convert to numpy arrays
+        valid_predictions = np.array(valid_predictions)
+        valid_targets = np.array(valid_targets)
+        
+        # Calculate metrics
+        if len(valid_predictions) > 0:
+            mae = float(np.mean(np.abs(valid_predictions - valid_targets)))
+            rmse = float(np.sqrt(np.mean((valid_predictions - valid_targets)**2)))
+            
+            metrics[feature] = {
+                'mae': mae,
+                'rmse': rmse
+            }
     
     # Save metrics to JSON
     metrics_file = save_dir / 'metrics.json'
     with open(metrics_file, 'w') as f:
         json.dump(metrics, f, indent=4)
     
-    # Create plots directory
-    plots_dir = save_dir / 'plots'
-    plots_dir.mkdir(exist_ok=True)
+    # Plot each trial with correct frame alignment
+    predictions_dir = save_dir / 'predictions'
+    predictions_dir.mkdir(exist_ok=True, parents=True)
     
-    # Create PDF for all predictions
-    with PdfPages(plots_dir / 'predictions.pdf') as pdf:
-        # First page: Summary metrics
-        plt.figure(figsize=(12, 8))
-        plt.axis('off')
-        plt.text(0.1, 0.95, 'Model Prediction Summary', fontsize=16, fontweight='bold')
-        
-        y_pos = 0.85
-        for feature, feature_metrics in metrics.items():
-            plt.text(0.1, y_pos, f"\n{feature}:", fontsize=12, fontweight='bold')
-            y_pos -= 0.05
-            plt.text(0.1, y_pos, f"  MAE: {feature_metrics['mae']:.4f}°")
-            y_pos -= 0.03
-            plt.text(0.1, y_pos, f"  RMSE: {feature_metrics['rmse']:.4f}°")
-            y_pos -= 0.03
-            plt.text(0.1, y_pos, f"  R²: {feature_metrics['r2']:.4f}")
-            y_pos -= 0.05
-        
-        pdf.savefig()
-        plt.close()
-        
+    # Create PDF for predictions
+    pdf_path = predictions_dir / 'trial_predictions.pdf'
+    with PdfPages(pdf_path) as pdf:
         # Plot each trial
-        for trial in range(num_trials):
+        for trial_idx in sorted(frame_mapped_predictions.keys()):
             # Get genotype for this trial if available
             trial_genotype = "Unknown"
-            if df is not None and test_trials is not None and trial < len(test_trials):
-                trial_idx = test_trials[trial]
-                start_idx = trial_idx * frames_per_trial
-                if 'genotype' in df.columns:
-                    trial_genotype = df.iloc[start_idx]['genotype']
+            if trial_idx in test_trial_metadata:
+                trial_genotype = test_trial_metadata[trial_idx].get('genotype', "Unknown")
             
             # Create a figure with subplots for each feature
             fig = plt.figure(figsize=(15, 10))
-            plt.suptitle(f'Trial {trial + 1} - Genotype: {trial_genotype}', fontsize=16, y=0.95)
+            plt.suptitle(f'Trial {trial_idx} - Genotype: {trial_genotype}', fontsize=16, y=0.95)
             
             # Calculate number of rows and columns for subplots
             n_features = len(output_features)
@@ -1067,31 +1014,38 @@ def evaluate_model(model, test_loader, criterion, device, output_features, outpu
             for i, feature in enumerate(output_features):
                 ax = plt.subplot(n_rows, n_cols, i + 1)
                 
-                # Get predictions and targets for this trial and feature
-                trial_pred = predictions_original[trial, :, i]
-                trial_target = targets_original[trial, :, i]
+                if feature in frame_mapped_predictions[trial_idx]:
+                    # Get predictions and targets for this trial and feature
+                    trial_pred = frame_mapped_predictions[trial_idx][feature]
+                    trial_target = frame_mapped_targets[trial_idx][feature]
+                    
+                    # Set appropriate frame range based on genotype
+                    if trial_genotype == 'ES':
+                        frame_start = 0
+                    else:  # Regular genotypes
+                        frame_start = 350
+                    
+                    # Create frame range
+                    frames = np.arange(frame_start, frame_start + frames_per_trial)
+                    
+                    # Plot predictions and targets
+                    ax.plot(frames, trial_target, 'b-', label='Actual', alpha=0.7)
+                    ax.plot(frames, trial_pred, 'r-', label='Predicted', alpha=0.7)
+                    
+                    # Add shaded region for sequence_length (indicating prediction window)
+                    ax.axvspan(frame_start, frame_start + sequence_length, 
+                               color='gray', alpha=0.1, label='Initial window')
+                    
+                    # Calculate trial-specific metrics (excluding NaNs)
+                    valid_mask = ~np.isnan(trial_pred) & ~np.isnan(trial_target)
+                    if np.sum(valid_mask) > 0:
+                        mae = np.mean(np.abs(trial_pred[valid_mask] - trial_target[valid_mask]))
+                        rmse = np.sqrt(np.mean((trial_pred[valid_mask] - trial_target[valid_mask])**2))
+                        
+                        ax.set_title(f'{feature}\nMAE: {mae:.2f}°, RMSE: {rmse:.2f}°')
+                    else:
+                        ax.set_title(f'{feature}\nNo valid predictions')
                 
-                # Set default frame range
-                frame_range = np.arange(400, 400 + len(trial_pred))
-                
-                # Store trial info
-                trial_predictions_data[f'trial_{trial}'] = {
-                    'predictions': trial_pred,
-                    'targets': trial_target,
-                    'frames': frame_range,
-                    'genotype': trial_genotype
-                }
-                
-                # Plot predictions and targets
-                ax.plot(frame_range, trial_target, 'b-', label='Actual', alpha=0.7)
-                ax.plot(frame_range, trial_pred, 'r-', label='Predicted', alpha=0.7)
-                
-                # Calculate trial-specific metrics
-                mae = np.mean(np.abs(trial_pred - trial_target))
-                rmse = np.sqrt(np.mean((trial_pred - trial_target)**2))
-                r2 = 1 - np.sum((trial_target - trial_pred)**2) / np.sum((trial_target - trial_target.mean())**2)
-                
-                ax.set_title(f'{feature}\nMAE: {mae:.2f}°, RMSE: {rmse:.2f}°, R²: {r2:.3f}')
                 ax.set_xlabel('Frame')
                 ax.set_ylabel('Angle (degrees)')
                 ax.legend()
@@ -1100,12 +1054,21 @@ def evaluate_model(model, test_loader, criterion, device, output_features, outpu
             plt.tight_layout(rect=[0, 0.03, 1, 0.95])
             pdf.savefig(fig)
             plt.close()
-            
-            # Print progress
-            if (trial + 1) % 10 == 0:
-                print(f"Processed {trial + 1}/{num_trials} trials")
     
-    print(f"\nPrediction plots saved to: {plots_dir / 'predictions.pdf'}")
+    # Save trial predictions with correct frame alignment
+    np.savez(
+        predictions_dir / 'trial_predictions.npz',
+        predictions=frame_mapped_predictions,
+        targets=frame_mapped_targets,
+        output_features=output_features,
+        frames_per_trial=frames_per_trial,
+        sequence_length=sequence_length,
+        test_trial_metadata=test_trial_metadata
+    )
+    
+    print(f"\nSaved predictions to: {predictions_dir / 'trial_predictions.pdf'}")
+    print(f"Saved metrics to: {metrics_file}")
+    
     return metrics
 
 def objective(trial, data_loaders, input_features, output_features, device, leg_prefix):
