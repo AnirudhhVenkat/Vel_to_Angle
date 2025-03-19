@@ -3,7 +3,12 @@ import torch.nn as nn
 import numpy as np
 
 class DerivativeLoss(nn.Module):
-    """Loss function that penalizes differences in derivatives (rate of change)"""
+    """
+    Loss function that combines absolute error with derivative error.
+    
+    This loss encourages both accurate predictions and smooth transitions
+    between consecutive predictions.
+    """
     def __init__(self, alpha=0.5):
         """
         Args:
@@ -13,14 +18,16 @@ class DerivativeLoss(nn.Module):
         super(DerivativeLoss, self).__init__()
         self.alpha = alpha
         self.mae = nn.L1Loss()
+        self.prev_pred = None
+        self.prev_target = None
     
     def forward(self, pred, target):
         """
         Calculate combined loss of MAE and derivative matching
         
         Args:
-            pred (torch.Tensor): Predicted values [batch, sequence_len, features]
-            target (torch.Tensor): Target values [batch, sequence_len, features]
+            pred (torch.Tensor): Predicted values [batch_size, features]
+            target (torch.Tensor): Target values [batch_size, features]
             
         Returns:
             torch.Tensor: Combined loss value
@@ -28,17 +35,33 @@ class DerivativeLoss(nn.Module):
         # Calculate standard MAE loss
         mae_loss = self.mae(pred, target)
         
-        # Calculate derivatives (differences between consecutive timesteps)
-        pred_diff = pred[:, 1:] - pred[:, :-1]
-        target_diff = target[:, 1:] - target[:, :-1]
+        # For the first batch, we can't calculate derivatives
+        if self.prev_pred is None or self.prev_target is None:
+            self.prev_pred = pred.detach().clone()
+            self.prev_target = target.detach().clone()
+            return mae_loss
         
-        # Calculate MAE of derivatives
+        # Check if batch sizes match
+        if pred.size(0) != self.prev_pred.size(0):
+            # If batch sizes don't match, just use MAE loss and update previous values
+            self.prev_pred = pred.detach().clone()
+            self.prev_target = target.detach().clone()
+            return mae_loss
+        
+        # Calculate derivative loss using current and previous predictions
+        pred_diff = pred - self.prev_pred
+        target_diff = target - self.prev_target
+        
         derivative_loss = self.mae(pred_diff, target_diff)
         
-        # Combine losses
-        total_loss = (1 - self.alpha) * mae_loss + self.alpha * derivative_loss
+        # Update previous values for next iteration
+        self.prev_pred = pred.detach().clone()
+        self.prev_target = target.detach().clone()
         
-        return total_loss
+        # Combine the losses
+        combined_loss = (1 - self.alpha) * mae_loss + self.alpha * derivative_loss
+        
+        return combined_loss
 
 class WeightedMAELoss(nn.Module):
     """MAE loss with optional feature weights"""

@@ -19,41 +19,38 @@ import traceback
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from matplotlib.backends.backend_pdf import PdfPages
 from scipy import signal
+import random
+from losses import DerivativeLoss
+import os
 
-class TrialAwareSequenceDataset(Dataset):
-    def __init__(self, X, y, sequence_length, frames_per_trial):
-        # Explicitly cast to float32 to match PyTorch's expected type
-        self.X = np.asarray(X, dtype=np.float32)
-        self.y = np.asarray(y, dtype=np.float32)
-        self.sequence_length = sequence_length
-        self.frames_per_trial = frames_per_trial
-        self.valid_indices = self._get_valid_indices()
-        
-    def _get_valid_indices(self):
-        """Get indices that don't cross trial boundaries."""
-        valid_indices = []
-        num_trials = len(self.X) // self.frames_per_trial
-        
-        for trial in range(num_trials):
-            start = trial * self.frames_per_trial
-            end = (trial + 1) * self.frames_per_trial - self.sequence_length
-            
-            # Add all valid starting indices for this trial
-            valid_indices.extend(range(start, end + 1))
-            
-        return valid_indices
-        
-    def __len__(self):
-        return len(self.valid_indices)
-        
-    def __getitem__(self, idx):
-        # Get the actual index from our valid indices list
-        start_idx = self.valid_indices[idx]
-        X_seq = self.X[start_idx:start_idx + self.sequence_length]
-        y_target = self.y[start_idx + self.sequence_length - 1]
-        
-        # Convert to PyTorch tensors with explicit float32 type
-        return torch.FloatTensor(X_seq), torch.FloatTensor(y_target)
+# Import functions from data.py
+from data import (
+    set_all_seeds,
+    TrialAwareSequenceDataset,
+    TrialSampler,
+    ZScoreScaler,
+    filter_trial_frames,
+    calculate_enhanced_features,
+    get_available_data_path,
+    calculate_psd_features,
+    add_psd_features,
+    prepare_data,
+)
+
+# Set seed for all random operations
+def set_all_seeds(seed=42):
+    """Set seeds for all random number generators for reproducibility."""
+    random.seed(seed)  
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"All random seeds set to {seed}")
+
+# Call the function at the beginning
+set_all_seeds(42)
 
 class LSTMPredictor(nn.Module):
     """LSTM model for predicting joint angles from velocity features."""
@@ -102,709 +99,10 @@ class LSTMPredictor(nn.Module):
         
         return out
 
-class ZScoreScaler:
-    """Z-score normalization scaler"""
-    def __init__(self, means=None, stds=None, feature_names=None):
-        self.means = means
-        self.stds = stds
-        self.feature_names = feature_names
-    
-    def fit(self, X):
-        """Fit the scaler to the data."""
-        if isinstance(X, pd.DataFrame):
-            self.feature_names = X.columns.tolist()
-            X = X.values
-        
-        self.means = np.mean(X, axis=0)
-        self.stds = np.std(X, axis=0)
-        # Handle constant features
-        self.stds[self.stds == 0] = 1
-        return self
-    
-    def transform(self, X):
-        """Transform the data."""
-        if isinstance(X, pd.DataFrame):
-            X = X.values
-        return (X - self.means) / self.stds
-    
-    def fit_transform(self, X):
-        """Fit to data, then transform it."""
-        return self.fit(X).transform(X)
-    
-    def inverse_transform(self, X):
-        """Convert back to original scale."""
-        if isinstance(X, pd.DataFrame):
-            X = X.values
-        return X * self.stds + self.means
 
-def filter_trial_frames(X, y, sequence_length):
-    """Filter frames to include context before frame 400."""
-    context_frames = sequence_length - 1
-    start_frame = 400 - context_frames
-    end_frame = 1000
-    original_trial_size = 1400
-    filtered_trial_size = end_frame - start_frame + 1  # Include end frame
-    
-    filtered_X = []
-    filtered_y = []
-    
-    # Process each trial
-    num_trials = len(X) // original_trial_size
-    print(f"\nProcessing {num_trials} trials:")
-    print(f"Original trial size: {original_trial_size}")
-    print(f"Start frame (with context): {start_frame}")
-    print(f"End frame: {end_frame}")
-    print(f"Context frames needed: {context_frames}")
-    print(f"Filtered trial size: {filtered_trial_size}")
-    
-    for trial in range(num_trials):
-        trial_start = trial * original_trial_size
-        trial_end = (trial + 1) * original_trial_size
-        
-        # Extract trial data
-        trial_X = X[trial_start:trial_end]
-        trial_y = y[trial_start:trial_end]
-        
-        # Extract frames from start_frame to end_frame (inclusive)
-        filtered_trial_X = trial_X[start_frame:end_frame + 1]  # +1 to include end frame
-        filtered_trial_y = trial_y[start_frame:end_frame + 1]  # +1 to include end frame
-        
-        filtered_X.append(filtered_trial_X)
-        filtered_y.append(filtered_trial_y)
-    
-    # Combine all trials
-    filtered_X = np.concatenate(filtered_X)
-    filtered_y = np.concatenate(filtered_y)
-    
-    print(f"\nFiltered data shapes:")
-    print(f"X: {filtered_X.shape}")
-    print(f"y: {filtered_y.shape}")
-    
-    return filtered_X, filtered_y
-
-def calculate_enhanced_features(df, trial_size=1400):
-    """Calculate enhanced features including lagged velocities and moving averages."""
-    # Initialize features dictionary
-    features_dict = {}
-    
-    # Original velocities
-    features_dict['x_vel'] = df['x_vel'].values
-    features_dict['y_vel'] = df['y_vel'].values
-    features_dict['z_vel'] = df['z_vel'].values
-    
-    # Calculate number of trials
-    num_trials = len(df) // trial_size
-    print(f"\nCalculating enhanced features for {num_trials} trials")
-    
-    # Add lagged velocities (both positive and negative lags)
-    lag_values = [1, 2, 3, 5, 10, 20]  # Different lag amounts
-    
-    # Pre-compute velocity arrays
-    vel_arrays = {
-        'x': df['x_vel'].values,
-        'y': df['y_vel'].values,
-        'z': df['z_vel'].values
-    }
-    
-    for lag in lag_values:
-        for coord in ['x', 'y', 'z']:
-            # Forward lags (future values)
-            vel_arr = np.roll(vel_arrays[coord], -lag)
-            features_dict[f'{coord}_vel_lag_plus_{lag}'] = vel_arr
-            
-            # Backward lags (past values)
-            vel_arr = np.roll(vel_arrays[coord], lag)
-            features_dict[f'{coord}_vel_lag_minus_{lag}'] = vel_arr
-    
-    # Calculate moving averages
-    windows = [5, 10, 20]
-    for window in windows:
-        for coord in ['x', 'y', 'z']:
-            # Velocity moving averages
-            ma_vel = pd.Series(vel_arrays[coord]).rolling(window=window, center=True).mean().values
-            features_dict[f'{coord}_vel_ma{window}'] = ma_vel
-    
-    # Calculate derived velocities
-    features_dict['velocity_magnitude'] = np.sqrt(
-        vel_arrays['x']**2 + vel_arrays['y']**2 + vel_arrays['z']**2
-    )
-    
-    features_dict['xy_velocity'] = np.sqrt(vel_arrays['x']**2 + vel_arrays['y']**2)
-    features_dict['xz_velocity'] = np.sqrt(vel_arrays['x']**2 + vel_arrays['z']**2)
-    
-    # Calculate accelerations using central difference
-    dt = 1/200  # 200Hz sampling rate
-    for coord in ['x', 'y', 'z']:
-        acc = np.zeros_like(vel_arrays[coord])
-        acc[1:-1] = (vel_arrays[coord][2:] - vel_arrays[coord][:-2]) / (2 * dt)
-        features_dict[f'{coord}_acc'] = acc
-    
-    # Calculate total acceleration magnitude
-    features_dict['acceleration_magnitude'] = np.sqrt(
-        features_dict['x_acc']**2 + 
-        features_dict['y_acc']**2 + 
-        features_dict['z_acc']**2
-    )
-    
-    # Calculate jerk (derivative of acceleration)
-    jerk = np.zeros_like(features_dict['acceleration_magnitude'])
-    jerk[1:-1] = (features_dict['acceleration_magnitude'][2:] - 
-                  features_dict['acceleration_magnitude'][:-2]) / (2 * dt)
-    features_dict['jerk_magnitude'] = jerk
-    
-    # Create DataFrame from dictionary all at once to avoid fragmentation
-    features = pd.DataFrame(features_dict)
-    
-    # Handle NaN values at trial boundaries
-    for trial in range(num_trials):
-        start_idx = trial * trial_size
-        end_idx = (trial + 1) * trial_size
-        features.iloc[start_idx:end_idx] = features.iloc[start_idx:end_idx].ffill().bfill()
-    
-    print(f"Enhanced features shape: {features.shape}")
-    return features
-
-def get_available_data_path(genotype):
-    """Try multiple possible data paths and return the first available one based on genotype."""
-    if genotype == 'ES':
-        possible_paths = [
-            r"Z:\Divya\TEMP_transfers\toAni\4_StopProjectData_forES\df_preproc_fly_centric.parquet"
-        ]
-    else:
-        possible_paths = [
-            "Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv",  # Network drive path
-            "/Users/anivenkat/Downloads/BPN_P9LT_P9RT_flyCoords.csv",      # Local Mac path
-            "C:/Users/bidayelab/Downloads/BPN_P9LT_P9RT_flyCoords.csv"     # Local Windows path
-        ]
-    
-    for path in possible_paths:
-        if Path(path).exists():
-            print(f"Using data file: {path}")
-            return path
-    
-    raise FileNotFoundError(f"Could not find the data file for genotype {genotype}")
-
-def calculate_psd_features(data, fs=200):
-    """
-    Calculate power spectral density features for velocity data up to Nyquist frequency.
-    
-    Args:
-        data (numpy.ndarray): Time series data
-        fs (int): Sampling frequency in Hz
-        
-    Returns:
-        dict: Dictionary containing PSD features
-    """
-    # Calculate PSD using Welch's method up to Nyquist frequency (fs/2 = 100 Hz)
-    frequencies, psd = signal.welch(data, fs=fs, nperseg=fs)
-    
-    # Calculate features from PSD
-    total_power = np.sum(psd)
-    peak_frequency = frequencies[np.argmax(psd)]
-    mean_frequency = np.sum(frequencies * psd) / total_power
-    
-    # Calculate power in different frequency bands
-    # More granular frequency bands up to 200 Hz
-    bands = {
-        'very_low': (0, 10),    # 0-10 Hz: Very slow movements
-        'low': (10, 30),        # 10-30 Hz: Slow movements
-        'medium': (30, 60),     # 30-60 Hz: Medium speed movements
-        'high': (60, 100),      # 60-100 Hz: Fast movements
-        'very_high': (100, 200) # 100-200 Hz: Very fast movements/noise
-    }
-    
-    def get_band_power(band):
-        mask = (frequencies >= band[0]) & (frequencies < band[1])
-        return np.sum(psd[mask])
-    
-    # Calculate power in each band
-    band_powers = {
-        f'{band_name}_power': get_band_power(freq_range)
-        for band_name, freq_range in bands.items()
-    }
-    
-    # Calculate relative power (percentage of total power in each band)
-    relative_powers = {
-        f'{band_name}_relative_power': power / total_power
-        for band_name, power in band_powers.items()
-    }
-    
-    # Combine all features
-    features = {
-        'total_power': total_power,
-        'peak_freq': peak_frequency,
-        'mean_freq': mean_frequency,
-        **band_powers,
-        **relative_powers
-    }
-    
-    return features
-
-def filter_es_data_by_genotype(df, target_genotype="ES"):
-    """
-    Filter the ES parquet data to only include rows with genotype 'ES'.
-    
-    Args:
-        df: DataFrame loaded from the parquet file
-        target_genotype: The target genotype to filter for (default: 'ES')
-        
-    Returns:
-        Filtered DataFrame
-    """
-    print(f"Filtering ES data for genotype: {target_genotype}")
-    print(f"Original data shape: {df.shape}")
-    
-    # Check if genotype column exists
-    if 'genotype' in df.columns:
-        # Check what unique genotypes exist
-        unique_genotypes = df['genotype'].unique()
-        print(f"Found genotypes in data: {unique_genotypes}")
-        
-        # Check if our target genotype exists
-        if target_genotype in unique_genotypes:
-            # Filter to only keep rows with target genotype
-            filtered_df = df[df['genotype'] == target_genotype]
-            print(f"After filtering for {target_genotype}: {filtered_df.shape} rows")
-            return filtered_df
-        else:
-            print(f"WARNING: {target_genotype} not found in genotypes. Available: {unique_genotypes}")
-            
-            # If there's only one genotype, assume it's equivalent to ES
-            if len(unique_genotypes) == 1:
-                print(f"Using the only available genotype: {unique_genotypes[0]}")
-                return df
-            
-            # If there are multiple genotypes but not ES, ask for guidance
-            print(f"Multiple genotypes found, but no '{target_genotype}'. Please specify which to use.")
-            return df  # Return unfiltered for now with warning
-    else:
-        print(f"WARNING: No 'genotype' column found in data. Columns: {df.columns.tolist()}")
-    
-    # If we get here, we couldn't filter by genotype
-    print("Could not filter by genotype. Using all data.")
-    return df
-
-def add_psd_features(df, base_velocities=None):
-    """Add power spectral density features efficiently to avoid fragmentation."""
-    print("Calculating power spectral density features...")
-    
-    if base_velocities is None:
-        base_velocities = ['x_vel', 'y_vel', 'z_vel']
-    
-    bands = {
-        'very_low': (0, 10),    # 0-10 Hz: Very slow movements
-        'low': (10, 30),        # 10-30 Hz: Slow movements
-        'medium': (30, 60),     # 30-60 Hz: Medium speed movements
-        'high': (60, 100),      # 60-100 Hz: Fast movements
-        'very_high': (100, 200) # 100-200 Hz: Very fast movements/noise
-    }
-    
-    # Create a dictionary to hold all new columns
-    new_columns = {}
-    
-    # Initialize all new columns at once
-    for vel in base_velocities:
-        # Basic PSD features
-        new_columns[f'{vel}_total_power'] = np.zeros(len(df))
-        new_columns[f'{vel}_peak_freq'] = np.zeros(len(df))
-        new_columns[f'{vel}_mean_freq'] = np.zeros(len(df))
-        
-        # Band power features
-        for band_name in bands.keys():
-            new_columns[f'{vel}_{band_name}_power'] = np.zeros(len(df))
-            new_columns[f'{vel}_{band_name}_relative_power'] = np.zeros(len(df))
-    
-    # Calculate frames per trial
-    frames_per_trial = 650  # All trials are now 650 frames
-    num_filtered_trials = len(df) // frames_per_trial
-    
-    # Calculate PSD features for each velocity and trial
-    for vel in base_velocities:
-        print(f"  Processing {vel}...")
-        for trial in range(num_filtered_trials):
-            start_idx = trial * frames_per_trial
-            end_idx = start_idx + frames_per_trial
-            trial_data = df.loc[start_idx:end_idx-1, vel].values
-            
-            # Calculate PSD using Welch's method
-            fs = 200  # 200Hz sampling frequency
-            frequencies, psd = signal.welch(trial_data, fs=fs, nperseg=fs)
-            
-            # Calculate PSD features
-            total_power = np.sum(psd)
-            peak_frequency = frequencies[np.argmax(psd)]
-            mean_frequency = np.sum(frequencies * psd) / total_power if total_power > 0 else 0
-            
-            # Store features for this trial in our arrays
-            new_columns[f'{vel}_total_power'][start_idx:end_idx] = total_power
-            new_columns[f'{vel}_peak_freq'][start_idx:end_idx] = peak_frequency
-            new_columns[f'{vel}_mean_freq'][start_idx:end_idx] = mean_frequency
-            
-            # Calculate and store band powers
-            for band_name, (low_freq, high_freq) in bands.items():
-                mask = (frequencies >= low_freq) & (frequencies < high_freq)
-                band_power = np.sum(psd[mask])
-                relative_power = band_power / total_power if total_power > 0 else 0
-                
-                new_columns[f'{vel}_{band_name}_power'][start_idx:end_idx] = band_power
-                new_columns[f'{vel}_{band_name}_relative_power'][start_idx:end_idx] = relative_power
-    
-    # Create a new DataFrame with all the new columns
-    new_df = pd.DataFrame(new_columns)
-    
-    # Join with the original DataFrame efficiently
-    return pd.concat([df, new_df], axis=1)
-
-def prepare_data(data_path, input_features, output_features, sequence_length):
-    """Load and prepare data for training."""
-    print("\nPreparing data...")
-    
-    # Load regular data
-    print("Loading regular data...")
-    regular_df = pd.read_csv("Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv")
-    print("Loading ES data...")
-    es_df = pd.read_parquet(r"Z:\Divya\TEMP_transfers\toAni\4_StopProjectData_forES\df_preproc_fly_centric.parquet")
-    
-    # Filter ES data by genotype
-    es_df = filter_es_data_by_genotype(es_df, target_genotype="ES")
-    
-    print(f"Regular data shape: {regular_df.shape}")
-    print(f"ES data shape: {es_df.shape}")
-    
-    # Process regular data
-    filtered_trials = []
-    trial_size = 1400
-    
-    # Process regular trials
-    num_regular_trials = len(regular_df) // trial_size
-    print(f"\nProcessing {num_regular_trials} regular trials...")
-    
-    for trial in range(num_regular_trials):
-        start_idx = trial * trial_size
-        end_idx = (trial + 1) * trial_size
-        trial_data = regular_df.iloc[start_idx:end_idx]
-        genotype = trial_data['genotype'].iloc[0]
-        
-        # Skip unexpected genotypes
-        if genotype not in ['BPN', 'P9RT', 'P9LT']:
-            continue
-        
-        # Get frames 350-1000 for regular genotypes (650 frames)
-        frames = trial_data.iloc[350:1000]
-        
-        # Apply velocity threshold
-        if genotype in ['P9RT', 'P9LT']:
-            avg_vel = abs(frames['z_vel'].mean())
-            threshold = 3
-            vel_type = 'z'
-        else:  # BPN
-            avg_vel = abs(frames['x_vel'].mean())
-            threshold = 5
-            vel_type = 'x'
-        
-        # Keep trial if it meets the threshold
-        if avg_vel >= threshold:
-            filtered_trials.append(frames)
-            print(f"Added {genotype} trial with {vel_type}_vel = {avg_vel:.2f}")
-    
-    # Process ES trials with velocity thresholding
-    num_es_trials = len(es_df) // trial_size
-    print(f"\nProcessing {num_es_trials} ES trials...")
-
-    for trial in range(num_es_trials):
-        start_idx = trial * trial_size
-        end_idx = min((trial + 1) * trial_size, len(es_df))
-        trial_data = es_df.iloc[start_idx:end_idx]
-        
-        # Skip incomplete trials
-        if len(trial_data) < trial_size:
-            print(f"Skipping incomplete trial {trial} with only {len(trial_data)} frames")
-            continue
-        
-        # Get frames 0-650 for ES trials (650 frames)
-        frames = trial_data.iloc[0:650]
-        
-        # Apply velocity threshold for ES data (same as BPN)
-        avg_vel = abs(frames['x_vel'].mean())
-        threshold = 5  # Using same threshold as BPN
-        
-        # Keep trial if it meets the threshold
-        if avg_vel >= threshold:
-            filtered_trials.append(frames)
-            print(f"Added ES trial {trial} with x_vel = {avg_vel:.2f}")
-    
-    if not filtered_trials:
-        raise ValueError("No trials remain after velocity filtering!")
-    
-    # Combine filtered trials
-    df = pd.concat(filtered_trials, ignore_index=True)
-    print(f"\nShape after combining and filtering: {df.shape}")
-    
-    # Print genotype distribution
-    genotype_counts = df['genotype'].value_counts()
-    print("\nGenotype distribution after filtering:")
-    for genotype, count in genotype_counts.items():
-        frames_per_trial = 650  # All trials are now 650 frames
-        num_trials = count // frames_per_trial
-        print(f"{genotype}: {num_trials} trials ({count} frames)")
-    
-    # Verify we have only expected genotypes
-    expected_genotypes = {'BPN', 'P9RT', 'P9LT', 'ES'}
-    unexpected_genotypes = [g for g in genotype_counts.index if g not in expected_genotypes]
-    if unexpected_genotypes:
-        raise ValueError(f"Found unexpected genotypes after filtering: {unexpected_genotypes}")
-    
-    # Calculate moving averages for velocities within each trial
-    base_velocities = ['x_vel', 'y_vel', 'z_vel']
-    for window in [5, 10, 20]:
-        for vel in base_velocities:
-            # Create the column first
-            df[f'{vel}_ma{window}'] = 0.0
-            
-            # Calculate moving average for each trial separately
-            frames_per_trial = 650  # All trials are now 650 frames
-            num_filtered_trials = len(df) // frames_per_trial
-            for trial in range(num_filtered_trials):
-                start_idx = trial * frames_per_trial
-                end_idx = (trial + 1) * frames_per_trial
-                trial_data = df.loc[start_idx:end_idx-1, vel]
-                # Calculate moving average and handle edges
-                ma = trial_data.rolling(window=window, center=True, min_periods=1).mean()
-                df.loc[start_idx:end_idx-1, f'{vel}_ma{window}'] = ma.values
-    
-    # Calculate enhanced features (accelerations, velocity magnitude, acceleration magnitude)
-    print("\nCalculating enhanced features...")
-    frames_per_trial = 650  # All trials are now 650 frames
-    num_filtered_trials = len(df) // frames_per_trial
-    
-    # Initialize acceleration arrays
-    df['x_acc'] = 0.0
-    df['y_acc'] = 0.0
-    df['z_acc'] = 0.0
-    df['velocity_magnitude'] = 0.0
-    df['acceleration_magnitude'] = 0.0
-    
-    # Calculate derivatives and magnitudes for each trial
-    for trial in range(num_filtered_trials):
-        start_idx = trial * frames_per_trial
-        end_idx = start_idx + frames_per_trial
-        
-        # Calculate accelerations (derivatives of velocity)
-        dt = 1/200  # 200Hz sampling rate
-        for coord in ['x', 'y', 'z']:
-            vel = df.loc[start_idx:end_idx-1, f'{coord}_vel'].values
-            acc = np.zeros_like(vel)
-            acc[1:-1] = (vel[2:] - vel[:-2]) / (2 * dt)
-            df.loc[start_idx:end_idx-1, f'{coord}_acc'] = acc
-        
-        # Calculate velocity magnitude
-        x_vel = df.loc[start_idx:end_idx-1, 'x_vel'].values
-        y_vel = df.loc[start_idx:end_idx-1, 'y_vel'].values
-        z_vel = df.loc[start_idx:end_idx-1, 'z_vel'].values
-        vel_mag = np.sqrt(x_vel**2 + y_vel**2 + z_vel**2)
-        df.loc[start_idx:end_idx-1, 'velocity_magnitude'] = vel_mag
-        
-        # Calculate acceleration magnitude
-        x_acc = df.loc[start_idx:end_idx-1, 'x_acc'].values
-        y_acc = df.loc[start_idx:end_idx-1, 'y_acc'].values
-        z_acc = df.loc[start_idx:end_idx-1, 'z_acc'].values
-        acc_mag = np.sqrt(x_acc**2 + y_acc**2 + z_acc**2)
-        df.loc[start_idx:end_idx-1, 'acceleration_magnitude'] = acc_mag
-    
-    # Calculate lagged features
-    print("\nCalculating lagged features...")
-    lag_values = [5, 10, 20]  # Future lags
-    
-    # Define velocity-related features for lagging
-    velocity_related_features = (
-        base_velocities +  # Basic velocities
-        [f"{vel}_ma{window}" for vel in base_velocities for window in [5, 10, 20]] +  # Moving averages
-        ['x_acc', 'y_acc', 'z_acc'] +  # Accelerations
-        ['velocity_magnitude', 'acceleration_magnitude']  # Magnitudes
-    )
-    
-    # Calculate future lags for each feature
-    for feature in velocity_related_features:
-        for lag in lag_values:
-            feature_name = f"{feature}_future_{lag}"
-            # Initialize the column first
-            df[feature_name] = 0.0
-            
-            # Calculate for each trial separately
-            for trial in range(num_filtered_trials):
-                start_idx = trial * frames_per_trial
-                end_idx = start_idx + frames_per_trial
-                trial_data = df.loc[start_idx:end_idx-1, feature].values
-                
-                # Future values
-                lagged_values = np.zeros_like(trial_data)
-                lagged_values[:-lag] = trial_data[lag:]
-                lagged_values[-lag:] = trial_data[-1]  # Pad with last value
-                
-                # Use loc[] instead of chained indexing to avoid warning
-                df.loc[start_idx:end_idx-1, feature_name] = lagged_values
-    
-    # Calculate PSD features
-    df = add_psd_features(df, base_velocities)
-    
-    # At the end of your feature calculation code, after all columns are added, add this line:
-    df = df.copy()  # Creates a defragmented copy of the DataFrame
-    
-    # Define extended input features
-    extended_features = [
-        # Base features (already included)
-        'x_vel_ma5', 'y_vel_ma5', 'z_vel_ma5',
-        'x_vel_ma10', 'y_vel_ma10', 'z_vel_ma10',
-        'x_vel_ma20', 'y_vel_ma20', 'z_vel_ma20',
-        'x_vel', 'y_vel', 'z_vel',
-        
-        # Enhanced features
-        'x_acc', 'y_acc', 'z_acc',
-        'velocity_magnitude', 'acceleration_magnitude',
-        
-        # Lagged features (examples, add more as needed)
-        'x_vel_future_5', 'y_vel_future_5', 'z_vel_future_5',
-        'x_vel_future_10', 'y_vel_future_10', 'z_vel_future_10',
-        'x_vel_future_20', 'y_vel_future_20', 'z_vel_future_20',
-        
-        # PSD features (examples, add more as needed)
-        'x_vel_total_power', 'y_vel_total_power', 'z_vel_total_power',
-        'x_vel_peak_freq', 'y_vel_peak_freq', 'z_vel_peak_freq',
-        'x_vel_mean_freq', 'y_vel_mean_freq', 'z_vel_mean_freq'
-    ]
-    
-    # Add representative band power features
-    for vel in base_velocities:
-        for band in ['low', 'medium', 'high']:
-            extended_features.append(f'{vel}_{band}_power')
-            extended_features.append(f'{vel}_{band}_relative_power')
-    
-    # Define base features
-    base_features = [
-        'x_vel_ma5',    # Moving average velocities
-        'y_vel_ma5',
-        'z_vel_ma5',
-        'x_vel_ma10',
-        'y_vel_ma10',
-        'z_vel_ma10',
-        'x_vel_ma20',
-        'y_vel_ma20',
-        'z_vel_ma20',
-        'x_vel',        # Raw velocities
-        'y_vel',
-        'z_vel'
-    ]
-    
-    # Use base features as input features by default
-    # To use enhanced features, uncomment the next line
-    input_features = extended_features
-    
-    # Print which feature set is being used
-    print(f"\nCURRENTLY USING: {'extended features' if input_features == extended_features else 'base features'}")
-    print(f"Number of features being used: {len(input_features)}")
-    
-    # Print the actual features being used
-    print("\nACTUAL INPUT FEATURES BEING USED:")
-    for i, feat in enumerate(input_features, 1):
-        print(f"  {i}. {feat}")
-    
-    #input_features = base_features
-    
-    print(f"\nFeature Information:")
-    print(f"Base input features ({len(base_features)}):")
-    for feat in base_features:
-        print(f"  - {feat}")
-        if feat in df.columns:
-            print(f"    NaN count: {df[feat].isna().sum()}")
-    
-    print(f"\nExtended features available but not used by default ({len(extended_features)}):")
-    for feat in extended_features:
-        if feat not in base_features and feat in df.columns:
-            print(f"  - {feat}")
-    
-    print(f"\nOutput features ({len(output_features)}):")
-    for feat in output_features:
-        print(f"  - {feat}")
-    
-    # Extract features and targets
-    X = df[input_features].values
-    y = df[output_features].values
-    
-    # Calculate split sizes based on filtered trials
-    frames_per_trial = 650  # All trials are now 650 frames
-    num_filtered_trials = len(df) // frames_per_trial
-    train_size = int(0.7 * num_filtered_trials)
-    val_size = int(0.15 * num_filtered_trials)
-    test_size = num_filtered_trials - train_size - val_size
-    
-    print(f"\nSplitting data by trials:")
-    print(f"Train: {train_size} trials")
-    print(f"Validation: {val_size} trials")
-    print(f"Test: {test_size} trials")
-    
-    # Create random permutation of trial indices
-    np.random.seed(42)  # For reproducibility
-    trial_indices = np.random.permutation(num_filtered_trials)
-    
-    # Split trial indices into train/val/test
-    train_trials = trial_indices[:train_size]
-    val_trials = trial_indices[train_size:train_size + val_size]
-    test_trials = trial_indices[train_size + val_size:]
-    
-    print("\nTrial assignments:")
-    print(f"Training trials: {sorted(train_trials)}")
-    print(f"Validation trials: {sorted(val_trials)}")
-    print(f"Test trials: {sorted(test_trials)}")
-    
-    # Create masks for each split
-    train_mask = np.zeros(len(df), dtype=bool)
-    val_mask = np.zeros(len(df), dtype=bool)
-    test_mask = np.zeros(len(df), dtype=bool)
-    
-    # Assign trials to splits using the random indices
-    for trial in train_trials:
-        start_idx = trial * frames_per_trial
-        end_idx = (trial + 1) * frames_per_trial
-        train_mask[start_idx:end_idx] = True
-    
-    for trial in val_trials:
-        start_idx = trial * frames_per_trial
-        end_idx = (trial + 1) * frames_per_trial
-        val_mask[start_idx:end_idx] = True
-    
-    for trial in test_trials:
-        start_idx = trial * frames_per_trial
-        end_idx = (trial + 1) * frames_per_trial
-        test_mask[start_idx:end_idx] = True
-    
-    # Scale the data
-    X_scaler = StandardScaler()
-    y_scaler = StandardScaler()
-    
-    # Fit scalers on training data only
-    X_train = X_scaler.fit_transform(X[train_mask])
-    y_train = y_scaler.fit_transform(y[train_mask])
-    
-    # Transform validation and test data
-    X_val = X_scaler.transform(X[val_mask])
-    y_val = y_scaler.transform(y[val_mask])
-    X_test = X_scaler.transform(X[test_mask])
-    y_test = y_scaler.transform(y[test_mask])
-    
-    # Create sequence datasets
-    train_dataset = TrialAwareSequenceDataset(X_train, y_train, sequence_length, frames_per_trial)
-    val_dataset = TrialAwareSequenceDataset(X_val, y_val, sequence_length, frames_per_trial)
-    test_dataset = TrialAwareSequenceDataset(X_test, y_test, sequence_length, frames_per_trial)
-    
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32)
-    test_loader = DataLoader(test_dataset, batch_size=32)
-    
-    return (train_loader, val_loader, test_loader), (X_scaler, y_scaler), (input_features, output_features), df, test_trials
-
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, patience=20):
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, patience=10):
     """Train the LSTM model."""
+    # Note: train_loader now uses TrialSampler which shuffles trials but keeps sequences within trials ordered
     model = model.to(device)
     best_val_loss = float('inf')
     best_model = None
@@ -814,48 +112,146 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         # Training phase
         model.train()
         train_loss = 0.0
+        train_batch_count = 0  # Count valid batches
         train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]')
         
-        for inputs, targets in train_pbar:
+        # Track NaN statistics
+        train_batches_with_nan_inputs = 0
+        train_batches_with_nan_targets = 0
+        train_batches_with_nan_outputs = 0
+        train_batches_with_nan_loss = 0
+        
+        for batch_data in train_pbar:
+            # Unpack the batch data - now includes trial indices
+            inputs, targets, _ = batch_data  # Ignore trial indices during training
+            
+            # Check for NaN values in inputs and targets
+            if torch.isnan(inputs).any():
+                train_batches_with_nan_inputs += 1
+                train_pbar.set_postfix({'status': 'NaN inputs - skipped'})
+                continue
+                
+            if torch.isnan(targets).any():
+                train_batches_with_nan_targets += 1
+                train_pbar.set_postfix({'status': 'NaN targets - skipped'})
+                continue
+            
             inputs, targets = inputs.to(device), targets.to(device)
             
             optimizer.zero_grad()
             outputs = model(inputs)
+            
+            # Check for NaN in outputs
+            if torch.isnan(outputs).any():
+                train_batches_with_nan_outputs += 1
+                train_pbar.set_postfix({'status': 'NaN outputs - skipped'})
+                continue
+                
             loss = criterion(outputs, targets)
+            
+            # Check if loss is NaN
+            if torch.isnan(loss):
+                train_batches_with_nan_loss += 1
+                train_pbar.set_postfix({'status': 'NaN loss - skipped'})
+                continue
+                
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
             train_loss += loss.item()
-            train_pbar.set_postfix({'mae': f'{loss.item():.4f}'})
+            train_batch_count += 1
+            train_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
         
-        avg_train_loss = train_loss / len(train_loader)
+        # Print NaN statistics
+        if train_batches_with_nan_inputs > 0 or train_batches_with_nan_targets > 0 or train_batches_with_nan_outputs > 0 or train_batches_with_nan_loss > 0:
+            print(f"\nTraining NaN statistics for epoch {epoch+1}:")
+            print(f"  Batches with NaN inputs: {train_batches_with_nan_inputs}/{len(train_loader)} ({train_batches_with_nan_inputs/len(train_loader)*100:.2f}%)")
+            print(f"  Batches with NaN targets: {train_batches_with_nan_targets}/{len(train_loader)} ({train_batches_with_nan_targets/len(train_loader)*100:.2f}%)")
+            print(f"  Batches with NaN outputs: {train_batches_with_nan_outputs}/{len(train_loader)} ({train_batches_with_nan_outputs/len(train_loader)*100:.2f}%)")
+            print(f"  Batches with NaN loss: {train_batches_with_nan_loss}/{len(train_loader)} ({train_batches_with_nan_loss/len(train_loader)*100:.2f}%)")
+        
+        # Handle case with no valid batches
+        if train_batch_count == 0:
+            print(f"\nWarning: No valid training batches in epoch {epoch+1}. Skipping validation.")
+            continue
+            
+        avg_train_loss = train_loss / train_batch_count
         
         # Validation phase
         model.eval()
         val_loss = 0.0
+        val_batch_count = 0  # Count valid batches
         val_pbar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Val]')
         
+        # Track NaN statistics
+        val_batches_with_nan_inputs = 0
+        val_batches_with_nan_targets = 0
+        val_batches_with_nan_outputs = 0
+        val_batches_with_nan_loss = 0
+        
         with torch.no_grad():
-            for inputs, targets in val_pbar:
+            for batch_data in val_pbar:
+                # Unpack the batch data - now includes trial indices
+                inputs, targets, _ = batch_data  # Ignore trial indices during validation
+                
+                # Check for NaN values
+                if torch.isnan(inputs).any():
+                    val_batches_with_nan_inputs += 1
+                    val_pbar.set_postfix({'status': 'NaN inputs - skipped'})
+                    continue
+                    
+                if torch.isnan(targets).any():
+                    val_batches_with_nan_targets += 1
+                    val_pbar.set_postfix({'status': 'NaN targets - skipped'})
+                    continue
+                
                 inputs, targets = inputs.to(device), targets.to(device)
                 outputs = model(inputs)
+                
+                # Check for NaN in outputs
+                if torch.isnan(outputs).any():
+                    val_batches_with_nan_outputs += 1
+                    val_pbar.set_postfix({'status': 'NaN outputs - skipped'})
+                    continue
+                
                 loss = criterion(outputs, targets)
+                
+                # Skip NaN losses
+                if torch.isnan(loss):
+                    val_batches_with_nan_loss += 1
+                    val_pbar.set_postfix({'status': 'NaN loss - skipped'})
+                    continue
+                    
                 val_loss += loss.item()
-                val_pbar.set_postfix({'mae': f'{loss.item():.4f}'})
+                val_batch_count += 1
+                val_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
         
-        avg_val_loss = val_loss / len(val_loader)
+        # Print NaN statistics
+        if val_batches_with_nan_inputs > 0 or val_batches_with_nan_targets > 0 or val_batches_with_nan_outputs > 0 or val_batches_with_nan_loss > 0:
+            print(f"\nValidation NaN statistics for epoch {epoch+1}:")
+            print(f"  Batches with NaN inputs: {val_batches_with_nan_inputs}/{len(val_loader)} ({val_batches_with_nan_inputs/len(val_loader)*100:.2f}%)")
+            print(f"  Batches with NaN targets: {val_batches_with_nan_targets}/{len(val_loader)} ({val_batches_with_nan_targets/len(val_loader)*100:.2f}%)")
+            print(f"  Batches with NaN outputs: {val_batches_with_nan_outputs}/{len(val_loader)} ({val_batches_with_nan_outputs/len(val_loader)*100:.2f}%)")
+            print(f"  Batches with NaN loss: {val_batches_with_nan_loss}/{len(val_loader)} ({val_batches_with_nan_loss/len(val_loader)*100:.2f}%)")
+        
+        # Handle case with no valid batches
+        if val_batch_count == 0:
+            print(f"\nWarning: No valid validation batches in epoch {epoch+1}. Skipping evaluation.")
+            continue
+            
+        avg_val_loss = val_loss / val_batch_count
         
         print(f"\nEpoch {epoch+1}:")
-        print(f"  Train MAE: {avg_train_loss:.4f}")
-        print(f"  Val MAE: {avg_val_loss:.4f}")
+        print(f"  Train Loss: {avg_train_loss:.4f} (from {train_batch_count}/{len(train_loader)} batches)")
+        print(f"  Val Loss: {avg_val_loss:.4f} (from {val_batch_count}/{len(val_loader)} batches)")
         
         # Check for improvement
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             best_model = model.state_dict()
             patience_counter = 0
-            print(f"  New best model! Val MAE: {best_val_loss:.4f}")
+            print(f"  New best model! Val Loss: {best_val_loss:.4f}")
         else:
             patience_counter += 1
             if patience_counter >= patience:
@@ -864,215 +260,192 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     
     return best_model, best_val_loss
 
-def evaluate_model(model, test_loader, criterion, device, output_features, output_scaler, save_dir, df=None, test_trials=None):
-    """Evaluate the trained model."""
+def evaluate_model(model, test_loader, criterion, device, output_features, y_scaler, output_dir, trial_splits, filtered_to_original):
+    """Evaluate the model on test data and save predictions as .npz files."""
     model.eval()
-    
-    # Track the correct frames corresponding to each prediction
-    all_predictions = []
     all_targets = []
-    sequence_indices = []  # Track which frame each prediction corresponds to
+    all_predictions = []
+    all_losses = []
+    trial_indices = []  # To store original trial indices for each batch
     
-    # Collect predictions and their corresponding target indices
+    # Debug: Print information about test dataset
+    print(f"\nDebug - Test dataset info:")
+    print(f"Number of test trials: {len(trial_splits['test'])}")
+    print(f"Test trial indices: {sorted(trial_splits['test'])}")
+    print(f"Test dataset size: {len(test_loader.dataset)}")
+    print(f"Number of batches: {len(test_loader)}")
+    
+    # Debug: Track unique trial indices
+    unique_trial_indices = set()
+    
     with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(test_loader):
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
-            
-            # Store predictions and targets
-            all_predictions.append(outputs.cpu().numpy())
-            all_targets.append(targets.cpu().numpy())
-            
-            # Get valid indices for this batch
-            if hasattr(test_loader.dataset, 'valid_indices'):
-                # For TrialAwareSequenceDataset
-                batch_size = inputs.shape[0]
-                batch_start = batch_idx * batch_size
-                # Get the actual indices these predictions correspond to
-                for i in range(min(batch_size, len(test_loader.dataset.valid_indices) - batch_start)):
-                    sequence_indices.append(test_loader.dataset.valid_indices[batch_start + i])
-    
-    # Convert to numpy arrays
-    predictions = np.vstack(all_predictions)
-    targets = np.vstack(all_targets)
-    sequence_indices = np.array(sequence_indices)
-    
-    # Inverse transform to get original units
-    predictions_original = output_scaler.inverse_transform(predictions)
-    targets_original = output_scaler.inverse_transform(targets)
-    
-    # Get frame indices for each prediction
-    sequence_length = test_loader.dataset.sequence_length
-    frames_per_trial = test_loader.dataset.frames_per_trial
-    
-    # Map predictions to their correct trial and frame
-    frame_mapped_predictions = {}
-    frame_mapped_targets = {}
-    
-    # Create dictionary of test trials for tracking
-    test_trial_metadata = {}
-    if df is not None and test_trials is not None:
-        for i, trial_idx in enumerate(test_trials):
-            trial_start = trial_idx * frames_per_trial
-            if 'genotype' in df.columns:
-                genotype = df.iloc[trial_start]['genotype']
-                test_trial_metadata[i] = {
-                    'genotype': genotype,
-                    'original_idx': trial_idx
-                }
-    
-    # For each prediction, determine which trial and frame it belongs to
-    for i, seq_idx in enumerate(sequence_indices):
-        if i >= len(predictions_original):
-            # Skip if we've run out of predictions
-            continue
-            
-        # Which trial does this belong to?
-        trial_idx = seq_idx // frames_per_trial
-        # Which frame within the trial?
-        frame_in_trial = (seq_idx % frames_per_trial) + sequence_length
-        
-        # Skip if we're past the end of a trial
-        if frame_in_trial >= frames_per_trial:
-            continue
-            
-        # Initialize trial data if needed
-        if trial_idx not in frame_mapped_predictions:
-            frame_mapped_predictions[trial_idx] = {}
-            frame_mapped_targets[trial_idx] = {}
-            
-        # Store this prediction with its correct frame index
-        for j, feature in enumerate(output_features):
-            if feature not in frame_mapped_predictions[trial_idx]:
-                frame_mapped_predictions[trial_idx][feature] = np.zeros(frames_per_trial) * np.nan
-                frame_mapped_targets[trial_idx][feature] = np.zeros(frames_per_trial) * np.nan
+        for batch_idx, batch_data in enumerate(tqdm(test_loader, desc="Evaluating")):
+            try:
+                # Unpack the batch data - now includes trial indices
+                inputs, targets, batch_trial_indices = batch_data
+                inputs, targets = inputs.to(device), targets.to(device)
                 
-            # Store at the correct frame location
-            frame_mapped_predictions[trial_idx][feature][frame_in_trial] = predictions_original[i, j]
-            frame_mapped_targets[trial_idx][feature][frame_in_trial] = targets_original[i, j]
+                # Check for NaN values in inputs
+                if torch.isnan(inputs).any():
+                    print(f"Warning: NaN values found in inputs batch {batch_idx}. Skipping batch.")
+                    continue
+                
+                # Check for NaN values in targets
+                if torch.isnan(targets).any():
+                    print(f"Warning: NaN values found in targets batch {batch_idx}. Skipping batch.")
+                    continue
+                
+                outputs = model(inputs)
+                
+                # Check for NaN values in model outputs
+                if torch.isnan(outputs).any():
+                    print(f"Warning: NaN values found in model outputs for batch {batch_idx}. Skipping batch.")
+                    continue
+                
+                loss = criterion(outputs, targets)
+                
+                all_targets.append(targets.cpu().numpy())
+                all_predictions.append(outputs.cpu().numpy())
+                all_losses.append(loss.item())
+                
+                # Add trial indices from the batch
+                trial_indices.extend(batch_trial_indices.cpu().numpy().tolist())
+                
+                # Update unique trial indices
+                unique_trial_indices.update(batch_trial_indices.cpu().numpy().tolist())
+                
+                # Debug: Print batch trial indices (first and last batch only)
+                if batch_idx == 0 or batch_idx == len(test_loader) - 1:
+                    print(f"\nDebug - Batch {batch_idx} trial indices:")
+                    print(f"Batch size: {len(batch_trial_indices)}")
+                    print(f"Unique trial indices in batch: {sorted(set(batch_trial_indices.cpu().numpy().tolist()))}")
+                    print(f"Trial indices count: {len(batch_trial_indices)}")
+                    
+            except Exception as e:
+                print(f"Error processing batch {batch_idx}: {str(e)}")
+                traceback.print_exc()  # Print full traceback for debugging
+                continue
     
-    # Create metrics dictionary
+    # Debug: Print summary of trial indices
+    print(f"\nDebug - Trial indices summary:")
+    print(f"Total trial indices collected: {len(trial_indices)}")
+    print(f"Unique trial indices: {sorted(unique_trial_indices)}")
+    print(f"Number of unique trial indices: {len(unique_trial_indices)}")
+    
+    # Check if we have any predictions
+    if not all_predictions:
+        print("Error: No predictions were generated. Check your test data and model.")
+        return {}
+    
+    # Concatenate results
+    all_targets = np.vstack(all_targets)
+    all_predictions = np.vstack(all_predictions)
+    
+    # Debug: Check shapes
+    print(f"\nDebug - Shapes:")
+    print(f"all_targets shape: {all_targets.shape}")
+    print(f"all_predictions shape: {all_predictions.shape}")
+    print(f"trial_indices length: {len(trial_indices)}")
+    
+    # Check for NaN values after stacking
+    nan_in_targets = np.isnan(all_targets).any()
+    nan_in_predictions = np.isnan(all_predictions).any()
+    
+    if nan_in_targets or nan_in_predictions:
+        print("\nWARNING: NaN values detected after stacking:")
+        print(f"  NaN values in targets: {np.isnan(all_targets).sum()}/{all_targets.size} ({np.isnan(all_targets).sum()/all_targets.size*100:.2f}%)")
+        print(f"  NaN values in predictions: {np.isnan(all_predictions).sum()}/{all_predictions.size} ({np.isnan(all_predictions).sum()/all_predictions.size*100:.2f}%)")
+    
+    # Inverse transform to get original scale
+    if y_scaler:
+        try:
+            all_targets = y_scaler.inverse_transform(all_targets)
+            all_predictions = y_scaler.inverse_transform(all_predictions)
+            
+            # Check for NaN values after inverse transform
+            nan_in_targets_after = np.isnan(all_targets).any()
+            nan_in_predictions_after = np.isnan(all_predictions).any()
+            
+            if nan_in_targets_after or nan_in_predictions_after:
+                print("\nWARNING: NaN values detected after inverse transform:")
+                print(f"  NaN values in targets: {np.isnan(all_targets).sum()}/{all_targets.size} ({np.isnan(all_targets).sum()/all_targets.size*100:.2f}%)")
+                print(f"  NaN values in predictions: {np.isnan(all_predictions).sum()}/{all_predictions.size} ({np.isnan(all_predictions).sum()/all_predictions.size*100:.2f}%)")
+        except Exception as e:
+            print(f"Error during inverse transform: {str(e)}")
+            traceback.print_exc()  # Print full traceback for debugging
+    
+    # Save predictions and targets only (without trial indices)
+    npz_path = output_dir / "predictions.npz"
+    np.savez(npz_path, targets=all_targets, predictions=all_predictions)
+    print(f"Predictions saved to {npz_path} (without trial indices)")
+    
+    # Save the correct unique trial indices to a separate file (renamed from debug_trial_indices.npz)
+    indices_path = output_dir / "trial_indices.npz"
+    np.savez(indices_path, unique_trial_indices=sorted(unique_trial_indices))
+    print(f"Unique trial indices saved to {indices_path}")
+    
+    # Calculate metrics
     metrics = {}
     for i, feature in enumerate(output_features):
-        # Filter out NaN values when calculating metrics
-        valid_predictions = []
-        valid_targets = []
+        target_values = all_targets[:, i]
+        pred_values = all_predictions[:, i]
         
-        for trial_idx in frame_mapped_predictions:
-            if feature in frame_mapped_predictions[trial_idx]:
-                trial_preds = frame_mapped_predictions[trial_idx][feature]
-                trial_targets = frame_mapped_targets[trial_idx][feature]
-                
-                # Only include points where both pred and target are not NaN
-                valid_mask = ~np.isnan(trial_preds) & ~np.isnan(trial_targets)
-                valid_predictions.extend(trial_preds[valid_mask])
-                valid_targets.extend(trial_targets[valid_mask])
+        # Check for NaN values
+        if np.isnan(target_values).any() or np.isnan(pred_values).any():
+            print(f"\nWARNING: NaN values detected for feature {feature}. Skipping metrics calculation.")
+            
+            # Count NaN values
+            nan_targets = np.isnan(target_values).sum()
+            nan_preds = np.isnan(pred_values).sum()
+            print(f"  NaN values in targets: {nan_targets}/{len(target_values)} ({nan_targets/len(target_values)*100:.2f}%)")
+            print(f"  NaN values in predictions: {nan_preds}/{len(pred_values)} ({nan_preds/len(pred_values)*100:.2f}%)")
+            
+            # Store NaN metrics to indicate issue
+            metrics[feature] = {
+                'mae': np.nan,
+                'mse': np.nan,
+                'rmse': np.nan,
+                'r2': np.nan,
+                'nan_targets': nan_targets,
+                'nan_predictions': nan_preds
+            }
+            continue
         
-        # Convert to numpy arrays
-        valid_predictions = np.array(valid_predictions)
-        valid_targets = np.array(valid_targets)
-        
-        # Calculate metrics
-        if len(valid_predictions) > 0:
-            mae = float(np.mean(np.abs(valid_predictions - valid_targets)))
-            rmse = float(np.sqrt(np.mean((valid_predictions - valid_targets)**2)))
+        try:
+            # Calculate metrics with valid data
+            mae = mean_absolute_error(target_values, pred_values)
+            mse = mean_squared_error(target_values, pred_values)
+            rmse = np.sqrt(mse)
+            r2 = r2_score(target_values, pred_values)
             
             metrics[feature] = {
                 'mae': mae,
-                'rmse': rmse
+                'mse': mse,
+                'rmse': rmse,
+                'r2': r2
             }
-    
-    # Save metrics to JSON
-    metrics_file = save_dir / 'metrics.json'
-    with open(metrics_file, 'w') as f:
-        json.dump(metrics, f, indent=4)
-    
-    # Plot each trial with correct frame alignment
-    predictions_dir = save_dir / 'predictions'
-    predictions_dir.mkdir(exist_ok=True, parents=True)
-    
-    # Create PDF for predictions
-    pdf_path = predictions_dir / 'trial_predictions.pdf'
-    with PdfPages(pdf_path) as pdf:
-        # Plot each trial
-        for trial_idx in sorted(frame_mapped_predictions.keys()):
-            # Get genotype for this trial if available
-            trial_genotype = "Unknown"
-            if trial_idx in test_trial_metadata:
-                trial_genotype = test_trial_metadata[trial_idx].get('genotype', "Unknown")
             
-            # Create a figure with subplots for each feature
-            fig = plt.figure(figsize=(15, 10))
-            plt.suptitle(f'Trial {trial_idx} - Genotype: {trial_genotype}', fontsize=16, y=0.95)
-            
-            # Calculate number of rows and columns for subplots
-            n_features = len(output_features)
-            n_cols = 2
-            n_rows = (n_features + 1) // 2
-            
-            # Plot each feature
-            for i, feature in enumerate(output_features):
-                ax = plt.subplot(n_rows, n_cols, i + 1)
-                
-                if feature in frame_mapped_predictions[trial_idx]:
-                    # Get predictions and targets for this trial and feature
-                    trial_pred = frame_mapped_predictions[trial_idx][feature]
-                    trial_target = frame_mapped_targets[trial_idx][feature]
-                    
-                    # Set appropriate frame range based on genotype
-                    if trial_genotype == 'ES':
-                        frame_start = 0
-                    else:  # Regular genotypes
-                        frame_start = 350
-                    
-                    # Create frame range
-                    frames = np.arange(frame_start, frame_start + frames_per_trial)
-                    
-                    # Plot predictions and targets
-                    ax.plot(frames, trial_target, 'b-', label='Actual', alpha=0.7)
-                    ax.plot(frames, trial_pred, 'r-', label='Predicted', alpha=0.7)
-                    
-                    # Add shaded region for sequence_length (indicating prediction window)
-                    ax.axvspan(frame_start, frame_start + sequence_length, 
-                               color='gray', alpha=0.1, label='Initial window')
-                    
-                    # Calculate trial-specific metrics (excluding NaNs)
-                    valid_mask = ~np.isnan(trial_pred) & ~np.isnan(trial_target)
-                    if np.sum(valid_mask) > 0:
-                        mae = np.mean(np.abs(trial_pred[valid_mask] - trial_target[valid_mask]))
-                        rmse = np.sqrt(np.mean((trial_pred[valid_mask] - trial_target[valid_mask])**2))
-                        
-                        ax.set_title(f'{feature}\nMAE: {mae:.2f}°, RMSE: {rmse:.2f}°')
-                    else:
-                        ax.set_title(f'{feature}\nNo valid predictions')
-                
-                ax.set_xlabel('Frame')
-                ax.set_ylabel('Angle (degrees)')
-                ax.legend()
-                ax.grid(True, alpha=0.3)
-            
-            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-            pdf.savefig(fig)
-            plt.close()
-    
-    # Save trial predictions with correct frame alignment
-    np.savez(
-        predictions_dir / 'trial_predictions.npz',
-        predictions=frame_mapped_predictions,
-        targets=frame_mapped_targets,
-        output_features=output_features,
-        frames_per_trial=frames_per_trial,
-        sequence_length=sequence_length,
-        test_trial_metadata=test_trial_metadata
-    )
-    
-    print(f"\nSaved predictions to: {predictions_dir / 'trial_predictions.pdf'}")
-    print(f"Saved metrics to: {metrics_file}")
+            print(f"\nMetrics for {feature}:")
+            print(f"  MAE: {mae:.4f}")
+            print(f"  MSE: {mse:.4f}")
+            print(f"  RMSE: {rmse:.4f}")
+            print(f"  R²: {r2:.4f}")
+        except Exception as e:
+            print(f"\nError calculating metrics for feature {feature}: {str(e)}")
+            metrics[feature] = {
+                'error': str(e),
+                'mae': np.nan,
+                'mse': np.nan,
+                'rmse': np.nan,
+                'r2': np.nan
+            }
     
     return metrics
 
 def objective(trial, data_loaders, input_features, output_features, device, leg_prefix):
     """Optuna objective function for hyperparameter optimization."""
+    # Note: train_loader in data_loaders[0] uses TrialSampler which shuffles trials but keeps sequences within trials ordered
+    
     # Suggest hyperparameters
     config = {
         'hidden_size': trial.suggest_int('hidden_size', 32, 256),
@@ -1090,8 +463,10 @@ def objective(trial, data_loaders, input_features, output_features, device, leg_
         dropout=config['dropout']
     )
     
-    # Use MAE loss
-    criterion = nn.L1Loss()
+    # Use DerivativeLoss
+    criterion = DerivativeLoss(alpha=0.5)
+    print(f"\nUsing DerivativeLoss with alpha={criterion.alpha}")
+    print(f"  - This combines standard MAE loss ({1-criterion.alpha:.2f}) with derivative matching ({criterion.alpha:.2f})")
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     
     train_loader, val_loader = data_loaders
@@ -1101,34 +476,75 @@ def objective(trial, data_loaders, input_features, output_features, device, leg_
     for epoch in range(50):  # Maximum epochs for hyperparameter search
         # Training phase
         model.train()
-        for inputs, targets in train_loader:
+        for batch_data in train_loader:
+            # Unpack the batch data - now includes trial indices
+            inputs, targets, _ = batch_data  # Ignore trial indices during training
+            
+            # Skip batches with NaN values
+            if torch.isnan(inputs).any() or torch.isnan(targets).any():
+                continue
+                
             inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)
+            
+            # Skip if outputs contain NaN
+            if torch.isnan(outputs).any():
+                continue
+                
             loss = criterion(outputs, targets)
+            
+            # Skip NaN losses
+            if torch.isnan(loss):
+                continue
+                
             loss.backward()
             optimizer.step()
         
         # Validation phase
         model.eval()
         val_loss = 0.0
+        val_count = 0  # Keep track of valid batches
         
         with torch.no_grad():
-            for inputs, targets in val_loader:
+            for batch_data in val_loader:
+                # Unpack the batch data - now includes trial indices
+                inputs, targets, _ = batch_data  # Ignore trial indices during validation
+                
+                # Skip batches with NaN values
+                if torch.isnan(inputs).any() or torch.isnan(targets).any():
+                    continue
+                    
                 inputs, targets = inputs.to(device), targets.to(device)
                 outputs = model(inputs)
+                
+                # Skip if outputs contain NaN
+                if torch.isnan(outputs).any():
+                    continue
+                    
                 loss = criterion(outputs, targets)
+                
+                # Skip NaN losses
+                if torch.isnan(loss):
+                    continue
+                    
                 val_loss += loss.item()
+                val_count += 1
         
-        val_loss = val_loss / len(val_loader)
+        # Avoid division by zero
+        if val_count == 0:
+            print("Warning: No valid validation batches found. Returning maximum loss.")
+            return float('inf')
+            
+        val_loss = val_loss / val_count
         
-        # Early stopping based on validation MAE
+        # Early stopping based on validation loss
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
         else:
             patience_counter += 1
-            if patience_counter >= 10:  # Early stopping patience
+            if patience_counter >= 1:  # Early stopping patience
                 break
         
         # Report intermediate value
@@ -1140,8 +556,76 @@ def objective(trial, data_loaders, input_features, output_features, device, leg_
     
     return best_val_loss
 
+def save_trial_splits_info(trial_splits, filtered_to_original, filtered_trials, output_dir, leg_name):
+    """Save information about trial splits to text files."""
+    # Create directory if it doesn't exist
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
+    
+    # Save trial splits
+    splits_file = output_dir / f"{leg_name}_trial_splits.txt"
+    with open(splits_file, 'w') as f:
+        f.write(f"Trial splits information for {leg_name}\n")
+        f.write(f"Generated at: {datetime.now()}\n\n")
+        
+        for split_name, indices in trial_splits.items():
+            f.write(f"{split_name.upper()} SPLIT:\n")
+            f.write(f"Number of trials: {len(indices)}\n")
+            f.write(f"Filtered indices: {sorted(indices)}\n")
+            f.write(f"Original indices: {sorted(filtered_to_original[idx] for idx in indices)}\n\n")
+    
+    # Save mapping between filtered and original indices
+    mapping_file = output_dir / f"{leg_name}_index_mapping.txt"
+    with open(mapping_file, 'w') as f:
+        f.write(f"Mapping between filtered and original trial indices for {leg_name}\n")
+        f.write(f"Generated at: {datetime.now()}\n\n")
+        
+        f.write("Filtered Index | Original Index\n")
+        f.write("------------------------------\n")
+        
+        for filtered_idx, original_idx in filtered_to_original.items():
+            f.write(f"{filtered_idx:13} | {original_idx}\n")
+    
+    # Save detailed trial information
+    trials_info_file = output_dir / f"{leg_name}_trial_info.txt"
+    with open(trials_info_file, 'w') as f:
+        f.write(f"Detailed trial information for {leg_name}\n")
+        f.write(f"Generated at: {datetime.now()}\n\n")
+        
+        for filtered_idx, trial_data in enumerate(filtered_trials):
+            original_idx = filtered_to_original[filtered_idx]
+            
+            genotype = trial_data['genotype'].iloc[0] if 'genotype' in trial_data.columns else 'Unknown'
+            
+            # Calculate average velocities
+            if 'x_vel' in trial_data.columns:
+                avg_x_vel = trial_data['x_vel'].mean()
+                avg_y_vel = trial_data['y_vel'].mean()
+                avg_z_vel = trial_data['z_vel'].mean()
+                
+                # Determine which split this trial belongs to
+                split = None
+                for split_name, indices in trial_splits.items():
+                    if filtered_idx in indices:
+                        split = split_name
+                        break
+                
+                f.write(f"Trial {filtered_idx} (Original index: {original_idx})\n")
+                f.write(f"  Genotype: {genotype}\n")
+                f.write(f"  Split: {split}\n")
+                f.write(f"  Average velocities:\n")
+                f.write(f"    x: {avg_x_vel:.2f} mm/s\n")
+                f.write(f"    y: {avg_y_vel:.2f} mm/s\n")
+                f.write(f"    z: {avg_z_vel:.2f} mm/s\n")
+                f.write("\n")
+    
+    return splits_file, mapping_file, trials_info_file
+
 def main():
     """Main function to train and evaluate LSTM models for all 6 legs."""
+    print("\nTraining Strategy: Shuffling trials but keeping sequences within trials in order.")
+    print("This maintains temporal relationships within each trial while randomizing between trials.")
+    
     # Configuration
     base_config = {
         'sequence_length': 50,
@@ -1151,7 +635,7 @@ def main():
         'batch_size': 32,
         'learning_rate': 1e-4,
         'num_epochs': 200,
-        'patience': 20
+        'patience': 10
     }
     
     # Create base directories
@@ -1187,7 +671,57 @@ def main():
         }
     }
     
-    # Train model for each leg
+    # Get the data path using any leg name (all should point to the same file)
+    data_path = get_available_data_path(next(iter(legs.keys())))
+    print(f"\nUsing data path: {data_path}")
+    
+    # Load data once to create trial splits - using first leg as reference
+    print("\nLoading data once to generate consistent trial splits for all legs...")
+    first_leg = next(iter(legs.keys()))
+    print(f"Using {first_leg} as reference leg for trial split generation")
+    
+    # Load and prepare data once just to get the trial splits
+    # Note: These are temporary loaders and scalers that we'll discard
+    (
+        _, _, _, _, _,
+        _, _, _,
+        _, _, shared_trial_splits, shared_filtered_to_original
+    ) = prepare_data(
+        data_path=data_path,
+        input_features=['x_vel', 'y_vel', 'z_vel'],  # Minimal features just to get the splits
+        output_features=legs[first_leg]['angles'],
+        sequence_length=base_config['sequence_length'],
+        output_dir=results_dir,
+        leg_name="trial_splits_reference"
+    )
+    
+    # Save master trial splits to base directory
+    master_splits_file = results_dir / "master_trial_splits.json"
+    with open(master_splits_file, 'w') as f:
+        # Convert numpy arrays to lists for JSON serialization
+        serializable_splits = {
+            split: sorted(indices) 
+            for split, indices in shared_trial_splits.items()
+        }
+        json.dump(serializable_splits, f, indent=2)
+    
+    # Save master filtered to original mapping
+    master_mapping_file = results_dir / "master_filtered_to_original.json"
+    with open(master_mapping_file, 'w') as f:
+        # Convert keys to strings for JSON serialization
+        serializable_mapping = {
+            str(filtered_idx): original_idx 
+            for filtered_idx, original_idx in shared_filtered_to_original.items()
+        }
+        json.dump(serializable_mapping, f, indent=2)
+    
+    print(f"\nMaster trial splits saved to: {master_splits_file}")
+    print(f"Master filtered-to-original mapping saved to: {master_mapping_file}")
+    print("\nConsistent trial splits across legs:")
+    for split_name, indices in shared_trial_splits.items():
+        print(f"  {split_name.capitalize()}: {len(indices)} trials - {sorted(indices)[:10]}...")
+    
+    # Train model for each leg using the same trial splits
     for leg_name, leg_info in legs.items():
         try:
             print(f"\n{'='*80}")
@@ -1195,20 +729,20 @@ def main():
             print(f"{'='*80}")
             
             # Create leg-specific directories
-            leg_dir = results_dir / leg_name
-            leg_models_dir = leg_dir / 'models'
-            leg_plots_dir = leg_dir / 'plots'
+            leg_dir = Path(f"lstm_results/{leg_name}")
+            leg_models_dir = leg_dir / "models"
+            leg_plots_dir = leg_dir / "plots"
             
-            leg_dir.mkdir(exist_ok=True, parents=True)
-            leg_models_dir.mkdir(exist_ok=True, parents=True)
-            leg_plots_dir.mkdir(exist_ok=True, parents=True)
+            os.makedirs(leg_dir, exist_ok=True)
+            os.makedirs(leg_models_dir, exist_ok=True)
+            os.makedirs(leg_plots_dir, exist_ok=True)
             
             print(f"\nCreated directory structure for {leg_name}:")
             print(f"- {leg_dir}")
             print(f"- {leg_models_dir}")
             print(f"- {leg_plots_dir}")
             
-            # Get data path
+            # Get data path - same for all legs
             data_path = get_available_data_path(leg_name)
             
             # Use leg-specific output features
@@ -1276,13 +810,66 @@ def main():
             for feat in output_features:
                 print(f"  - {feat}")
             
-            # Prepare data for this leg
-            (train_loader, val_loader, test_loader), (X_scaler, y_scaler), (input_features, output_features), df, test_trials = prepare_data(
-                data_path,
-                input_features,
-                output_features,
-                base_config['sequence_length']
+            print(f"\nUsing consistent trial splits across all legs:")
+            print(f"  Train: {len(shared_trial_splits['train'])} trials")
+            print(f"  Validation: {len(shared_trial_splits['val'])} trials")
+            print(f"  Test: {len(shared_trial_splits['test'])} trials")
+            
+            # Prepare data for this leg - reusing the shared trial splits
+            (
+                df, all_filtered_trials, train_trials, val_trials, test_trials,
+                train_loader, val_loader, test_loader,
+                X_scaler, y_scaler, trial_splits, filtered_to_original
+            ) = prepare_data(
+                data_path=data_path,
+                input_features=input_features,
+                output_features=output_features,
+                sequence_length=base_config['sequence_length'],
+                output_dir=leg_dir,  # Pass the leg directory
+                leg_name=leg_name,   # Pass the leg name
+                fixed_trial_splits=shared_trial_splits,  # Pass the shared trial splits
+                fixed_filtered_to_original=shared_filtered_to_original  # Pass the shared mapping
             )
+            
+            # Verify we're using the same trial splits
+            for split in ['train', 'val', 'test']:
+                if set(trial_splits[split]) != set(shared_trial_splits[split]):
+                    print(f"WARNING: {leg_name} {split} split doesn't match the master splits!")
+                    print(f"  Master: {sorted(shared_trial_splits[split])}")
+                    print(f"  {leg_name}: {sorted(trial_splits[split])}")
+            
+            # Save trial splits to text file
+            splits_file, mapping_file, trials_info_file = save_trial_splits_info(trial_splits, filtered_to_original, all_filtered_trials, leg_dir, leg_name)
+            
+            print(f"\nTrial splits saved to: {splits_file}")
+            print(f"Index mapping saved to: {mapping_file}")
+            print(f"Detailed trial info saved to: {trials_info_file}")
+            
+            # Check for NaN values in the dataset
+            print("\nChecking for NaN values in processed data...")
+            
+            # Sample a few batches from each loader to check for NaNs
+            for loader_name, loader in [("train", train_loader), ("validation", val_loader), ("test", test_loader)]:
+                nan_in_inputs = 0
+                nan_in_targets = 0
+                
+                for i, batch_data in enumerate(loader):
+                    if i >= 5:  # Check first 5 batches
+                        break
+                    
+                    # Unpack the batch data - now includes trial indices
+                    inputs, targets, _ = batch_data  # Ignore trial indices for NaN check
+                        
+                    if torch.isnan(inputs).any():
+                        nan_in_inputs += 1
+                    
+                    if torch.isnan(targets).any():
+                        nan_in_targets += 1
+                
+                if nan_in_inputs > 0 or nan_in_targets > 0:
+                    print(f"Warning: Found NaN values in {loader_name} loader:")
+                    print(f"  Batches with NaN inputs: {nan_in_inputs}/5")
+                    print(f"  Batches with NaN targets: {nan_in_targets}/5")
             
             # Create model for this leg
             model = LSTMPredictor(
@@ -1295,7 +882,11 @@ def main():
             
             # Set up training
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            criterion = nn.L1Loss()  # Use MAE loss for stable training
+            
+            # Use DerivativeLoss instead of L1Loss
+            criterion = DerivativeLoss(alpha=0.5)
+            print(f"\nUsing DerivativeLoss with alpha={criterion.alpha}")
+            
             optimizer = optim.Adam(model.parameters(), lr=base_config['learning_rate'])
             
             # Train model
@@ -1315,7 +906,7 @@ def main():
             # Load best model
             model.load_state_dict(best_model_state)
             
-            # Evaluate model
+            # Evaluate model and save predictions
             metrics = evaluate_model(
                 model,
                 test_loader,
@@ -1324,8 +915,8 @@ def main():
                 output_features,
                 y_scaler,
                 leg_plots_dir,
-                df=df,
-                test_trials=test_trials
+                trial_splits,
+                filtered_to_original
             )
             
             # Save model and results
@@ -1340,7 +931,11 @@ def main():
                 'X_scaler': X_scaler,
                 'y_scaler': y_scaler,
                 'metrics': metrics,
-                'best_val_loss': best_val_loss
+                'best_val_loss': best_val_loss,
+                'loss_type': 'DerivativeLoss',
+                'loss_params': {'alpha': criterion.alpha},
+                'trial_splits': trial_splits,
+                'filtered_to_original': filtered_to_original
             }, model_save_path)
             
             print(f"\nModel and results saved to: {model_save_path}")
