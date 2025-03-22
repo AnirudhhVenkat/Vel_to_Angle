@@ -23,6 +23,10 @@ import random
 from losses import DerivativeLoss
 import os
 
+# Import Optuna visualization capabilities
+import optuna.visualization
+import plotly
+
 # Import functions from data.py
 from data import (
     set_all_seeds,
@@ -629,13 +633,10 @@ def main():
     # Configuration
     base_config = {
         'sequence_length': 50,
-        'hidden_size': 256,
-        'num_layers': 2,
-        'dropout': 0.2,
         'batch_size': 32,
-        'learning_rate': 1e-4,
         'num_epochs': 200,
-        'patience': 10
+        'patience': 10,
+        'n_trials': 20,  # Number of Optuna trials
     }
     
     # Create base directories
@@ -871,46 +872,166 @@ def main():
                     print(f"  Batches with NaN inputs: {nan_in_inputs}/5")
                     print(f"  Batches with NaN targets: {nan_in_targets}/5")
             
-            # Create model for this leg
-            model = LSTMPredictor(
-                input_size=len(input_features),
-                hidden_size=base_config['hidden_size'],
-                output_size=len(output_features),
-                num_layers=base_config['num_layers'],
-                dropout=base_config['dropout']
+            # Set up device
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            print(f"\nUsing device: {device}")
+            
+            # Initialize Optuna study
+            study_name = f"{leg_name}_lstm_optimization"
+            storage_name = f"sqlite:///{leg_dir}/optuna.db"
+            
+            print(f"\nStarting hyperparameter optimization for {leg_name} with Optuna")
+            print(f"Study name: {study_name}")
+            print(f"Number of trials: {base_config['n_trials']}")
+            
+            # Create a new study or continue from a previous one
+            study = optuna.create_study(
+                study_name=study_name,
+                storage=storage_name,
+                load_if_exists=True,
+                direction="minimize",
+                pruner=optuna.pruners.MedianPruner()
             )
             
-            # Set up training
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            # Define the objective function for hyperparameter optimization
+            def optuna_objective(trial):
+                # Suggest hyperparameters
+                config = {
+                    'hidden_size': trial.suggest_int('hidden_size', 64, 512, step=64),
+                    'num_layers': trial.suggest_int('num_layers', 1, 4),
+                    'dropout': trial.suggest_float('dropout', 0.1, 0.5, step=0.1),
+                    'learning_rate': trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True),
+                    'alpha': trial.suggest_float('alpha', 0.0, 1.0, step=0.1),  # For DerivativeLoss
+                }
+                
+                # Create model with suggested hyperparameters
+                model = LSTMPredictor(
+                    input_size=len(input_features),
+                    hidden_size=config['hidden_size'],
+                    output_size=len(output_features),
+                    num_layers=config['num_layers'],
+                    dropout=config['dropout']
+                )
+                
+                # Use DerivativeLoss
+                criterion = DerivativeLoss(alpha=config['alpha'])
+                print(f"\nTrial {trial.number}: Using DerivativeLoss with alpha={criterion.alpha}")
+                optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
+                
+                # Train the model
+                best_model_state, best_val_loss = train_model(
+                    model,
+                    train_loader,
+                    val_loader,
+                    criterion,
+                    optimizer,
+                    num_epochs=100,  # Limited epochs for hyperparameter search
+                    device=device,
+                    patience=5      # Reduced patience for faster trials
+                )
+                
+                # Return the best validation loss
+                return best_val_loss
             
-            # Use DerivativeLoss instead of L1Loss
-            criterion = DerivativeLoss(alpha=0.5)
-            print(f"\nUsing DerivativeLoss with alpha={criterion.alpha}")
+            # Run the optimization
+            study.optimize(
+                optuna_objective,
+                n_trials=base_config['n_trials']
+            )
             
-            optimizer = optim.Adam(model.parameters(), lr=base_config['learning_rate'])
+            # Get the best trial
+            best_trial = study.best_trial
+            best_params = best_trial.params
             
-            # Train model
+            print(f"\nBest hyperparameters for {leg_name}:")
+            for param, value in best_params.items():
+                print(f"  {param}: {value}")
+            print(f"Best validation loss: {best_trial.value:.4f}")
+            
+            # Save hyperparameter optimization results
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            optuna_results_file = leg_dir / f"optuna_results_{timestamp}.json"
+            
+            # Prepare results for JSON serialization
+            optuna_results = {
+                "best_params": best_params,
+                "best_value": best_trial.value,
+                "study_name": study_name,
+                "timestamp": timestamp,
+                "trials": [
+                    {
+                        "number": t.number,
+                        "params": t.params,
+                        "value": t.value if t.value is not None else float('nan'),
+                        "state": t.state.name
+                    }
+                    for t in study.trials
+                ]
+            }
+            
+            with open(optuna_results_file, 'w') as f:
+                json.dump(optuna_results, f, indent=2, default=str)
+            
+            print(f"\nOptuna results saved to: {optuna_results_file}")
+            
+            # Generate optimization visualization plots
+            try:
+                # Create optimization history plot
+                fig = optuna.visualization.plot_optimization_history(study)
+                fig.write_image(str(leg_plots_dir / f"optuna_history_{timestamp}.png"))
+                
+                # Create parameter importance plot
+                param_imp_fig = optuna.visualization.plot_param_importances(study)
+                param_imp_fig.write_image(str(leg_plots_dir / f"optuna_param_importance_{timestamp}.png"))
+                
+                # Create parallel coordinate plot
+                parallel_fig = optuna.visualization.plot_parallel_coordinate(study)
+                parallel_fig.write_image(str(leg_plots_dir / f"optuna_parallel_coordinate_{timestamp}.png"))
+                
+                print(f"\nOptuna visualization plots saved to: {leg_plots_dir}")
+            except Exception as e:
+                print(f"Warning: Could not generate Optuna visualization plots: {str(e)}")
+            
+            # Train the best model with full epochs
+            print(f"\nTraining the best model for {leg_name} with full epochs...")
+            
+            # Create model with best hyperparameters
+            best_model = LSTMPredictor(
+                input_size=len(input_features),
+                output_size=len(output_features),
+                hidden_size=best_params['hidden_size'],
+                num_layers=best_params['num_layers'],
+                dropout=best_params['dropout']
+            )
+            
+            # Use DerivativeLoss with best alpha
+            best_criterion = DerivativeLoss(alpha=best_params['alpha'])
+            print(f"\nUsing DerivativeLoss with best alpha={best_params['alpha']}")
+            
+            best_optimizer = optim.Adam(best_model.parameters(), lr=best_params['learning_rate'])
+            
+            # Train the best model with full epochs
             best_model_state, best_val_loss = train_model(
-                model,
+                best_model,
                 train_loader,
                 val_loader,
-                criterion,
-                optimizer,
+                best_criterion,
+                best_optimizer,
                 base_config['num_epochs'],
                 device,
                 base_config['patience']
             )
             
-            print(f"\nTraining completed for {leg_name}. Best validation loss: {best_val_loss:.4f}")
+            print(f"\nFull training completed for {leg_name}. Best validation loss: {best_val_loss:.4f}")
             
             # Load best model
-            model.load_state_dict(best_model_state)
+            best_model.load_state_dict(best_model_state)
             
             # Evaluate model and save predictions
             metrics = evaluate_model(
-                model,
+                best_model,
                 test_loader,
-                criterion,
+                best_criterion,
                 device,
                 output_features,
                 y_scaler,
@@ -919,13 +1040,12 @@ def main():
                 filtered_to_original
             )
             
-            # Save model and results
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            model_save_path = leg_models_dir / f'{leg_name}_lstm_{timestamp}.pth'
+            # Save best model and results
+            model_save_path = leg_models_dir / f'{leg_name}_lstm_best_{timestamp}.pth'
             
             torch.save({
                 'model_state_dict': best_model_state,
-                'config': base_config,
+                'best_params': best_params,
                 'input_features': input_features,
                 'output_features': output_features,
                 'X_scaler': X_scaler,
@@ -933,17 +1053,20 @@ def main():
                 'metrics': metrics,
                 'best_val_loss': best_val_loss,
                 'loss_type': 'DerivativeLoss',
-                'loss_params': {'alpha': criterion.alpha},
+                'loss_params': {'alpha': best_params['alpha']},
                 'trial_splits': trial_splits,
-                'filtered_to_original': filtered_to_original
+                'filtered_to_original': filtered_to_original,
+                'optuna_study_name': study_name,
+                'optuna_best_trial': best_trial.number
             }, model_save_path)
             
-            print(f"\nModel and results saved to: {model_save_path}")
+            print(f"\nBest model and results saved to: {model_save_path}")
             
             # Log successful completion
             with open(error_log, 'a') as f:
                 f.write(f"Successfully completed training for {leg_name} at {datetime.now()}\n")
                 f.write(f"Best validation loss: {best_val_loss:.4f}\n")
+                f.write(f"Best hyperparameters: {best_params}\n")
                 f.write("-" * 80 + "\n\n")
                 
         except Exception as e:
@@ -958,6 +1081,7 @@ def main():
             
             print(f"\nError occurred while processing {leg_name}. See {error_log} for details.")
             print(f"Error: {str(e)}")
+            traceback.print_exc()  # Print full traceback for debugging
             continue  # Continue with next leg
     
     print("\nTraining completed for all legs!")
