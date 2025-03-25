@@ -20,7 +20,6 @@ from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from matplotlib.backends.backend_pdf import PdfPages
 from scipy import signal
 import random
-from losses import DerivativeLoss
 import os
 
 # Import Optuna visualization capabilities
@@ -467,10 +466,9 @@ def objective(trial, data_loaders, input_features, output_features, device, leg_
         dropout=config['dropout']
     )
     
-    # Use DerivativeLoss
-    criterion = DerivativeLoss(alpha=0.5)
-    print(f"\nUsing DerivativeLoss with alpha={criterion.alpha}")
-    print(f"  - This combines standard MAE loss ({1-criterion.alpha:.2f}) with derivative matching ({criterion.alpha:.2f})")
+    # Use standard MAE loss
+    criterion = nn.L1Loss()
+    print(f"\nUsing standard MAE loss")
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     
     train_loader, val_loader = data_loaders
@@ -611,7 +609,7 @@ def save_trial_splits_info(trial_splits, filtered_to_original, filtered_trials, 
                 split = None
                 for split_name, indices in trial_splits.items():
                     if filtered_idx in indices:
-                        split = split_name
+                        split = split_name  
                         break
                 
                 f.write(f"Trial {filtered_idx} (Original index: {original_idx})\n")
@@ -901,7 +899,6 @@ def main():
                     'num_layers': trial.suggest_int('num_layers', 1, 4),
                     'dropout': trial.suggest_float('dropout', 0.1, 0.5, step=0.1),
                     'learning_rate': trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True),
-                    'alpha': trial.suggest_float('alpha', 0.0, 1.0, step=0.1),  # For DerivativeLoss
                 }
                 
                 # Create model with suggested hyperparameters
@@ -913,9 +910,9 @@ def main():
                     dropout=config['dropout']
                 )
                 
-                # Use DerivativeLoss
-                criterion = DerivativeLoss(alpha=config['alpha'])
-                print(f"\nTrial {trial.number}: Using DerivativeLoss with alpha={criterion.alpha}")
+                # Use standard MAE loss
+                criterion = nn.L1Loss()
+                print(f"\nTrial {trial.number}: Using standard MAE loss")
                 optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
                 
                 # Train the model
@@ -1004,9 +1001,9 @@ def main():
                 dropout=best_params['dropout']
             )
             
-            # Use DerivativeLoss with best alpha
-            best_criterion = DerivativeLoss(alpha=best_params['alpha'])
-            print(f"\nUsing DerivativeLoss with best alpha={best_params['alpha']}")
+            # Use standard MAE loss
+            best_criterion = nn.L1Loss()
+            print(f"\nUsing standard MAE loss for final training")
             
             best_optimizer = optim.Adam(best_model.parameters(), lr=best_params['learning_rate'])
             
@@ -1052,8 +1049,7 @@ def main():
                 'y_scaler': y_scaler,
                 'metrics': metrics,
                 'best_val_loss': best_val_loss,
-                'loss_type': 'DerivativeLoss',
-                'loss_params': {'alpha': best_params['alpha']},
+                'loss_type': 'MAE',
                 'trial_splits': trial_splits,
                 'filtered_to_original': filtered_to_original,
                 'optuna_study_name': study_name,
