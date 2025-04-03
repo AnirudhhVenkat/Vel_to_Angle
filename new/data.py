@@ -426,7 +426,73 @@ def calculate_enhanced_features(trials_data, frames_per_trial):
     return features
 
 def get_available_data_path(genotype):
-    """Try multiple possible data paths and return the first available one based on genotype."""
+    """
+    Try multiple possible data paths and return the first available one based on genotype.
+    
+    IMPORTANT: Now prioritizes normalized data files if available.
+    
+    Args:
+        genotype (str): The genotype to search for (ES, BPN, etc.)
+        
+    Returns:
+        str: Path to the data file (as a string)
+    """
+    # Define the exact normalized file paths the user provided
+    normalized_files_exact = {
+        'BPN': "C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/BPN_P9LT_P9RT_flyCoords_normalized_20250331_215833.csv",
+        'P9RT': "C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/BPN_P9LT_P9RT_flyCoords_normalized_20250331_215833.csv",
+        'P9LT': "C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/BPN_P9LT_P9RT_flyCoords_normalized_20250331_215833.csv",
+        'ES': "C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/df_preproc_fly_centric_normalized_20250331_215833.parquet"
+    }
+    
+    # Check if there's an exact match for this genotype
+    if genotype in normalized_files_exact:
+        exact_path = normalized_files_exact[genotype]
+        if Path(exact_path).exists():
+            print(f"Using exact normalized data file: {exact_path}")
+            return exact_path
+    
+    # First check for normalized data files in the normalized_data directory
+    normalized_dir = Path("normalized_data")
+    if normalized_dir.exists():
+        # Look for normalized files with matching genotype in the filename
+        normalized_files = []
+        for ext in ['.csv', '.parquet']:
+            if genotype == 'ES':
+                # For ES genotype
+                normalized_files.extend(list(normalized_dir.glob(f"*ES*_normalized_*{ext}")))
+                normalized_files.extend(list(normalized_dir.glob(f"*df_preproc_fly_centric*_normalized_*{ext}")))
+            else:
+                # For BPN, P9RT, P9LT genotypes
+                normalized_files.extend(list(normalized_dir.glob(f"*BPN*_normalized_*{ext}")))
+                normalized_files.extend(list(normalized_dir.glob(f"*P9*_normalized_*{ext}")))
+                normalized_files.extend(list(normalized_dir.glob(f"*flyCoords*_normalized_*{ext}")))
+        
+        if normalized_files:
+            # Sort by timestamp (newest first) - timestamps are in format YYYYMMDD_HHMMSS
+            normalized_files.sort(key=lambda x: str(x), reverse=True)
+            newest_file = normalized_files[0]
+            print(f"Using newest normalized data file: {newest_file}")
+            # Return as string
+            return str(newest_file)
+        else:
+            print(f"No normalized data files found for genotype {genotype} using glob pattern.")
+            
+            # Try the absolute path as a final check
+            if genotype in ['BPN', 'P9RT', 'P9LT']:
+                abs_path = Path("C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/BPN_P9LT_P9RT_flyCoords_normalized_20250331_215833.csv")
+                if abs_path.exists():
+                    print(f"Using hardcoded normalized BPN/P9 data file: {abs_path}")
+                    return str(abs_path)
+            elif genotype == 'ES':
+                abs_path = Path("C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/df_preproc_fly_centric_normalized_20250331_215833.parquet")
+                if abs_path.exists():
+                    print(f"Using hardcoded normalized ES data file: {abs_path}")
+                    return str(abs_path)
+                    
+            print(f"Falling back to original files for genotype {genotype}.")
+    
+    # If no normalized files found, fall back to original files
     if genotype == 'ES':
         possible_paths = [
             r"Z:\Divya\TEMP_transfers\toAni\4_StopProjectData_forES\df_preproc_fly_centric.parquet"
@@ -440,10 +506,10 @@ def get_available_data_path(genotype):
     
     for path in possible_paths:
         if Path(path).exists():
-            print(f"Using data file: {path}")
-            return path
+            print(f"Using original data file: {path}")
+            return path  # Already a string
     
-    raise FileNotFoundError(f"Could not find the data file for genotype {genotype}")
+    raise FileNotFoundError(f"Could not find any data file for genotype {genotype}")
 
 def calculate_psd_features(data, fs=200):
     """

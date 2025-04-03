@@ -634,7 +634,7 @@ def main():
         'batch_size': 32,
         'num_epochs': 200,
         'patience': 10,
-        'n_trials': 20,  # Number of Optuna trials
+        'n_trials': 10,  # Number of Optuna trials - REDUCED FROM 20 TO 10
     }
     
     # Create base directories
