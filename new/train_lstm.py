@@ -1,3 +1,23 @@
+"""
+Train LSTM models to predict joint angles from velocity features.
+
+This script performs hyperparameter optimization for LSTM models using Optuna,
+training separate models for each leg. The optimization includes:
+- Network architecture parameters (hidden size, number of layers, dropout)
+- Learning rate
+- Sequence length (window size) - This allows the model to find the optimal temporal context
+
+The script uses a consistent train/validation/test split across all legs to ensure
+fair comparison between legs. It also includes extensive data preparation, feature
+engineering, and comprehensive evaluation.
+
+For each leg, the script:
+1. Prepares data using the optimal sequence length found during optimization
+2. Trains an LSTM model with optimized hyperparameters
+3. Evaluates the model on the test set
+4. Saves the model, predictions, and performance metrics
+"""
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -103,7 +123,7 @@ class LSTMPredictor(nn.Module):
         return out
 
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, patience=10):
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, y_scaler=None, patience=10):
     """Train the LSTM model."""
     # Note: train_loader now uses TrialSampler which shuffles trials but keeps sequences within trials ordered
     model = model.to(device)
@@ -246,8 +266,19 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         avg_val_loss = val_loss / val_batch_count
         
         print(f"\nEpoch {epoch+1}:")
-        print(f"  Train Loss: {avg_train_loss:.4f} (from {train_batch_count}/{len(train_loader)} batches)")
-        print(f"  Val Loss: {avg_val_loss:.4f} (from {val_batch_count}/{len(val_loader)} batches)")
+        print(f"  Train Loss (Normalized MAE): {avg_train_loss:.4f} (from {train_batch_count}/{len(train_loader)} batches)")
+        print(f"  Val Loss (Normalized MAE): {avg_val_loss:.4f} (from {val_batch_count}/{len(val_loader)} batches)")
+        
+        # Also print MAE in original units if y_scaler is provided
+        if y_scaler is not None:
+            # Calculate average std from y_scaler
+            if hasattr(y_scaler, 'stds'):
+                avg_std = np.mean(y_scaler.stds)
+                orig_train_loss = avg_train_loss * avg_std
+                orig_val_loss = avg_val_loss * avg_std
+                
+                print(f"  Train Loss (Original Units MAE): {orig_train_loss:.4f}°")
+                print(f"  Val Loss (Original Units MAE): {orig_val_loss:.4f}°")
         
         # Check for improvement
         if avg_val_loss < best_val_loss:
@@ -266,10 +297,14 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
 def evaluate_model(model, test_loader, criterion, device, output_features, y_scaler, output_dir, trial_splits, filtered_to_original):
     """Evaluate the model on test data and save predictions as .npz files."""
     model.eval()
-    all_targets = []
-    all_predictions = []
-    all_losses = []
-    trial_indices = []  # To store original trial indices for each batch
+    
+    # Define the frame range we want to keep (51-651, using zero-based indexing)
+    start_frame = 50  # Frame 51 (1-indexed) = index 50 (0-indexed)
+    end_frame = 650   # Frame 651 (1-indexed) = index 650 (0-indexed)
+    frames_to_keep = end_frame - start_frame + 1  # Should be 601 frames
+    
+    print(f"\nUsing frame range: {start_frame+1}-{end_frame+1} (1-indexed)")
+    print(f"Number of frames to keep per trial: {frames_to_keep}")
     
     # Debug: Print information about test dataset
     print(f"\nDebug - Test dataset info:")
@@ -277,6 +312,10 @@ def evaluate_model(model, test_loader, criterion, device, output_features, y_sca
     print(f"Test trial indices: {sorted(trial_splits['test'])}")
     print(f"Test dataset size: {len(test_loader.dataset)}")
     print(f"Number of batches: {len(test_loader)}")
+    
+    # Initialize storage for predictions and targets by trial
+    all_predictions_by_trial = {}  # Dict to store predictions for each trial
+    all_targets_by_trial = {}      # Dict to store targets for each trial
     
     # Debug: Track unique trial indices
     unique_trial_indices = set()
@@ -305,17 +344,28 @@ def evaluate_model(model, test_loader, criterion, device, output_features, y_sca
                     print(f"Warning: NaN values found in model outputs for batch {batch_idx}. Skipping batch.")
                     continue
                 
-                loss = criterion(outputs, targets)
-                
-                all_targets.append(targets.cpu().numpy())
-                all_predictions.append(outputs.cpu().numpy())
-                all_losses.append(loss.item())
-                
-                # Add trial indices from the batch
-                trial_indices.extend(batch_trial_indices.cpu().numpy().tolist())
-                
-                # Update unique trial indices
-                unique_trial_indices.update(batch_trial_indices.cpu().numpy().tolist())
+                # Process each item in the batch
+                for i in range(len(inputs)):
+                    # Get the trial index for this item
+                    trial_idx = batch_trial_indices[i].item()
+                    unique_trial_indices.add(trial_idx)
+                    
+                    # Get predictions and targets
+                    pred = outputs[i].cpu().numpy()
+                    target = targets[i].cpu().numpy()
+                    
+                    # Get the sequence and position in trial from the dataset
+                    sequence_length = inputs.shape[1]
+                    position = test_loader.dataset.valid_indices[batch_idx * test_loader.batch_size + i] % 651
+                    frame_idx = position + sequence_length - 1  # Target is at the end of the sequence
+                    
+                    # Store predictions and targets by trial index and frame position
+                    if trial_idx not in all_predictions_by_trial:
+                        all_predictions_by_trial[trial_idx] = {}
+                        all_targets_by_trial[trial_idx] = {}
+                    
+                    all_predictions_by_trial[trial_idx][frame_idx] = pred
+                    all_targets_by_trial[trial_idx][frame_idx] = target
                 
                 # Debug: Print batch trial indices (first and last batch only)
                 if batch_idx == 0 or batch_idx == len(test_loader) - 1:
@@ -331,31 +381,54 @@ def evaluate_model(model, test_loader, criterion, device, output_features, y_sca
     
     # Debug: Print summary of trial indices
     print(f"\nDebug - Trial indices summary:")
-    print(f"Total trial indices collected: {len(trial_indices)}")
+    print(f"Total unique trial indices collected: {len(unique_trial_indices)}")
     print(f"Unique trial indices: {sorted(unique_trial_indices)}")
-    print(f"Number of unique trial indices: {len(unique_trial_indices)}")
+    
+    # Collect all predictions and targets in the desired frame range (51-651)
+    final_predictions = []
+    final_targets = []
+    
+    # Process each trial
+    for trial_idx in sorted(unique_trial_indices):
+        trial_predictions = all_predictions_by_trial.get(trial_idx, {})
+        trial_targets = all_targets_by_trial.get(trial_idx, {})
+        
+        # Keep only the frames in the specified range (51-651)
+        valid_frames = []
+        for frame_idx in range(start_frame, end_frame + 1):
+            if frame_idx in trial_predictions and frame_idx in trial_targets:
+                valid_frames.append(frame_idx)
+        
+        # Check if we have enough frames for this trial
+        if len(valid_frames) < frames_to_keep:
+            print(f"Warning: Trial {trial_idx} has only {len(valid_frames)} frames in range {start_frame+1}-{end_frame+1}, expected {frames_to_keep}")
+        
+        # Add valid frames to final arrays
+        for frame_idx in sorted(valid_frames):
+            final_predictions.append(trial_predictions[frame_idx])
+            final_targets.append(trial_targets[frame_idx])
     
     # Check if we have any predictions
-    if not all_predictions:
-        print("Error: No predictions were generated. Check your test data and model.")
+    if not final_predictions:
+        print("Error: No predictions were generated for the frame range. Check your test data and model.")
         return {}
     
-    # Concatenate results
-    all_targets = np.vstack(all_targets)
-    all_predictions = np.vstack(all_predictions)
+    # Convert to numpy arrays
+    all_predictions = np.array(final_predictions)
+    all_targets = np.array(final_targets)
     
     # Debug: Check shapes
-    print(f"\nDebug - Shapes:")
+    print(f"\nDebug - Final shapes:")
     print(f"all_targets shape: {all_targets.shape}")
     print(f"all_predictions shape: {all_predictions.shape}")
-    print(f"trial_indices length: {len(trial_indices)}")
+    print(f"Expected number of samples: {len(unique_trial_indices) * frames_to_keep}")
     
-    # Check for NaN values after stacking
+    # Check for NaN values
     nan_in_targets = np.isnan(all_targets).any()
     nan_in_predictions = np.isnan(all_predictions).any()
     
     if nan_in_targets or nan_in_predictions:
-        print("\nWARNING: NaN values detected after stacking:")
+        print("\nWARNING: NaN values detected after collecting results:")
         print(f"  NaN values in targets: {np.isnan(all_targets).sum()}/{all_targets.size} ({np.isnan(all_targets).sum()/all_targets.size*100:.2f}%)")
         print(f"  NaN values in predictions: {np.isnan(all_predictions).sum()}/{all_predictions.size} ({np.isnan(all_predictions).sum()/all_predictions.size*100:.2f}%)")
     
@@ -377,17 +450,17 @@ def evaluate_model(model, test_loader, criterion, device, output_features, y_sca
             print(f"Error during inverse transform: {str(e)}")
             traceback.print_exc()  # Print full traceback for debugging
     
-    # Save predictions and targets only (without trial indices)
+    # Save predictions and targets
     npz_path = output_dir / "predictions.npz"
     np.savez(npz_path, targets=all_targets, predictions=all_predictions)
-    print(f"Predictions saved to {npz_path} (without trial indices)")
+    print(f"Predictions saved to {npz_path} with exactly {frames_to_keep} frames per trial")
     
-    # Save the correct unique trial indices to a separate file (renamed from debug_trial_indices.npz)
+    # Save the unique trial indices to a separate file
     indices_path = output_dir / "trial_indices.npz"
     np.savez(indices_path, unique_trial_indices=sorted(unique_trial_indices))
     print(f"Unique trial indices saved to {indices_path}")
     
-    # Calculate metrics
+    # Calculate metrics for each feature
     metrics = {}
     for i, feature in enumerate(output_features):
         target_values = all_targets[:, i]
@@ -443,9 +516,10 @@ def evaluate_model(model, test_loader, criterion, device, output_features, y_sca
                 'r2': np.nan
             }
     
+    print(f"\nEvaluation complete - LSTM predictions saved with exactly {frames_to_keep} frames per trial (frames {start_frame+1}-{end_frame+1})")
     return metrics
 
-def objective(trial, data_loaders, input_features, output_features, device, leg_prefix):
+def objective(trial, data_loaders, input_features, output_features, device, leg_prefix, y_scaler=None, data_path=None, shared_trial_splits=None, shared_filtered_to_original=None, leg_dir=None, leg_name=None):
     """Optuna objective function for hyperparameter optimization."""
     # Note: train_loader in data_loaders[0] uses TrialSampler which shuffles trials but keeps sequences within trials ordered
     
@@ -454,8 +528,33 @@ def objective(trial, data_loaders, input_features, output_features, device, leg_
         'hidden_size': trial.suggest_int('hidden_size', 32, 256),
         'num_layers': trial.suggest_int('num_layers', 1, 4),
         'dropout': trial.suggest_float('dropout', 0.1, 0.5),
-        'learning_rate': trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
+        'learning_rate': trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True),
+        'sequence_length': trial.suggest_int('sequence_length', 20, 100, step=10),  # Optimize sequence length
     }
+    
+    # Prepare data with the current sequence length parameter if data_path is provided
+    if data_path is not None and leg_dir is not None and leg_name is not None and shared_trial_splits is not None and shared_filtered_to_original is not None:
+        print(f"\nTrial: Testing sequence_length={config['sequence_length']}")
+        (
+            _, _, _, _, _,
+            trial_train_loader, trial_val_loader, _,
+            trial_X_scaler, trial_y_scaler, _, _
+        ) = prepare_data(
+            data_path=data_path,
+            input_features=input_features,
+            output_features=output_features,
+            sequence_length=config['sequence_length'],
+            output_dir=leg_dir,
+            leg_name=f"{leg_name}_trial{trial.number}",
+            fixed_trial_splits=shared_trial_splits,
+            fixed_filtered_to_original=shared_filtered_to_original
+        )
+        
+        train_loader, val_loader = trial_train_loader, trial_val_loader
+        y_scaler = trial_y_scaler
+    else:
+        # Use the provided data loaders directly
+        train_loader, val_loader = data_loaders
     
     # Create model with suggested hyperparameters
     model = LSTMPredictor(
@@ -471,92 +570,20 @@ def objective(trial, data_loaders, input_features, output_features, device, leg_
     print(f"\nUsing standard MAE loss")
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     
-    train_loader, val_loader = data_loaders
-    best_val_loss = float('inf')
+    # Train model with current parameters
+    best_model_state, best_val_loss = train_model(
+        model,
+        train_loader,
+        val_loader,
+        criterion,
+        optimizer,
+        num_epochs=100,  # Limited epochs for hyperparameter search
+        device=device,
+        y_scaler=y_scaler,
+        patience=5      # Reduced patience for faster trials
+    )
     
-    # Training loop
-    for epoch in range(50):  # Maximum epochs for hyperparameter search
-        # Training phase
-        model.train()
-        for batch_data in train_loader:
-            # Unpack the batch data - now includes trial indices
-            inputs, targets, _ = batch_data  # Ignore trial indices during training
-            
-            # Skip batches with NaN values
-            if torch.isnan(inputs).any() or torch.isnan(targets).any():
-                continue
-                
-            inputs, targets = inputs.to(device), targets.to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            
-            # Skip if outputs contain NaN
-            if torch.isnan(outputs).any():
-                continue
-                
-            loss = criterion(outputs, targets)
-            
-            # Skip NaN losses
-            if torch.isnan(loss):
-                continue
-                
-            loss.backward()
-            optimizer.step()
-        
-        # Validation phase
-        model.eval()
-        val_loss = 0.0
-        val_count = 0  # Keep track of valid batches
-        
-        with torch.no_grad():
-            for batch_data in val_loader:
-                # Unpack the batch data - now includes trial indices
-                inputs, targets, _ = batch_data  # Ignore trial indices during validation
-                
-                # Skip batches with NaN values
-                if torch.isnan(inputs).any() or torch.isnan(targets).any():
-                    continue
-                    
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
-                
-                # Skip if outputs contain NaN
-                if torch.isnan(outputs).any():
-                    continue
-                    
-                loss = criterion(outputs, targets)
-                
-                # Skip NaN losses
-                if torch.isnan(loss):
-                    continue
-                    
-                val_loss += loss.item()
-                val_count += 1
-        
-        # Avoid division by zero
-        if val_count == 0:
-            print("Warning: No valid validation batches found. Returning maximum loss.")
-            return float('inf')
-            
-        val_loss = val_loss / val_count
-        
-        # Early stopping based on validation loss
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= 1:  # Early stopping patience
-                break
-        
-        # Report intermediate value
-        trial.report(val_loss, epoch)
-        
-        # Handle pruning based on the intermediate value
-        if trial.should_prune():
-            raise optuna.exceptions.TrialPruned()
-    
-    return best_val_loss
+    return best_val_loss  # This is the objective value that Optuna will minimize
 
 def save_trial_splits_info(trial_splits, filtered_to_original, filtered_trials, output_dir, leg_name):
     """Save information about trial splits to text files."""
@@ -630,7 +657,7 @@ def main():
     
     # Configuration
     base_config = {
-        'sequence_length': 50,
+        'sequence_length': 50,  # Initial value, will be optimized by Optuna for each leg
         'batch_size': 32,
         'num_epochs': 200,
         'patience': 10,
@@ -899,7 +926,26 @@ def main():
                     'num_layers': trial.suggest_int('num_layers', 1, 4),
                     'dropout': trial.suggest_float('dropout', 0.1, 0.5, step=0.1),
                     'learning_rate': trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True),
+                    'sequence_length': trial.suggest_int('sequence_length', 20, 100, step=10),  # Optimize sequence length
                 }
+                
+                print(f"\nTrial {trial.number}: Testing sequence_length={config['sequence_length']}")
+                
+                # Prepare data with the current sequence length parameter
+                (
+                    _, _, _, _, _,
+                    trial_train_loader, trial_val_loader, _,
+                    trial_X_scaler, trial_y_scaler, _, _
+                ) = prepare_data(
+                    data_path=data_path,
+                    input_features=input_features,
+                    output_features=output_features,
+                    sequence_length=config['sequence_length'],
+                    output_dir=leg_dir,
+                    leg_name=f"{leg_name}_trial{trial.number}",
+                    fixed_trial_splits=shared_trial_splits,
+                    fixed_filtered_to_original=shared_filtered_to_original
+                )
                 
                 # Create model with suggested hyperparameters
                 model = LSTMPredictor(
@@ -918,16 +964,16 @@ def main():
                 # Train the model
                 best_model_state, best_val_loss = train_model(
                     model,
-                    train_loader,
-                    val_loader,
+                    trial_train_loader,
+                    trial_val_loader,
                     criterion,
                     optimizer,
                     num_epochs=100,  # Limited epochs for hyperparameter search
                     device=device,
+                    y_scaler=trial_y_scaler,
                     patience=5      # Reduced patience for faster trials
                 )
                 
-                # Return the best validation loss
                 return best_val_loss
             
             # Run the optimization
@@ -991,6 +1037,23 @@ def main():
             
             # Train the best model with full epochs
             print(f"\nTraining the best model for {leg_name} with full epochs...")
+            print(f"Using best sequence_length: {best_params['sequence_length']}")
+            
+            # Prepare data with the best sequence length parameter
+            (
+                df, all_filtered_trials, train_trials, val_trials, test_trials,
+                best_train_loader, best_val_loader, best_test_loader,
+                X_scaler, y_scaler, trial_splits, filtered_to_original
+            ) = prepare_data(
+                data_path=data_path,
+                input_features=input_features,
+                output_features=output_features,
+                sequence_length=best_params['sequence_length'],
+                output_dir=leg_dir,
+                leg_name=f"{leg_name}_best",
+                fixed_trial_splits=shared_trial_splits,
+                fixed_filtered_to_original=shared_filtered_to_original
+            )
             
             # Create model with best hyperparameters
             best_model = LSTMPredictor(
@@ -1010,13 +1073,14 @@ def main():
             # Train the best model with full epochs
             best_model_state, best_val_loss = train_model(
                 best_model,
-                train_loader,
-                val_loader,
+                best_train_loader,
+                best_val_loader,
                 best_criterion,
                 best_optimizer,
                 base_config['num_epochs'],
                 device,
-                base_config['patience']
+                y_scaler,
+                patience=base_config['patience']
             )
             
             print(f"\nFull training completed for {leg_name}. Best validation loss: {best_val_loss:.4f}")
@@ -1027,7 +1091,7 @@ def main():
             # Evaluate model and save predictions
             metrics = evaluate_model(
                 best_model,
-                test_loader,
+                best_test_loader,
                 best_criterion,
                 device,
                 output_features,
@@ -1053,10 +1117,12 @@ def main():
                 'trial_splits': trial_splits,
                 'filtered_to_original': filtered_to_original,
                 'optuna_study_name': study_name,
-                'optuna_best_trial': best_trial.number
+                'optuna_best_trial': best_trial.number,
+                'sequence_length': best_params['sequence_length']  # Save sequence length explicitly
             }, model_save_path)
             
             print(f"\nBest model and results saved to: {model_save_path}")
+            print(f"Best sequence length: {best_params['sequence_length']}")
             
             # Log successful completion
             with open(error_log, 'a') as f:

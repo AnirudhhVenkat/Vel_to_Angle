@@ -47,6 +47,27 @@ class WholeTrialDataset(Dataset):
             trial_indices: List of trial indices (for traceability)
             filtered_to_original: Mapping from filtered trial indices to original indices
         """
+        # Check for NaN values before converting to tensors
+        self.has_nans = {
+            'X': np.isnan(X).any(),
+            'y': np.isnan(y).any()
+        }
+        
+        if self.has_nans['X'] or self.has_nans['y']:
+            print(f"\nWARNING: NaN values detected in dataset:")
+            print(f"  X has NaNs: {self.has_nans['X']} - {np.isnan(X).sum()}/{X.size} values")
+            print(f"  y has NaNs: {self.has_nans['y']} - {np.isnan(y).sum()}/{y.size} values")
+            
+            # Replace NaN values with 0 for X input features
+            if self.has_nans['X']:
+                print("  Replacing NaN values in X with 0")
+                X = np.nan_to_num(X, nan=0.0)
+            
+            # Replace NaN values with 0 for y target values
+            if self.has_nans['y']:
+                print("  Replacing NaN values in y with 0")
+                y = np.nan_to_num(y, nan=0.0)
+        
         self.X = torch.FloatTensor(X)
         self.y = torch.FloatTensor(y)
         self.trial_indices = trial_indices
@@ -79,6 +100,13 @@ class ZScoreScaler:
             self.feature_names = X.columns.tolist()
             X = X.values
         
+        # Check for NaN values before fitting
+        if np.isnan(X).any():
+            print(f"\nWARNING: NaN values detected in data during scaler fitting.")
+            print(f"  Number of NaNs: {np.isnan(X).sum()}/{X.size}")
+            print(f"  Replacing NaN values with 0 before computing means and stds")
+            X = np.nan_to_num(X, nan=0.0)
+            
         # Handle 3D input (trials, time, features)
         if X.ndim == 3:
             # Reshape to 2D to fit
@@ -101,13 +129,40 @@ class ZScoreScaler:
         if isinstance(X, pd.DataFrame):
             X = X.values
         
+        # Check for NaN values before transforming
+        if np.isnan(X).any():
+            print(f"\nWARNING: NaN values detected in data during transformation.")
+            print(f"  Number of NaNs: {np.isnan(X).sum()}/{X.size}")
+            print(f"  Replacing NaN values with 0 before normalization")
+            X = np.nan_to_num(X, nan=0.0)
+        
         # Handle 3D input (trials, time, features)
         if X.ndim == 3:
             # Apply normalization along the feature dimension
-            return (X - self.means) / self.stds
+            normalized = (X - self.means) / self.stds
+            
+            # Check for NaN values after normalization
+            if np.isnan(normalized).any():
+                print(f"\nWARNING: NaN values introduced after normalization!")
+                print(f"  Number of NaNs: {np.isnan(normalized).sum()}/{normalized.size}")
+                print(f"  This could be due to division by zero or other numerical issues.")
+                print(f"  Replacing NaN values with 0")
+                normalized = np.nan_to_num(normalized, nan=0.0)
+                
+            return normalized
         else:
             # Standard 2D case
-            return (X - self.means) / self.stds
+            normalized = (X - self.means) / self.stds
+            
+            # Check for NaN values after normalization
+            if np.isnan(normalized).any():
+                print(f"\nWARNING: NaN values introduced after normalization!")
+                print(f"  Number of NaNs: {np.isnan(normalized).sum()}/{normalized.size}")
+                print(f"  This could be due to division by zero or other numerical issues.")
+                print(f"  Replacing NaN values with 0")
+                normalized = np.nan_to_num(normalized, nan=0.0)
+                
+            return normalized
     
     def fit_transform(self, X):
         """Fit to data, then transform it."""
@@ -117,7 +172,25 @@ class ZScoreScaler:
         """Convert back to original scale."""
         if isinstance(X, pd.DataFrame):
             X = X.values
-        return X * self.stds + self.means
+            
+        # Check for NaN values before inverse transforming
+        if np.isnan(X).any():
+            print(f"\nWARNING: NaN values detected in data during inverse transformation.")
+            print(f"  Number of NaNs: {np.isnan(X).sum()}/{X.size}")
+            print(f"  Replacing NaN values with 0 before inverse normalization")
+            X = np.nan_to_num(X, nan=0.0)
+            
+        # Apply inverse transformation
+        inverse_transformed = X * self.stds + self.means
+        
+        # Check for NaN values after inverse transformation
+        if np.isnan(inverse_transformed).any():
+            print(f"\nWARNING: NaN values introduced after inverse transformation!")
+            print(f"  Number of NaNs: {np.isnan(inverse_transformed).sum()}/{inverse_transformed.size}")
+            print(f"  Replacing NaN values with 0")
+            inverse_transformed = np.nan_to_num(inverse_transformed, nan=0.0)
+            
+        return inverse_transformed
 
 def filter_trial_frames(X_trials, y_trials, start_frame=350, end_frame=1000):
     """
@@ -133,17 +206,56 @@ def filter_trial_frames(X_trials, y_trials, start_frame=350, end_frame=1000):
     Returns:
         Tuple of filtered X_trials, y_trials
     """
+    # Check for NaN values before filtering
+    if np.isnan(X_trials).any():
+        print(f"\nWARNING: NaN values detected in X_trials before filtering.")
+        print(f"  Number of NaNs: {np.isnan(X_trials).sum()}/{X_trials.size}")
+        
+    if np.isnan(y_trials).any():
+        print(f"\nWARNING: NaN values detected in y_trials before filtering.")
+        print(f"  Number of NaNs: {np.isnan(y_trials).sum()}/{y_trials.size}")
+        
     filtered_X = []
     filtered_y = []
     
     for i in range(len(X_trials)):
         # Extract the frames we want to keep
-        filtered_X.append(X_trials[i, start_frame:end_frame+1, :])
-        filtered_y.append(y_trials[i, start_frame:end_frame+1, :])
+        trial_X = X_trials[i, start_frame:end_frame+1, :]
+        trial_y = y_trials[i, start_frame:end_frame+1, :]
+        
+        # Check if this specific trial has NaN values
+        if np.isnan(trial_X).any():
+            print(f"  Trial {i}: Has {np.isnan(trial_X).sum()}/{trial_X.size} NaN values in X")
+            
+            # Replace NaN values with 0
+            trial_X = np.nan_to_num(trial_X, nan=0.0)
+            
+        if np.isnan(trial_y).any():
+            print(f"  Trial {i}: Has {np.isnan(trial_y).sum()}/{trial_y.size} NaN values in y")
+            
+            # Replace NaN values with 0
+            trial_y = np.nan_to_num(trial_y, nan=0.0)
+            
+        # Add to filtered lists
+        filtered_X.append(trial_X)
+        filtered_y.append(trial_y)
     
     # Stack trials back into 3D arrays
     filtered_X = np.stack(filtered_X)
     filtered_y = np.stack(filtered_y)
+    
+    # Check for NaN values after filtering
+    if np.isnan(filtered_X).any():
+        print(f"\nWARNING: NaN values still present in filtered_X after filtering.")
+        print(f"  Number of NaNs: {np.isnan(filtered_X).sum()}/{filtered_X.size}")
+        print(f"  Replacing remaining NaN values with 0")
+        filtered_X = np.nan_to_num(filtered_X, nan=0.0)
+        
+    if np.isnan(filtered_y).any():
+        print(f"\nWARNING: NaN values still present in filtered_y after filtering.")
+        print(f"  Number of NaNs: {np.isnan(filtered_y).sum()}/{filtered_y.size}")
+        print(f"  Replacing remaining NaN values with 0")
+        filtered_y = np.nan_to_num(filtered_y, nan=0.0)
     
     print(f"Filtered data shapes:")
     print(f"X: {filtered_X.shape}")
@@ -250,7 +362,79 @@ def calculate_enhanced_features(trials_data, frames_per_trial):
     return enhanced_trials
 
 def get_available_data_path(genotype):
-    """Try multiple possible data paths and return the first available one based on genotype."""
+    """
+    Try multiple possible data paths and return the first available one based on genotype.
+    
+    IMPORTANT: Now prioritizes normalized data files if available.
+    
+    Args:
+        genotype (str): The genotype to search for (ES, BPN, etc.)
+        
+    Returns:
+        str: Path to the data file (as a string)
+    """
+    # Define the exact normalized file paths the user provided
+    normalized_files_exact = {
+        'BPN': "C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/BPN_P9LT_P9RT_flyCoords_normalized_20250331_215833.csv",
+        'P9RT': "C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/BPN_P9LT_P9RT_flyCoords_normalized_20250331_215833.csv",
+        'P9LT': "C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/BPN_P9LT_P9RT_flyCoords_normalized_20250331_215833.csv",
+        'ES': "C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/df_preproc_fly_centric_normalized_20250331_215833.parquet",
+        'R1': "C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/BPN_P9LT_P9RT_flyCoords_normalized_20250331_215833.csv",
+        'R2': "C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/BPN_P9LT_P9RT_flyCoords_normalized_20250331_215833.csv",
+        'R3': "C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/BPN_P9LT_P9RT_flyCoords_normalized_20250331_215833.csv",
+        'L1': "C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/BPN_P9LT_P9RT_flyCoords_normalized_20250331_215833.csv",
+        'L2': "C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/BPN_P9LT_P9RT_flyCoords_normalized_20250331_215833.csv",
+        'L3': "C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/BPN_P9LT_P9RT_flyCoords_normalized_20250331_215833.csv",
+    }
+    
+    # Check if there's an exact match for this genotype
+    if genotype in normalized_files_exact:
+        exact_path = normalized_files_exact[genotype]
+        if Path(exact_path).exists():
+            print(f"Using exact normalized data file: {exact_path}")
+            return exact_path
+    
+    # First check for normalized data files in the normalized_data directory
+    normalized_dir = Path("normalized_data")
+    if normalized_dir.exists():
+        # Look for normalized files with matching genotype in the filename
+        normalized_files = []
+        for ext in ['.csv', '.parquet']:
+            if genotype == 'ES':
+                # For ES genotype
+                normalized_files.extend(list(normalized_dir.glob(f"*ES*_normalized_*{ext}")))
+                normalized_files.extend(list(normalized_dir.glob(f"*df_preproc_fly_centric*_normalized_*{ext}")))
+            else:
+                # For BPN, P9RT, P9LT genotypes
+                normalized_files.extend(list(normalized_dir.glob(f"*BPN*_normalized_*{ext}")))
+                normalized_files.extend(list(normalized_dir.glob(f"*P9*_normalized_*{ext}")))
+                normalized_files.extend(list(normalized_dir.glob(f"*flyCoords*_normalized_*{ext}")))
+        
+        if normalized_files:
+            # Sort by timestamp (newest first) - timestamps are in format YYYYMMDD_HHMMSS
+            normalized_files.sort(key=lambda x: str(x), reverse=True)
+            newest_file = normalized_files[0]
+            print(f"Using newest normalized data file: {newest_file}")
+            # Return as string
+            return str(newest_file)
+        else:
+            print(f"No normalized data files found for genotype {genotype} using glob pattern.")
+            
+            # Try the absolute path as a final check
+            if genotype in ['BPN', 'P9RT', 'P9LT', 'R1', 'R2', 'R3', 'L1', 'L2', 'L3']:
+                abs_path = Path("C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/BPN_P9LT_P9RT_flyCoords_normalized_20250331_215833.csv")
+                if abs_path.exists():
+                    print(f"Using hardcoded normalized BPN/P9 data file: {abs_path}")
+                    return str(abs_path)
+            elif genotype == 'ES':
+                abs_path = Path("C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/df_preproc_fly_centric_normalized_20250331_215833.parquet")
+                if abs_path.exists():
+                    print(f"Using hardcoded normalized ES data file: {abs_path}")
+                    return str(abs_path)
+                    
+            print(f"Falling back to original files for genotype {genotype}.")
+    
+    # If no normalized files found, fall back to original files
     if genotype == 'ES':
         possible_paths = [
             r"Z:\Divya\TEMP_transfers\toAni\4_StopProjectData_forES\df_preproc_fly_centric.parquet"
@@ -264,10 +448,10 @@ def get_available_data_path(genotype):
     
     for path in possible_paths:
         if Path(path).exists():
-            print(f"Using data file: {path}")
-            return path
+            print(f"Using original data file: {path}")
+            return path  # Already a string
     
-    raise FileNotFoundError(f"Could not find the data file for genotype {genotype}")
+    raise FileNotFoundError(f"Could not find any data file for genotype {genotype}")
 
 def prepare_data_no_windows(data_path, input_features, output_features, pred_len, output_dir=None, leg_name=None, fixed_trial_splits=None, fixed_filtered_to_original=None):
     """
@@ -304,6 +488,30 @@ def prepare_data_no_windows(data_path, input_features, output_features, pred_len
     else:
         print("\nGenerating new trial splits")
     
+    # Check if we need to load ES data as well
+    es_data_path = None
+    leg_names = ['R1', 'R2', 'R3', 'L1', 'L2', 'L3']
+    bpn_data_path = "C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/BPN_P9LT_P9RT_flyCoords_normalized_20250331_215833.csv"
+    
+    # Load ES data separately if:
+    # 1. The path doesn't contain 'ES' AND
+    # 2. Either the path is the BPN normalized file OR no leg name is in the path
+    if 'ES' not in data_path and (data_path == bpn_data_path or not any(leg in data_path for leg in leg_names)):
+        # Try to find ES data path
+        possible_es_paths = [
+            r"Z:\Divya\TEMP_transfers\toAni\4_StopProjectData_forES\df_preproc_fly_centric.parquet",
+            "C:/Users/bidayelab/Vel_to_Angle/new/normalized_data/df_preproc_fly_centric_normalized_20250331_215833.parquet"
+        ]
+        
+        for path in possible_es_paths:
+            if Path(path).exists():
+                es_data_path = path
+                print(f"Found ES data at: {es_data_path}")
+                break
+    else:
+        # When the path contains 'ES' or a leg name, it's using normalized data that should already have all genotypes
+        print(f"Using normalized data path that should include all genotypes: {data_path}")
+    
     # Load main data
     if str(data_path).endswith('.csv'):
         df = pd.read_csv(data_path)
@@ -313,6 +521,29 @@ def prepare_data_no_windows(data_path, input_features, output_features, pred_len
         raise ValueError(f"Unsupported file format: {data_path}")
     
     print(f"Main data loaded with shape: {df.shape}")
+    
+    # Load ES data if available
+    if es_data_path:
+        print(f"Loading ES data from {es_data_path}...")
+        es_df = pd.read_parquet(es_data_path)
+        
+        # Filter to only include ES genotype
+        if 'genotype' in es_df.columns:
+            es_df = es_df[es_df['genotype'] == 'ES'].copy()
+            print(f"ES data filtered to shape: {es_df.shape}")
+        
+        # Check if the ES data has the required columns
+        required_cols = ['x_vel', 'y_vel', 'z_vel'] + output_features
+        missing_cols = [col for col in required_cols if col not in es_df.columns]
+        
+        if missing_cols:
+            print(f"Warning: ES data is missing required columns: {missing_cols}")
+            print("ES data will not be included.")
+        else:
+            # Combine the datasets
+            print("Combining main data with ES data...")
+            df = pd.concat([df, es_df], ignore_index=True)
+            print(f"Combined data shape: {df.shape}")
     
     # Print genotype distribution
     print("\nGenotype distribution in data:")

@@ -11,7 +11,6 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 from datetime import datetime
 import json
-from utils.data import TimeSeriesDataset, filter_frames
 import optuna
 from optuna.trial import TrialState
 import shutil
@@ -19,6 +18,33 @@ import pickle
 import traceback
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from matplotlib.backends.backend_pdf import PdfPages
+from scipy import signal
+import random
+import os
+
+# Import Optuna visualization capabilities
+import optuna.visualization
+import plotly
+
+# Import prepare_data_no_windows from no_window_data
+from data import (
+    set_all_seeds,
+    TrialAwareSequenceDataset,
+    TrialSampler,
+    ZScoreScaler,
+    filter_trial_frames,
+    calculate_enhanced_features,
+    get_available_data_path,
+    calculate_psd_features,
+    add_psd_features,
+    prepare_data,
+)
+
+# Add import from no_window_data
+from no_window_data import (
+    WholeTrialDataset,
+    prepare_data_no_windows,
+)
 
 class Chomp1d(nn.Module):
     """Helper module to ensure causal convolutions"""
@@ -52,6 +78,14 @@ class TemporalBlock(nn.Module):
         
         self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
         self.relu = nn.ReLU()
+        self.init_weights()
+
+    def init_weights(self):
+        """Initialize weights using normal initialization"""
+        self.conv1.weight.data.normal_(0, 0.01)
+        self.conv2.weight.data.normal_(0, 0.01)
+        if self.downsample is not None:
+            self.downsample.weight.data.normal_(0, 0.01)
 
     def forward(self, x):
         out = self.net(x)
@@ -92,937 +126,1164 @@ class TemporalConvNet(nn.Module):
         print(f"Kernel size: {kernel_size}")
         print(f"Sequence length: {sequence_length}")
         print(f"Output size: {output_size}")
+        print(f"Dropout: {dropout}")
         
     def forward(self, x):
-        # Input shape: [batch, features, sequence]
-        out = self.network(x)
-        # Take only the last timestep: [batch, channels, 1]
-        out = out[:, :, -1]
-        # Output shape: [batch, output_size]
-        return self.final(out)
+        # Ensure input is in the correct format [batch, features, sequence]
+        if x.shape[1] != x.shape[2] and x.shape[1] == self.sequence_length:
+            # If input is [batch, sequence, features], transpose to [batch, features, sequence]
+            x = x.transpose(1, 2)
+            
+        # Process through TCN layers
+        out = self.network(x)  # Shape: [batch, channels, sequence]
+        
+        # Apply final layer to each time step
+        # First transpose to [batch, sequence, channels]
+        out = out.transpose(1, 2)
+        
+        # Apply final layer to each timestep
+        batch_size, seq_len, channels = out.shape
+        out = out.reshape(-1, channels)  # Reshape to [batch*seq_len, channels]
+        out = self.final(out)  # Shape: [batch*seq_len, output_size]
+        
+        # Reshape back to [batch, sequence, output_size]
+        out = out.reshape(batch_size, seq_len, -1)
+        
+        return out
 
-def filter_trial_frames(X, y, sequence_length):
-    """
-    Filter frames 400-1000 for each trial, ensuring proper context for sequences.
-    
-    Args:
-        X: Input features array
-        y: Target values array
-        sequence_length: Length of input sequences for TCN
-    """
-    filtered_X = []
-    filtered_y = []
-    frames_per_trial = 1400  # Total frames per trial
-    eval_frames = (400, 1000)  # Frame range to evaluate
-    num_trials = len(X) // frames_per_trial
-    
-    print(f"\nFrame filtering details:")
-    print(f"  Total frames per trial: {frames_per_trial}")
-    print(f"  Evaluation frame range: {eval_frames}")
-    print(f"  Sequence length: {sequence_length}")
-    print(f"  Number of trials: {num_trials}")
-    
-    for trial in range(num_trials):
-        trial_start = trial * frames_per_trial
-        
-        # Calculate indices for this trial
-        eval_start = trial_start + eval_frames[0]  # Frame 400
-        eval_end = trial_start + eval_frames[1]    # Frame 1000
-        context_start = eval_start - sequence_length + 1  # Include context for first prediction
-        
-        # Extract frames including context
-        trial_X = X[context_start:eval_end]
-        trial_y = y[context_start:eval_end]
-        
-        filtered_X.append(trial_X)
-        filtered_y.append(trial_y)
-        
-        if trial == 0:  # Print details for first trial
-            print(f"\nFirst trial frame details:")
-            print(f"  Trial start: {trial_start}")
-            print(f"  Context start: {context_start} (frame {eval_frames[0] - sequence_length + 1} of trial)")
-            print(f"  Eval start: {eval_start} (frame {eval_frames[0]} of trial)")
-            print(f"  Eval end: {eval_end} (frame {eval_frames[1]} of trial)")
-            print(f"  Total frames: {len(trial_X)}")
-            print(f"  Context frames: {eval_start - context_start}")
-            print(f"  Evaluation frames: {eval_end - eval_start}")
-    
-    X_filtered = np.concatenate(filtered_X)
-    y_filtered = np.concatenate(filtered_y)
-    
-    print(f"\nFiltered data shapes:")
-    print(f"  X: {X_filtered.shape}")
-    print(f"  y: {y_filtered.shape}")
-    
-    return X_filtered, y_filtered
+# Set seed for all random operations
+def set_all_seeds(seed=42):
+    """Set seeds for all random number generators for reproducibility."""
+    random.seed(seed)  
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"All random seeds set to {seed}")
 
-class SequenceDataset(Dataset):
-    """Dataset for TCN training with sequences"""
-    def __init__(self, X, y, sequence_length=50):
-        """
-        Initialize sequence dataset.
-        
-        Args:
-            X (np.ndarray): Input features array of shape (num_samples, num_features)
-            y (np.ndarray): Target values array of shape (num_samples, num_targets)
-            sequence_length (int): Length of input sequences
-        """
-        self.X = torch.FloatTensor(X)
-        self.y = torch.FloatTensor(y)
-        self.sequence_length = sequence_length
-        
-        # Calculate valid indices that will result in predictions for frames 400-1000
-        frames_per_trial = 600  # Number of frames to predict per trial (1000 - 400)
-        self.valid_indices = []
-        
-        # Each trial in the filtered data starts with (sequence_length-1) context frames
-        # followed by the frames we want to predict (400-1000)
-        total_sequence = sequence_length - 1 + frames_per_trial  # Context + prediction frames
-        num_trials = len(self.X) // total_sequence
-        
-        for trial in range(num_trials):
-            trial_start = trial * total_sequence
-            # Add indices that will result in predictions for frames 400-1000
-            for i in range(frames_per_trial):
-                sequence_start = trial_start + i
-                self.valid_indices.append(sequence_start)
-    
-    def __len__(self):
-        """Return the number of sequences in the dataset"""
-        return len(self.valid_indices)
-    
-    def __getitem__(self, idx):
-        """Get a sequence and its target"""
-        sequence_start = self.valid_indices[idx]
-        sequence_end = sequence_start + self.sequence_length
-        
-        # Get sequence of input features
-        # Shape: (sequence_length, num_features) -> (num_features, sequence_length)
-        sequence = self.X[sequence_start:sequence_end].transpose(0, 1)
-        
-        # Get target (last frame's angles)
-        target = self.y[sequence_end - 1]
-        
-        return sequence, target
+# Call the function at the beginning
+set_all_seeds(42)
 
-class ZScoreScaler:
-    """Z-score normalization scaler with feature-wise scaling"""
-    def __init__(self, means=None, stds=None, feature_names=None):
-        self.means = means if means is not None else None
-        self.stds = stds if stds is not None else None
-        self.feature_names = feature_names
-    
-    def fit(self, X):
-        """Compute mean and std for each feature"""
-        if isinstance(X, (pd.DataFrame, pd.Series)):
-            X = X.values
-        self.means = np.mean(X, axis=0)
-        self.stds = np.std(X, axis=0)
-        # Prevent division by zero
-        self.stds[self.stds == 0] = 1
-        return self
-    
-    def transform(self, X):
-        """Apply z-score normalization"""
-        if isinstance(X, (pd.DataFrame, pd.Series)):
-            X = X.values
-        if self.means is None or self.stds is None:
-            raise ValueError("Scaler has not been fitted yet.")
-        
-        # Convert means and stds to numpy arrays if they're dictionaries
-        if isinstance(self.means, dict):
-            means_array = np.array([self.means[feat] for feat in self.feature_names])
-            stds_array = np.array([self.stds[feat] for feat in self.feature_names])
-            return (X - means_array) / stds_array
-        else:
-            return (X - self.means) / self.stds
-    
-    def fit_transform(self, X):
-        """Fit and transform in one step"""
-        return self.fit(X).transform(X)
-    
-    def inverse_transform(self, X):
-        """Reverse the z-score normalization"""
-        if isinstance(X, (pd.DataFrame, pd.Series)):
-            X = X.values
-        if self.means is None or self.stds is None:
-            raise ValueError("Scaler has not been fitted yet.")
-        
-        # Convert means and stds to numpy arrays if they're dictionaries
-        if isinstance(self.means, dict):
-            means_array = np.array([self.means[feat] for feat in self.feature_names])
-            stds_array = np.array([self.stds[feat] for feat in self.feature_names])
-            return X * stds_array + means_array
-        else:
-            return X * self.stds + self.means
-
-def prepare_data(data_path, input_features, output_features, sequence_length, genotype='ALL'):
-    """Load and prepare data for training."""
-    print("\nPreparing data...")
-    
-    # Load data
-    df = pd.read_csv(data_path)
-    print(f"Loaded data with shape: {df.shape}")
-    
-    # Filter for specific genotype if requested
-    if genotype != 'ALL':
-        df = df[df['genotype'] == genotype].copy()
-        print(f"Filtered for {genotype} genotype: {df.shape}")
-    
-    # Create trial IDs based on frame numbers
-    trial_size = 1400
-    num_trials = len(df) // trial_size
-    print(f"\nInitial number of trials: {num_trials}")
-    print(f"Total frames: {len(df)}")
-    print(f"Remainder frames: {len(df) % trial_size}")
-    
-    # Keep only complete trials
-    complete_trials_data = df.iloc[:num_trials * trial_size].copy()
-    print(f"Keeping only complete trials: {len(complete_trials_data)} frames")
-    
-    # Create trial IDs
-    complete_trials_data['trial_id'] = np.repeat(np.arange(num_trials), trial_size)
-    
-    # Calculate split sizes
-    train_size = int(0.7 * num_trials)
-    val_size = int(0.15 * num_trials)
-    test_size = num_trials - train_size - val_size
-    
-    print(f"\nSplitting data by trials:")
-    print(f"Train: {train_size} trials")
-    print(f"Validation: {val_size} trials")
-    print(f"Test: {test_size} trials")
-    
-    # Create random permutation of trial indices
-    np.random.seed(42)  # For reproducibility
-    trial_indices = np.random.permutation(num_trials)
-    
-    # Split trial indices into train/val/test
-    train_trials = trial_indices[:train_size]
-    val_trials = trial_indices[train_size:train_size + val_size]
-    test_trials = trial_indices[train_size + val_size:]
-    
-    print("\nTrial assignments:")
-    print(f"Training trials: {sorted(train_trials)}")
-    print(f"Validation trials: {sorted(val_trials)}")
-    print(f"Test trials: {sorted(test_trials)}")
-    
-    # Create masks for each split
-    train_mask = np.zeros(len(complete_trials_data), dtype=bool)
-    val_mask = np.zeros(len(complete_trials_data), dtype=bool)
-    test_mask = np.zeros(len(complete_trials_data), dtype=bool)
-    
-    # Assign trials to splits using the random indices
-    for trial in train_trials:
-        start_idx = trial * trial_size
-        end_idx = (trial + 1) * trial_size
-        train_mask[start_idx:end_idx] = True
-    
-    for trial in val_trials:
-        start_idx = trial * trial_size
-        end_idx = (trial + 1) * trial_size
-        val_mask[start_idx:end_idx] = True
-    
-    for trial in test_trials:
-        start_idx = trial * trial_size
-        end_idx = (trial + 1) * trial_size
-        test_mask[start_idx:end_idx] = True
-    
-    # Split data
-    train_data = complete_trials_data[train_mask].copy()
-    val_data = complete_trials_data[val_mask].copy()
-    test_data = complete_trials_data[test_mask].copy()
-    
-    # Extract features and targets
-    X = train_data[input_features].values
-    y = train_data[output_features].values
-    
-    # Reshape data into trials
-    X_trials = X.reshape(num_trials, trial_size, -1)
-    y_trials = y.reshape(num_trials, trial_size, -1)
-    
-    # Scale input features
-    X_scaler = StandardScaler()
-    X_train_scaled = X_scaler.fit_transform(X)
-    X_val_scaled = X_scaler.transform(val_data[input_features].values)
-    X_test_scaled = X_scaler.transform(test_data[input_features].values)
-    
-    # Calculate z-score parameters for each target independently
-    y_means = {}
-    y_stds = {}
-    y_scaled = np.zeros_like(y_train)
-    
-    print("\nTarget Statistics and Z-score Verification:")
-    for i, feature in enumerate(output_features):
-        # Calculate parameters using only training data
-        y_means[feature] = np.mean(y_train[:, i])
-        y_stds[feature] = np.std(y_train[:, i])
-        
-        # Z-score all splits
-        y_scaled[:, i] = (y_train[:, i] - y_means[feature]) / y_stds[feature]
-        
-        # Verify z-scoring
-        z_mean = np.mean(y_scaled[:, i])
-        z_std = np.std(y_scaled[:, i])
-        
-        print(f"\n{feature}:")
-        print(f"  Original - Mean: {y_means[feature]:.2f}°, Std: {y_stds[feature]:.2f}°")
-        print(f"  Z-scored - Mean: {z_mean:.6f}, Std: {z_std:.6f}")
-    
-    # Create scaler for targets
-    y_scaler = ZScoreScaler(y_means, y_stds, output_features)
-    
-    # Scale targets
-    y_train_scaled = y_scaler.transform(y_train)
-    y_val_scaled = y_scaler.transform(val_data[output_features].values)
-    y_test_scaled = y_scaler.transform(test_data[output_features].values)
-    
-    print("\nFinal Dataset Sizes:")
-    print(f"Training: {len(X_train_scaled)} frames")
-    print(f"Validation: {len(X_val_scaled)} frames")
-    print(f"Test: {len(X_test_scaled)} frames")
-    
-    # Filter frames 400-1000 for each trial
-    X_train_filtered, y_train_filtered = filter_trial_frames(X_train_scaled, y_train_scaled, sequence_length)
-    X_val_filtered, y_val_filtered = filter_trial_frames(X_val_scaled, y_val_scaled, sequence_length)
-    X_test_filtered, y_test_filtered = filter_trial_frames(X_test_scaled, y_test_scaled, sequence_length)
-    
-    print("\nDataset sizes after filtering frames 400-1000:")
-    print(f"Training: {len(X_train_filtered)} frames")
-    print(f"Validation: {len(X_val_filtered)} frames")
-    print(f"Test: {len(X_test_filtered)} frames")
-    
-    # Create sequence datasets
-    train_dataset = SequenceDataset(X_train_filtered, y_train_filtered, sequence_length)
-    val_dataset = SequenceDataset(X_val_filtered, y_val_filtered, sequence_length)
-    test_dataset = SequenceDataset(X_test_filtered, y_test_filtered, sequence_length)
-    
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=64)
-    test_loader = DataLoader(test_dataset, batch_size=64)
-    
-    return (X_train_filtered, y_train_filtered), (X_val_filtered, y_val_filtered), (X_test_filtered, y_test_filtered), X_scaler, y_scaler
-
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, patience=20):
-    """Train the TCN model"""
-    model = model.to(device)  # Move model to device
-    train_losses = []
-    val_losses = []
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, patience=10):
+    """Train the TCN model with whole-trial data."""
+    # Note: Using whole-trial data with batch_size=1
+    model = model.to(device)
     best_val_loss = float('inf')
-    best_model_state = None
+    best_model = None
     patience_counter = 0
     
-    print("\nTraining Configuration:")
-    print(f"Device: {device}")
-    print(f"Number of epochs: {num_epochs}")
-    print(f"Training batches per epoch: {len(train_loader)}")
-    print(f"Validation batches per epoch: {len(val_loader)}")
-    print(f"Early stopping patience: {patience}")
-    
-    # Clear GPU cache if using CUDA
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        print(f"\nGPU Memory after clearing cache:")
-        print(f"  Allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
-        print(f"  Cached: {torch.cuda.memory_reserved(0) / 1024**2:.2f} MB")
-    
-    print("\nStarting training...")
     for epoch in range(num_epochs):
-        epoch_start_time = datetime.now()
+        # Debug: Check for NaN values in the first batch of the training set at the beginning of the epoch
+        first_batch = None
+        try:
+            # Get the first batch from the iterator without disturbing the DataLoader
+            for batch in train_loader:
+                first_batch = batch
+                break
+                
+            if first_batch is not None:
+                inputs, targets, _ = first_batch
+                print(f"\nDEBUG - First batch of epoch {epoch+1}:")
+                print(f"  Inputs shape: {inputs.shape}")
+                print(f"  Targets shape: {targets.shape}")
+                print(f"  Inputs has NaN: {torch.isnan(inputs).any().item()}")
+                print(f"  Targets has NaN: {torch.isnan(targets).any().item()}")
+                
+                if torch.isnan(inputs).any():
+                    nan_coords = torch.where(torch.isnan(inputs))
+                    print(f"  Number of NaN in inputs: {torch.isnan(inputs).sum().item()}/{inputs.numel()}")
+                    print(f"  First few NaN coordinates: {list(zip(*[c[:5].tolist() for c in nan_coords]))}")
+                
+                # Check input ranges
+                print(f"  Input range: [{inputs.min().item():.4f}, {inputs.max().item():.4f}]")
+                print(f"  Target range: [{targets.min().item():.4f}, {targets.max().item():.4f}]")
+                
+                # Check if batch can be successfully processed
+                inputs_test = inputs.clone().to(device)
+                inputs_test = inputs_test.transpose(1, 2)  # Transpose for TCN format
+                try:
+                    with torch.no_grad():
+                        outputs_test = model(inputs_test)
+                    print(f"  Model can process the inputs: Yes")
+                    print(f"  Outputs shape: {outputs_test.shape}")
+                    print(f"  Outputs has NaN: {torch.isnan(outputs_test).any().item()}")
+                    print(f"  Outputs range: [{outputs_test.min().item():.4f}, {outputs_test.max().item():.4f}]")
+                except Exception as e:
+                    print(f"  Model failed to process the inputs: {str(e)}")
+        except Exception as e:
+            print(f"Error during first batch debug: {str(e)}")
         
         # Training phase
         model.train()
         train_loss = 0.0
-        train_batches = 0
+        train_batch_count = 0  # Count valid batches
+        train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]')
         
-        print(f"\nEpoch [{epoch+1}/{num_epochs}]")
-        print("Training phase:")
-        progress_bar = tqdm(train_loader, desc="Training", leave=False)
+        # Track NaN statistics
+        train_batches_with_nan_inputs = 0
+        train_batches_with_nan_targets = 0
+        train_batches_with_nan_outputs = 0
+        train_batches_with_nan_loss = 0
         
-        for batch_idx, (inputs, targets) in enumerate(progress_bar):
-            # Move data to the same device as model
-            inputs = inputs.to(device)
-            targets = targets.to(device)
+        for batch_data in train_pbar:
+            # Unpack the batch data - now includes trial indices
+            inputs, targets, _ = batch_data  # Ignore trial indices during training
+            
+            # For whole-trial processing, inputs shape is [batch=1, trial_length, features]
+            # and targets shape is [batch=1, trial_length, outputs]
+            
+            # Check for NaN values in inputs and targets
+            if torch.isnan(inputs).any():
+                train_batches_with_nan_inputs += 1
+                train_pbar.set_postfix({'status': 'NaN inputs - skipped'})
+                continue
+                
+            if torch.isnan(targets).any():
+                train_batches_with_nan_targets += 1
+                train_pbar.set_postfix({'status': 'NaN targets - skipped'})
+                continue
+            
+            inputs, targets = inputs.to(device), targets.to(device)
             
             optimizer.zero_grad()
-            outputs = model(inputs)
+            
+            # For TCN, we need to transpose inputs to [batch, features, sequence]
+            # Model expects [batch, features, sequence] but our data is [batch, sequence, features]
+            inputs_transposed = inputs.transpose(1, 2)
+            
+            # Forward pass to get predictions for the entire sequence
+            outputs = model(inputs_transposed)  # Now returns predictions for all timesteps
+            
+            # Check for NaN in outputs
+            if torch.isnan(outputs).any():
+                train_batches_with_nan_outputs += 1
+                train_pbar.set_postfix({'status': 'NaN outputs - skipped'})
+                continue
+                
+            # Calculate loss across all timesteps (similar to LSTM)
             loss = criterion(outputs, targets)
+            
+            # Check if loss is NaN
+            if torch.isnan(loss):
+                train_batches_with_nan_loss += 1
+                train_pbar.set_postfix({'status': 'NaN loss - skipped'})
+                continue
+                
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
             train_loss += loss.item()
-            train_batches += 1
-            
-            # Update progress bar
-            progress_bar.set_postfix({
-                'batch': f'{batch_idx+1}/{len(train_loader)}',
-                'loss': f'{loss.item():.4f}'
-            })
+            train_batch_count += 1
+            train_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
         
-        avg_train_loss = train_loss / train_batches
-        train_losses.append(avg_train_loss)
+        # Print NaN statistics
+        if train_batches_with_nan_inputs > 0 or train_batches_with_nan_targets > 0 or train_batches_with_nan_outputs > 0 or train_batches_with_nan_loss > 0:
+            print(f"\nTraining NaN statistics for epoch {epoch+1}:")
+            print(f"  Batches with NaN inputs: {train_batches_with_nan_inputs}/{len(train_loader)} ({train_batches_with_nan_inputs/len(train_loader)*100:.2f}%)")
+            print(f"  Batches with NaN targets: {train_batches_with_nan_targets}/{len(train_loader)} ({train_batches_with_nan_targets/len(train_loader)*100:.2f}%)")
+            print(f"  Batches with NaN outputs: {train_batches_with_nan_outputs}/{len(train_loader)} ({train_batches_with_nan_outputs/len(train_loader)*100:.2f}%)")
+            print(f"  Batches with NaN loss: {train_batches_with_nan_loss}/{len(train_loader)} ({train_batches_with_nan_loss/len(train_loader)*100:.2f}%)")
+        
+        # Handle case with no valid batches
+        if train_batch_count == 0:
+            print(f"\nWarning: No valid training batches in epoch {epoch+1}. Skipping validation.")
+            continue
+            
+        avg_train_loss = train_loss / train_batch_count
         
         # Validation phase
         model.eval()
         val_loss = 0.0
-        val_batches = 0
+        val_batch_count = 0  # Count valid batches
+        val_pbar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Val]')
         
-        print("Validation phase:")
-        progress_bar = tqdm(val_loader, desc="Validation", leave=False)
+        # Track NaN statistics
+        val_batches_with_nan_inputs = 0
+        val_batches_with_nan_targets = 0
+        val_batches_with_nan_outputs = 0
+        val_batches_with_nan_loss = 0
         
         with torch.no_grad():
-            for batch_idx, (inputs, targets) in enumerate(progress_bar):
-                # Move data to the same device as model
+            for batch_data in val_pbar:
+                # Unpack the batch data - now includes trial indices
+                inputs, targets, _ = batch_data  # Ignore trial indices during validation
+                
+                # Check for NaN values
+                if torch.isnan(inputs).any():
+                    val_batches_with_nan_inputs += 1
+                    val_pbar.set_postfix({'status': 'NaN inputs - skipped'})
+                    continue
+                    
+                if torch.isnan(targets).any():
+                    val_batches_with_nan_targets += 1
+                    val_pbar.set_postfix({'status': 'NaN targets - skipped'})
+                    continue
+                
+                inputs, targets = inputs.to(device), targets.to(device)
+                
+                # For TCN, we need to transpose inputs to [batch, features, sequence]
+                inputs_transposed = inputs.transpose(1, 2)
+                
+                outputs = model(inputs_transposed)  # Now returns predictions for all timesteps
+                
+                # Check for NaN in outputs
+                if torch.isnan(outputs).any():
+                    val_batches_with_nan_outputs += 1
+                    val_pbar.set_postfix({'status': 'NaN outputs - skipped'})
+                    continue
+                
+                # Calculate loss across all timesteps (similar to LSTM)
+                loss = criterion(outputs, targets)
+                
+                # Skip NaN losses
+                if torch.isnan(loss):
+                    val_batches_with_nan_loss += 1
+                    val_pbar.set_postfix({'status': 'NaN loss - skipped'})
+                    continue
+                    
+                val_loss += loss.item()
+                val_batch_count += 1
+                val_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        
+        # Print NaN statistics
+        if val_batches_with_nan_inputs > 0 or val_batches_with_nan_targets > 0 or val_batches_with_nan_outputs > 0 or val_batches_with_nan_loss > 0:
+            print(f"\nValidation NaN statistics for epoch {epoch+1}:")
+            print(f"  Batches with NaN inputs: {val_batches_with_nan_inputs}/{len(val_loader)} ({val_batches_with_nan_inputs/len(val_loader)*100:.2f}%)")
+            print(f"  Batches with NaN targets: {val_batches_with_nan_targets}/{len(val_loader)} ({val_batches_with_nan_targets/len(val_loader)*100:.2f}%)")
+            print(f"  Batches with NaN outputs: {val_batches_with_nan_outputs}/{len(val_loader)} ({val_batches_with_nan_outputs/len(val_loader)*100:.2f}%)")
+            print(f"  Batches with NaN loss: {val_batches_with_nan_loss}/{len(val_loader)} ({val_batches_with_nan_loss/len(val_loader)*100:.2f}%)")
+        
+        # Handle case with no valid batches
+        if val_batch_count == 0:
+            print(f"\nWarning: No valid validation batches in epoch {epoch+1}. Skipping evaluation.")
+            continue
+            
+        avg_val_loss = val_loss / val_batch_count
+        
+        print(f"\nEpoch {epoch+1}:")
+        print(f"  Train Loss (Normalized MAE): {avg_train_loss:.4f} (from {train_batch_count}/{len(train_loader)} batches)")
+        print(f"  Val Loss (Normalized MAE): {avg_val_loss:.4f} (from {val_batch_count}/{len(val_loader)} batches)")
+        
+        # Check for improvement
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_model = model.state_dict()
+            patience_counter = 0
+            print(f"  New best model! Val Loss: {best_val_loss:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"\nEarly stopping triggered after {epoch+1} epochs")
+                break
+    
+    return best_model, best_val_loss
+
+def evaluate_model(model, test_loader, criterion, device, output_features, y_scaler, output_dir, trial_splits=None, filtered_to_original=None):
+    """Evaluate the model on test data and save predictions as .npz files."""
+    model.eval()
+    
+    # Define the frame range we want to keep (51-651, using zero-based indexing)
+    start_frame = 50  # Frame 51 (1-indexed) = index 50 (0-indexed)
+    end_frame = 650   # Frame 651 (1-indexed) = index 650 (0-indexed)
+    frames_to_keep = end_frame - start_frame + 1  # Should be 601 frames
+    
+    print(f"\nUsing frame range: {start_frame+1}-{end_frame+1} (1-indexed)")
+    print(f"Number of frames to keep per trial: {frames_to_keep}")
+    
+    # Debug: Print information about test dataset
+    print(f"\nDebug - Test dataset info:")
+    if trial_splits:
+        print(f"Number of test trials: {len(trial_splits['test'])}")
+        print(f"Test trial indices: {sorted(trial_splits['test'])}")
+    print(f"Test dataset size: {len(test_loader.dataset)}")
+    print(f"Number of batches: {len(test_loader)}")
+    
+    # Store predictions and targets
+    all_targets_by_trial = []  # Will store sliced targets for each trial
+    all_outputs_by_trial = []  # Will store sliced outputs for each trial
+    trial_indices = []
+    
+    # Debug: Track unique trial indices
+    unique_trial_indices = set()
+    
+    with torch.no_grad():
+        for batch_idx, batch_data in enumerate(tqdm(test_loader, desc="Evaluating")):
+            try:
+                # Unpack the batch
+                inputs, targets, batch_trial_indices = batch_data
+                
+                # Move to device
                 inputs = inputs.to(device)
                 targets = targets.to(device)
                 
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                val_loss += loss.item()
-                val_batches += 1
+                # Check for NaN values in inputs
+                if torch.isnan(inputs).any():
+                    print(f"Warning: NaN values found in inputs batch {batch_idx}. Skipping batch.")
+                    continue
                 
-                # Update progress bar
-                progress_bar.set_postfix({
-                    'batch': f'{batch_idx+1}/{len(val_loader)}',
-                    'loss': f'{loss.item():.4f}'
-                })
+                # Check for NaN values in targets
+                if torch.isnan(targets).any():
+                    print(f"Warning: NaN values found in targets batch {batch_idx}. Skipping batch.")
+                    continue
+                
+                # Forward pass
+                outputs = model(inputs)
+                
+                # Check for NaN values in outputs
+                if torch.isnan(outputs).any():
+                    print(f"Warning: NaN values found in outputs batch {batch_idx}. Skipping batch.")
+                    continue
+                
+                # Process each trial in the batch
+                for trial_idx in range(len(inputs)):
+                    # Get trial data
+                    trial_targets = targets[trial_idx].cpu().numpy()  # Shape (seq_len, n_features)
+                    trial_outputs = outputs[trial_idx].cpu().numpy()  # Shape (seq_len, n_features)
+                    
+                    # Keep only the specified frames (51-651)
+                    if len(trial_targets) >= frames_to_keep:
+                        # Slice to keep only frames 51-651
+                        sliced_targets = trial_targets[start_frame:end_frame+1]
+                        sliced_outputs = trial_outputs[start_frame:end_frame+1]
+                        
+                        # Store the sliced data
+                        all_targets_by_trial.append(sliced_targets)
+                        all_outputs_by_trial.append(sliced_outputs)
+                        
+                        # Store the trial index
+                        current_trial_idx = batch_trial_indices[trial_idx].item()
+                        trial_indices.extend([current_trial_idx] * frames_to_keep)
+                        unique_trial_indices.add(current_trial_idx)
+                    else:
+                        print(f"Warning: Trial {batch_trial_indices[trial_idx].item()} has only {len(trial_targets)} frames, which is less than the required {frames_to_keep}. Skipping trial.")
+                
+                # Debug: Print batch trial indices (first and last batch only)
+                if batch_idx == 0 or batch_idx == len(test_loader) - 1:
+                    print(f"\nDebug - Batch {batch_idx} trial indices:")
+                    print(f"Batch size: {len(batch_trial_indices)}")
+                    print(f"Unique trial indices in batch: {sorted(set(batch_trial_indices.cpu().numpy().tolist()))}")
+                    
+            except Exception as e:
+                print(f"Error processing batch {batch_idx}: {str(e)}")
+                traceback.print_exc()
+                continue
+    
+    # Debug: Print summary of trial indices
+    print(f"\nDebug - Trial indices summary:")
+    print(f"Unique trial indices: {sorted(unique_trial_indices)}")
+    print(f"Number of unique trial indices: {len(unique_trial_indices)}")
+    print(f"Expected total frames: {len(unique_trial_indices) * frames_to_keep}")
+    
+    # Check if we have any predictions
+    if not all_outputs_by_trial:
+        print("Error: No predictions were generated.")
+        return {}
+    
+    # Concatenate all trials' data
+    all_targets = np.vstack(all_targets_by_trial)  # Shape (n_trials*frames_to_keep, n_features)
+    all_outputs = np.vstack(all_outputs_by_trial)  # Shape (n_trials*frames_to_keep, n_features)
+    
+    # Debug: Print shapes
+    print(f"\nDebug - Shapes after concatenation:")
+    print(f"all_targets shape: {all_targets.shape}")
+    print(f"all_outputs shape: {all_outputs.shape}")
+    print(f"trial_indices length: {len(trial_indices)}")
+    
+    # Check for NaN values
+    nan_in_targets = np.isnan(all_targets).any()
+    nan_in_outputs = np.isnan(all_outputs).any()
+    
+    if nan_in_targets or nan_in_outputs:
+        print("\nWARNING: NaN values detected:")
+        print(f"  NaN values in targets: {np.isnan(all_targets).sum()}/{all_targets.size} ({np.isnan(all_targets).sum()/all_targets.size*100:.2f}%)")
+        print(f"  NaN values in outputs: {np.isnan(all_outputs).sum()}/{all_outputs.size} ({np.isnan(all_outputs).sum()/all_outputs.size*100:.2f}%)")
+    
+    # Inverse transform if scaler is provided
+    if y_scaler:
+        try:
+            all_targets = y_scaler.inverse_transform(all_targets)
+            all_outputs = y_scaler.inverse_transform(all_outputs)
+            
+            # Check for NaN values after inverse transform
+            nan_in_targets_after = np.isnan(all_targets).any()
+            nan_in_outputs_after = np.isnan(all_outputs).any()
+            
+            if nan_in_targets_after or nan_in_outputs_after:
+                print("\nWARNING: NaN values detected after inverse transform:")
+                print(f"  NaN values in targets: {np.isnan(all_targets).sum()}/{all_targets.size} ({np.isnan(all_targets).sum()/all_targets.size*100:.2f}%)")
+                print(f"  NaN values in outputs: {np.isnan(all_outputs).sum()}/{all_outputs.size} ({np.isnan(all_outputs).sum()/all_outputs.size*100:.2f}%)")
+        except Exception as e:
+            print(f"Error during inverse transform: {str(e)}")
+            traceback.print_exc()
+    
+    # Save as 2D arrays to match LSTM format
+    npz_path = output_dir / "predictions.npz"
+    np.savez(npz_path, targets=all_targets, predictions=all_outputs)
+    print(f"Predictions saved to {npz_path}")
+    
+    # Save unique trial indices
+    indices_path = output_dir / "trial_indices.npz"
+    np.savez(indices_path, unique_trial_indices=sorted(unique_trial_indices))
+    print(f"Unique trial indices saved to {indices_path}")
+    
+    # Calculate metrics for each feature
+    metrics = {}
+    for i, feature in enumerate(output_features):
+        # Get target and prediction values for this feature
+        target_values = all_targets[:, i]
+        pred_values = all_outputs[:, i]
         
-        avg_val_loss = val_loss / val_batches
-        val_losses.append(avg_val_loss)
+        # Check for NaN values
+        if np.isnan(target_values).any() or np.isnan(pred_values).any():
+            print(f"\nWARNING: NaN values detected for feature {feature}. Skipping metrics calculation.")
+            
+            # Count NaN values
+            nan_targets = np.isnan(target_values).sum()
+            nan_preds = np.isnan(pred_values).sum()
+            print(f"  NaN values in targets: {nan_targets}/{len(target_values)} ({nan_targets/len(target_values)*100:.2f}%)")
+            print(f"  NaN values in predictions: {nan_preds}/{len(pred_values)} ({nan_preds/len(pred_values)*100:.2f}%)")
+            
+            # Store NaN metrics
+            metrics[feature] = {
+                'mae': np.nan,
+                'mse': np.nan,
+                'rmse': np.nan,
+                'r2': np.nan,
+                'nan_targets': nan_targets,
+                'nan_predictions': nan_preds
+            }
+            continue
         
-        # Early stopping check
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            # Move model state to CPU before saving
-            best_model_state = {k: v.cpu() for k, v in model.state_dict().items()}
+        # Calculate metrics
+        try:
+            mae = mean_absolute_error(target_values, pred_values)
+            mse = mean_squared_error(target_values, pred_values)
+            rmse = np.sqrt(mse)
+            r2 = r2_score(target_values, pred_values)
+            
+            metrics[feature] = {
+                'mae': mae,
+                'mse': mse,
+                'rmse': rmse,
+                'r2': r2
+            }
+            
+            print(f"\nMetrics for {feature}:")
+            print(f"  MAE: {mae:.4f}")
+            print(f"  MSE: {mse:.4f}")
+            print(f"  RMSE: {rmse:.4f}")
+            print(f"  R²: {r2:.4f}")
+        except Exception as e:
+            print(f"Error calculating metrics for feature {feature}: {str(e)}")
+            metrics[feature] = {
+                'error': str(e),
+                'mae': np.nan,
+                'mse': np.nan,
+                'rmse': np.nan,
+                'r2': np.nan
+            }
+    
+    return metrics
+
+def objective(trial, data_loaders, input_features, output_features, device, leg_prefix):
+    """Optuna objective function for hyperparameter optimization with whole-trial processing."""
+    # Note: Using whole-trial data with batch_size=1
+    
+    # Suggest hyperparameters specifically for TCN with whole-trial processing
+    config = {
+        'hidden_size': trial.suggest_int('hidden_size', 32, 256, step=32),
+        'num_levels': trial.suggest_int('num_levels', 4, 8),  # Minimum 4 levels for adequate receptive field
+        'kernel_size': trial.suggest_categorical('kernel_size', [5, 7, 9, 11]),  # Larger kernel sizes for 100-frame context
+        'dropout': trial.suggest_float('dropout', 0.1, 0.5),
+        'learning_rate': trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True),
+    }
+    
+    # Create num_channels list - decreasing by a factor of 2 each level
+    num_channels = [config['hidden_size']]
+    for i in range(1, config['num_levels']):
+        num_channels.append(num_channels[-1] // 2)
+        if num_channels[-1] < 16:  # Ensure we don't go too small
+            num_channels[-1] = 16
+            
+    # Calculate effective receptive field size
+    receptive_field = 1 + (config['kernel_size'] - 1) * sum(2**i for i in range(config['num_levels']))
+    print(f"\nTCN configuration: kernel_size={config['kernel_size']}, num_levels={config['num_levels']}")
+    print(f"Effective receptive field: {receptive_field} frames")
+    
+    # Get a sample input from the training loader
+    sample_batch = next(iter(data_loaders[0]))
+    sample_input = sample_batch[0]  # [batch=1, seq_len, features]
+    sequence_length = sample_input.shape[1]  # Get the actual sequence length from data
+    
+    # Create model with suggested hyperparameters
+    model = TemporalConvNet(
+        input_size=len(input_features),
+        output_size=len(output_features),
+        num_channels=num_channels,
+        kernel_size=config['kernel_size'],
+        dropout=config['dropout'],
+        sequence_length=sequence_length
+    )
+    
+    # Use standard MAE loss
+    criterion = nn.L1Loss()
+    print(f"\nUsing standard MAE loss")
+    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
+    
+    train_loader, val_loader = data_loaders
+    best_val_loss = float('inf')
+    
+    # Training loop
+    for epoch in range(50):  # Maximum epochs for hyperparameter search
+        # Training phase
+        model.train()
+        for batch_data in train_loader:
+            # Unpack the batch data - now includes trial indices
+            inputs, targets, _ = batch_data  # Ignore trial indices during training
+            
+            # Skip batches with NaN values
+            if torch.isnan(inputs).any() or torch.isnan(targets).any():
+                continue
+                
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            # For TCN, we need to transpose inputs to [batch, features, sequence]
+            inputs = inputs.transpose(1, 2)
+            
+            optimizer.zero_grad()
+            outputs = model(inputs)  # Now outputs all timesteps
+            
+            # Skip if outputs contain NaN
+            if torch.isnan(outputs).any():
+                continue
+            
+            # Calculate loss on all timesteps (not just the last one)
+            loss = criterion(outputs, targets)
+            
+            # Skip NaN losses
+            if torch.isnan(loss):
+                continue
+                
+            loss.backward()
+            optimizer.step()
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        val_count = 0  # Keep track of valid batches
+        
+        with torch.no_grad():
+            for batch_data in val_loader:
+                # Unpack the batch data - now includes trial indices
+                inputs, targets, _ = batch_data  # Ignore trial indices during validation
+                
+                # Skip batches with NaN values
+                if torch.isnan(inputs).any() or torch.isnan(targets).any():
+                    continue
+                    
+                inputs, targets = inputs.to(device), targets.to(device)
+                
+                # For TCN, we need to transpose inputs to [batch, features, sequence]
+                inputs = inputs.transpose(1, 2)
+                
+                outputs = model(inputs)  # Now outputs all timesteps
+                
+                # Skip if outputs contain NaN
+                if torch.isnan(outputs).any():
+                    continue
+                
+                # Calculate loss on all timesteps
+                loss = criterion(outputs, targets)
+                
+                # Skip NaN losses
+                if torch.isnan(loss):
+                    continue
+                    
+                val_loss += loss.item()
+                val_count += 1
+        
+        # Avoid division by zero
+        if val_count == 0:
+            print("Warning: No valid validation batches found. Returning maximum loss.")
+            return float('inf')
+            
+        val_loss = val_loss / val_count
+        
+        # Early stopping based on validation loss
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             patience_counter = 0
         else:
             patience_counter += 1
+            if patience_counter >= 1:  # Early stopping patience
+                break
         
-        # Calculate epoch time
-        epoch_time = datetime.now() - epoch_start_time
+        # Report intermediate value
+        trial.report(val_loss, epoch)
         
-        # Print epoch summary
-        print(f"\nEpoch {epoch+1} Summary:")
-        print(f"  Time: {epoch_time}")
-        print(f"  Training Loss: {avg_train_loss:.6f}")
-        print(f"  Validation Loss: {avg_val_loss:.6f}")
-        print(f"  Best Validation Loss: {best_val_loss:.6f}")
-        print(f"  Early Stopping Counter: {patience_counter}/{patience}")
-        
-        if torch.cuda.is_available():
-            print(f"  GPU Memory:")
-            print(f"    Allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
-            print(f"    Cached: {torch.cuda.memory_reserved(0) / 1024**2:.2f} MB")
-        
-        # Early stopping
-        if patience_counter >= patience:
-            print(f"\nEarly stopping triggered after {epoch+1} epochs")
-            print(f"Best validation loss: {best_val_loss:.6f}")
-            break
+        # Handle pruning based on the intermediate value
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
     
-    print("\nTraining completed!")
-    print(f"Best validation loss: {best_val_loss:.6f}")
-    print(f"Total epochs run: {epoch+1}")
-    
-    return best_model_state, train_losses, val_losses
+    return best_val_loss
 
-def evaluate_model(model, test_loader, criterion, device, output_features, output_scaler, save_dir):
-    """Evaluate the trained TCN model"""
-    # Ensure save directory exists
-    save_dir = Path(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
+def save_trial_splits_info(trial_splits, filtered_to_original, filtered_trials, output_dir, leg_name):
+    """Save information about trial splits to text files."""
+    # Create directory if it doesn't exist
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
     
-    model.eval()  # Set model to evaluation mode
-    
-    # Initialize metrics
-    total_loss = 0
-    all_predictions = []
-    all_targets = []
-    
-    # Evaluate model
-    print("\nEvaluating model on test set...")
-    with torch.no_grad():
-        for inputs, targets in test_loader:
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            
-            # Forward pass
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            
-            # Store predictions and targets
-            all_predictions.append(outputs.cpu().numpy())
-            all_targets.append(targets.cpu().numpy())
-            
-            total_loss += loss.item()
-    
-    # Calculate average loss
-    avg_loss = total_loss / len(test_loader)
-    
-    # Combine all predictions and targets
-    predictions = np.concatenate(all_predictions)
-    targets = np.concatenate(all_targets)
-    
-    print(f"\nPredictions shape before inverse transform: {predictions.shape}")
-    print(f"Targets shape before inverse transform: {targets.shape}")
-    
-    # Inverse transform predictions and targets
-    predictions_original = output_scaler.inverse_transform(predictions)
-    targets_original = output_scaler.inverse_transform(targets)
-    
-    # Calculate frames per trial and number of trials
-    frames_per_trial = 600  # 1000 - 400 frames per trial
-    num_trials = len(predictions) // frames_per_trial
-    total_frames = num_trials * frames_per_trial
-    
-    print(f"\nReshaping details:")
-    print(f"Total predictions: {len(predictions)}")
-    print(f"Frames per trial: {frames_per_trial}")
-    print(f"Calculated number of trials: {num_trials}")
-    print(f"Total frames to use: {total_frames}")
-    
-    # Trim predictions and targets to fit complete trials
-    predictions = predictions[:total_frames]
-    targets = targets[:total_frames]
-    predictions_original = predictions_original[:total_frames]
-    targets_original = targets_original[:total_frames]
-    
-    # Reshape into trials
-    predictions = predictions.reshape(num_trials, frames_per_trial, -1)
-    targets = targets.reshape(num_trials, frames_per_trial, -1)
-    predictions_original = predictions_original.reshape(num_trials, frames_per_trial, -1)
-    targets_original = targets_original.reshape(num_trials, frames_per_trial, -1)
-    
-    print(f"\nArray shapes after reshaping:")
-    print(f"Predictions: {predictions.shape}")
-    print(f"Targets: {targets.shape}")
-    
-    # Calculate metrics for each output feature
-    metrics = {
-        'test_loss': avg_loss,
-        'metrics_by_feature': {}
-    }
-    
-    # Create PDF for prediction plots
-    pdf_path = save_dir / 'predictions.pdf'
-    with PdfPages(pdf_path) as pdf:
-        # For each feature
-        for i, feature in enumerate(output_features):
-            feature_metrics_z = []
-            feature_metrics_raw = []
-            
-            # Create a figure for this feature with subplots for each trial
-            rows = int(np.ceil(num_trials / 2))
-            fig, axes = plt.subplots(rows, 2, figsize=(20, 5*rows))
-            fig.suptitle(f'{feature} Predictions Across All Trials', fontsize=16)
-            axes = axes.flatten()
-            
-            # Plot each trial
-            for trial in range(num_trials):
-                # Get predictions and targets for this trial
-                trial_pred_z = predictions[trial, :, i]
-                trial_target_z = targets[trial, :, i]
-                trial_pred_raw = predictions_original[trial, :, i]
-                trial_target_raw = targets_original[trial, :, i]
-                
-                # Calculate metrics for this trial
-                mae_z = mean_absolute_error(trial_target_z, trial_pred_z)
-                rmse_z = np.sqrt(mean_squared_error(trial_target_z, trial_pred_z))
-                r2_z = r2_score(trial_target_z, trial_pred_z)
-                
-                mae_raw = mean_absolute_error(trial_target_raw, trial_pred_raw)
-                rmse_raw = np.sqrt(mean_squared_error(trial_target_raw, trial_pred_raw))
-                r2_raw = r2_score(trial_target_raw, trial_pred_raw)
-                
-                feature_metrics_z.append([mae_z, rmse_z, r2_z])
-                feature_metrics_raw.append([mae_raw, rmse_raw, r2_raw])
-                
-                # Create time axis (frames 400-1000)
-                x_axis = np.arange(400, 1000)
-                
-                # Plot this trial
-                ax = axes[trial]
-                ax.plot(x_axis, trial_target_raw, 'b-', label='True', alpha=0.7)
-                ax.plot(x_axis, trial_pred_raw, 'r-', label='Predicted', alpha=0.7)
-                ax.set_title(f'Trial {trial+1}\nMAE: {mae_raw:.2f}°, RMSE: {rmse_raw:.2f}°, R²: {r2_raw:.3f}')
-                ax.set_xlabel('Frame')
-                ax.set_ylabel('Angle (degrees)')
-                ax.legend()
-                ax.grid(True, alpha=0.3)
-            
-            # Remove any empty subplots
-            for j in range(trial + 1, len(axes)):
-                fig.delaxes(axes[j])
-            
-            plt.tight_layout()
-            pdf.savefig(fig)
-            plt.close()
-            
-            # Calculate average metrics across trials
-            avg_metrics_z = np.mean(feature_metrics_z, axis=0)
-            avg_metrics_raw = np.mean(feature_metrics_raw, axis=0)
-            
-            metrics['metrics_by_feature'][feature] = {
-                'mae_z': float(avg_metrics_z[0]),
-                'rmse_z': float(avg_metrics_z[1]),
-                'r2_z': float(avg_metrics_z[2]),
-                'mae_raw': float(avg_metrics_raw[0]),
-                'rmse_raw': float(avg_metrics_raw[1]),
-                'r2_raw': float(avg_metrics_raw[2]),
-                'trial_metrics': {
-                    f'trial_{t+1}': {
-                        'mae_z': float(mz[0]),
-                        'rmse_z': float(mz[1]),
-                        'r2_z': float(mz[2]),
-                        'mae_raw': float(mr[0]),
-                        'rmse_raw': float(mr[1]),
-                        'r2_raw': float(mr[2])
-                    }
-                    for t, (mz, mr) in enumerate(zip(feature_metrics_z, feature_metrics_raw))
-                }
-            }
-    
-    print(f"\nSaved prediction plots to: {pdf_path}")
-    
-    # Print summary metrics
-    print("\nTest Set Metrics (averaged across trials):")
-    print(f"Average Loss: {avg_loss:.6f}")
-    
-    for feature, feature_metrics in metrics['metrics_by_feature'].items():
-        print(f"\n{feature}:")
-        print(f"  MAE (z-scored): {feature_metrics['mae_z']:.6f}")
-        print(f"  RMSE (z-scored): {feature_metrics['rmse_z']:.6f}")
-        print(f"  R² (z-scored): {feature_metrics['r2_z']:.6f}")
-        print(f"  MAE (raw): {feature_metrics['mae_raw']:.6f}")
-        print(f"  RMSE (raw): {feature_metrics['rmse_raw']:.6f}")
-        print(f"  R² (raw): {feature_metrics['r2_raw']:.6f}")
+    # Save trial splits
+    splits_file = output_dir / f"{leg_name}_trial_splits.txt"
+    with open(splits_file, 'w') as f:
+        f.write(f"Trial splits information for {leg_name}\n")
+        f.write(f"Generated at: {datetime.now()}\n\n")
         
-        print("\n  Trial-wise metrics:")
-        for trial_name, trial_metrics in feature_metrics['trial_metrics'].items():
-            print(f"    {trial_name}:")
-            print(f"      MAE (raw): {trial_metrics['mae_raw']:.6f}°")
-            print(f"      RMSE (raw): {trial_metrics['rmse_raw']:.6f}°")
-            print(f"      R²: {trial_metrics['r2_raw']:.6f}")
+        for split_name, indices in trial_splits.items():
+            f.write(f"{split_name.upper()} SPLIT:\n")
+            f.write(f"Number of trials: {len(indices)}\n")
+            f.write(f"Filtered indices: {sorted(indices)}\n")
+            f.write(f"Original indices: {sorted(filtered_to_original[idx] for idx in indices)}\n\n")
     
-    return metrics
-
-def convert_to_serializable(obj):
-    """Convert numpy types and Path objects to Python types for JSON serialization"""
-    if isinstance(obj, dict):
-        return {key: convert_to_serializable(value) for key, value in obj.items()}
-    elif isinstance(obj, list):
-        return [convert_to_serializable(item) for item in obj]
-    elif isinstance(obj, np.integer):
-        return int(obj)
-    elif isinstance(obj, np.floating):
-        return float(obj)
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, Path):
-        return str(obj)
-    else:
-        return obj
-
-def run_experiment(config):
-    """Run a TCN experiment with the given configuration"""
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\nUsing device: {device}")
-    
-    # Create model directory
-    model_dir = Path('tcn_results') / config['genotype'] / f"{config['leg_prefix']}_leg"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Save configuration
-    config_path = model_dir / 'config.json'
-    with open(config_path, 'w') as f:
-        json.dump(convert_to_serializable(config), f, indent=4)
-    print(f"\nSaved configuration to: {config_path}")
-    
-    # Prepare data
-    print("\nPreparing data...")
-    (X_train, y_train), (X_val, y_val), (X_test, y_test), X_scaler, y_scaler = prepare_data(
-        config['data_path'],
-        config['input_features'],
-        config['output_features'],
-        config['sequence_length'],
-        config['genotype']
-    )
-    
-    # Create datasets
-    print("\nCreating datasets...")
-    train_dataset = SequenceDataset(X_train, y_train, config['sequence_length'])
-    val_dataset = SequenceDataset(X_val, y_val, config['sequence_length'])
-    test_dataset = SequenceDataset(X_test, y_test, config['sequence_length'])
-    
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'])
-    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'])
-    
-    print("\nDataset sizes:")
-    print(f"Training sequences: {len(train_dataset)}")
-    print(f"Validation sequences: {len(val_dataset)}")
-    print(f"Test sequences: {len(test_dataset)}")
-    
-    # Create model
-    model = TemporalConvNet(
-        input_size=len(config['input_features']),
-        output_size=len(config['output_features']),
-        num_channels=config['num_channels'],
-        kernel_size=config['kernel_size'],
-        dropout=config['dropout'],
-        sequence_length=config['sequence_length']
-    ).to(device)
-    
-    # Define loss function and optimizer
-    criterion = nn.L1Loss()
-    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
-    
-    # Train model
-    print("\nTraining model...")
-    best_model_state, train_losses, val_losses = train_model(
-        model,
-        train_loader,
-        val_loader,
-        criterion,
-        optimizer,
-        config['num_epochs'],
-        device,
-        patience=config['patience']
-    )
-    
-    # Save model
-    model_path = model_dir / 'best_model.pt'
-    torch.save({
-        'model_state_dict': best_model_state,
-        'config': config,
-        'X_scaler': X_scaler,
-        'y_scaler': y_scaler
-    }, model_path)
-    print(f"\nSaved best model to: {model_path}")
-    
-    # Load best model for evaluation
-    model.load_state_dict(best_model_state)
-    
-    # Evaluate model
-    print("\nEvaluating model...")
-    metrics = evaluate_model(
-        model,
-        test_loader,
-        criterion,
-        device,
-        config['output_features'],
-        y_scaler,
-        model_dir
-    )
-    
-    # Save metrics
-    metrics_path = model_dir / 'metrics.json'
-    with open(metrics_path, 'w') as f:
-        json.dump(convert_to_serializable(metrics), f, indent=4)
-    print(f"\nSaved metrics to: {metrics_path}")
-    
-    # Plot training curves
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Loss')
-    plt.legend()
-    plt.grid(True)
-    
-    # Save plot
-    plot_path = model_dir / 'training_curves.png'
-    plt.savefig(plot_path)
-    plt.close()
-    print(f"\nSaved training curves to: {plot_path}")
-    
-    return metrics
-
-def create_genotype_summary(genotype_dir, experiment_results):
-    """Create summary metrics and plots for all legs of a genotype"""
-    print("\nCreating genotype summary...")
-    
-    # Initialize dictionaries for metrics
-    leg_metrics = {}
-    
-    # Process each leg's results
-    for leg_prefix, results in experiment_results.items():
-        print(f"\nProcessing {leg_prefix} leg metrics...")
-        leg_metrics[leg_prefix] = results  # Store metrics directly
-    
-    # Save summary metrics
-    summary_path = Path(genotype_dir) / 'summary_metrics.json'
-    with open(summary_path, 'w') as f:
-        json.dump(convert_to_serializable(leg_metrics), f, indent=4)
-    print(f"\nSaved summary metrics to: {summary_path}")
-    
-    # Create comparison plots
-    create_comparison_plots(leg_metrics, genotype_dir)
-
-def create_comparison_plots(experiment_results, output_dir):
-    """Create comparison plots for a leg's experiments"""
-    # Sort results by z-scored MAE
-    sorted_results_z = []
-    sorted_results_raw = []
-    
-    for leg_prefix, results in experiment_results.items():
-        # Calculate average MAE across all features for this leg
-        feature_metrics = results['metrics_by_feature']
-        avg_mae_z = np.mean([m['mae_z'] for m in feature_metrics.values()])
-        avg_mae_raw = np.mean([m['mae_raw'] for m in feature_metrics.values()])
+    # Save mapping between filtered and original indices
+    mapping_file = output_dir / f"{leg_name}_index_mapping.txt"
+    with open(mapping_file, 'w') as f:
+        f.write(f"Mapping between filtered and original trial indices for {leg_name}\n")
+        f.write(f"Generated at: {datetime.now()}\n\n")
         
-        sorted_results_z.append((leg_prefix, avg_mae_z))
-        sorted_results_raw.append((leg_prefix, avg_mae_raw))
+        f.write("Filtered Index | Original Index\n")
+        f.write("------------------------------\n")
+        
+        for filtered_idx, original_idx in filtered_to_original.items():
+            f.write(f"{filtered_idx:13} | {original_idx}\n")
     
-    sorted_results_z.sort(key=lambda x: x[1])
-    sorted_results_raw.sort(key=lambda x: x[1])
+    # Save detailed trial information
+    trials_info_file = output_dir / f"{leg_name}_trial_info.txt"
+    with open(trials_info_file, 'w') as f:
+        f.write(f"Detailed trial information for {leg_name}\n")
+        f.write(f"Generated at: {datetime.now()}\n\n")
+        
+        for filtered_idx, trial_data in enumerate(filtered_trials):
+            original_idx = filtered_to_original[filtered_idx]
+            
+            genotype = trial_data['genotype'].iloc[0] if 'genotype' in trial_data.columns else 'Unknown'
+            
+            # Calculate average velocities
+            if 'x_vel' in trial_data.columns:
+                avg_x_vel = trial_data['x_vel'].mean()
+                avg_y_vel = trial_data['y_vel'].mean()
+                avg_z_vel = trial_data['z_vel'].mean()
+                
+                # Determine which split this trial belongs to
+                split = None
+                for split_name, indices in trial_splits.items():
+                    if filtered_idx in indices:
+                        split = split_name  
+                        break
+                
+                f.write(f"Trial {filtered_idx} (Original index: {original_idx})\n")
+                f.write(f"  Genotype: {genotype}\n")
+                f.write(f"  Split: {split}\n")
+                f.write(f"  Average velocities:\n")
+                f.write(f"    x: {avg_x_vel:.2f} mm/s\n")
+                f.write(f"    y: {avg_y_vel:.2f} mm/s\n")
+                f.write(f"    z: {avg_z_vel:.2f} mm/s\n")
+                f.write("\n")
     
-    # Create side-by-side comparison plot
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 12))
-    
-    # Z-scored plot
-    legs_z = [r[0] for r in sorted_results_z]
-    maes_z = [r[1] for r in sorted_results_z]
-    x_positions = np.arange(len(legs_z))
-    ax1.bar(x_positions, maes_z)
-    ax1.set_xticks(x_positions)
-    ax1.set_xticklabels(legs_z, rotation=45, ha='right')
-    ax1.set_title('Average Z-scored MAE by Leg')
-    ax1.set_xlabel('Leg')
-    ax1.set_ylabel('Z-scored MAE')
-    ax1.grid(True, alpha=0.3)
-    
-    # Add value labels on top of each bar
-    for i, v in enumerate(maes_z):
-        ax1.text(i, v + 0.01, f'{v:.3f}', ha='center', va='bottom')
-    
-    # Raw plot
-    legs_raw = [r[0] for r in sorted_results_raw]
-    maes_raw = [r[1] for r in sorted_results_raw]
-    x_positions = np.arange(len(legs_raw))
-    ax2.bar(x_positions, maes_raw)
-    ax2.set_xticks(x_positions)
-    ax2.set_xticklabels(legs_raw, rotation=45, ha='right')
-    ax2.set_title('Average Raw MAE by Leg')
-    ax2.set_xlabel('Leg')
-    ax2.set_ylabel('MAE (degrees)')
-    ax2.grid(True, alpha=0.3)
-    
-    # Add value labels on top of each bar
-    for i, v in enumerate(maes_raw):
-        ax2.text(i, v + 0.01, f'{v:.1f}°', ha='center', va='bottom')
-    
-    plt.tight_layout()
-    plt.savefig(output_dir / 'leg_comparison.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # Save comparison data
-    comparison_data = {
-        'z_scored_mae': {leg: mae for leg, mae in sorted_results_z},
-        'raw_mae': {leg: mae for leg, mae in sorted_results_raw}
-    }
-    
-    with open(output_dir / 'leg_comparison.json', 'w') as f:
-        json.dump(comparison_data, f, indent=4)
+    return splits_file, mapping_file, trials_info_file
 
 def main():
-    """Main function to run TCN training"""
-    # Get base data path
-    base_data_path = "Z:/Divya/TEMP_transfers/toAni/BPN_P9LT_P9RT_flyCoords.csv"
+    """Main function to train and evaluate TCN models for all 6 legs."""
+    print("\nTraining Strategy: Using whole trials for TCN model without windowing.")
+    print("This approach preserves the entire temporal context for each trial.")
+    print("TCN architecture is well-suited for processing whole sequences through dilated convolutions.")
+    print("For 100-frame context, we'll use larger kernel sizes (5-11) and sufficient network depth (4-8 levels).")
     
-    # Prompt for genotype selection
-    print("\nAvailable genotypes:")
-    print("1. BPN")
-    print("2. P9LT")
-    print("3. P9RT")
-    print("4. ALL (train on all genotypes)")
-    
-    while True:
-        try:
-            choice = input("\nSelect genotype (1-4): ").strip()
-            if choice in ['1', '2', '3', '4']:
-                break
-            print("Please enter a number between 1 and 4")
-        except ValueError:
-            print("Please enter a valid number")
-    
-    # Map choice to genotype
-    genotype_map = {
-        '1': 'BPN',
-        '2': 'P9LT',
-        '3': 'P9RT',
-        '4': 'ALL'
+    # Configuration
+    base_config = {
+        'pred_len': 1,           # Prediction length for non-windowed approach
+        'batch_size': 1,         # Use batch_size=1 for whole trials
+        'num_epochs': 200,
+        'patience': 10,
+        'n_trials': 20,          # Number of Optuna trials
     }
-    selected_genotype = genotype_map[choice]
     
-    print(f"\nSelected genotype: {selected_genotype}")
+    # Create base directories
+    results_dir = Path('tcn_results')
+    results_dir.mkdir(exist_ok=True, parents=True)
+    print("\nCreated base results directory:", results_dir)
     
-    # Create base results directory for the selected genotype
-    base_results_dir = Path('tcn_results') / selected_genotype
-    base_results_dir.mkdir(exist_ok=True, parents=True)
+    # Create error log file
+    error_log = results_dir / 'error_log.txt'
+    with open(error_log, 'w') as f:
+        f.write(f"Training started at {datetime.now()}\n")
+        f.write("-" * 80 + "\n\n")
     
-    # Dictionary to store all experiment results
-    all_results = {}
-    
-    # Define legs and their configurations
+    # Define legs and their features
     legs = {
-        'R-F': {'position': 'R-F-FeTi_z', 'angles': ['R1A_flex', 'R1A_rot', 'R1A_abduct', 'R1B_flex', 'R1B_rot', 'R1C_flex', 'R1C_rot', 'R1D_flex']},
-        'L-F': {'position': 'L-F-FeTi_z', 'angles': ['L1A_flex', 'L1A_rot', 'L1A_abduct', 'L1B_flex', 'L1B_rot', 'L1C_flex', 'L1C_rot', 'L1D_flex']},
-        'R-M': {'position': 'R-M-FeTi_z', 'angles': ['R2A_flex', 'R2A_rot', 'R2A_abduct', 'R2B_flex', 'R2B_rot', 'R2C_flex', 'R2C_rot', 'R2D_flex']},
-        'L-M': {'position': 'L-M-FeTi_z', 'angles': ['L2A_flex', 'L2A_rot', 'L2A_abduct', 'L2B_flex', 'L2B_rot', 'L2C_flex', 'L2C_rot', 'L2D_flex']},
-        'R-H': {'position': 'R-H-FeTi_z', 'angles': ['R3A_flex', 'R3A_rot', 'R3A_abduct', 'R3B_flex', 'R3B_rot', 'R3C_flex', 'R3C_rot', 'R3D_flex']},
-        'L-H': {'position': 'L-H-FeTi_z', 'angles': ['L3A_flex', 'L3A_rot', 'L3A_abduct', 'L3B_flex', 'L3B_rot', 'L3C_flex', 'L3C_rot', 'L3D_flex']}
+        'R1': {
+            'angles': ['R1A_flex', 'R1A_rot', 'R1A_abduct', 'R1B_flex', 'R1B_rot', 'R1C_flex', 'R1C_rot', 'R1D_flex']
+        },
+        'L1': {
+            'angles': ['L1A_flex', 'L1A_rot', 'L1A_abduct', 'L1B_flex', 'L1B_rot', 'L1C_flex', 'L1C_rot', 'L1D_flex']
+        },
+        'R2': {
+            'angles': ['R2A_flex', 'R2A_rot', 'R2A_abduct', 'R2B_flex', 'R2B_rot', 'R2C_flex', 'R2C_rot', 'R2D_flex']
+        },
+        'L2': {
+            'angles': ['L2A_flex', 'L2A_rot', 'L2A_abduct', 'L2B_flex', 'L2B_rot', 'L2C_flex', 'L2C_rot', 'L2D_flex']
+        },
+        'R3': {
+            'angles': ['R3A_flex', 'R3A_rot', 'R3A_abduct', 'R3B_flex', 'R3B_rot', 'R3C_flex', 'R3C_rot', 'R3D_flex']
+        },
+        'L3': {
+            'angles': ['L3A_flex', 'L3A_rot', 'L3A_abduct', 'L3B_flex', 'L3B_rot', 'L3C_flex', 'L3C_rot', 'L3D_flex']
+        }
     }
     
-    # Save configuration
-    config_path = base_results_dir / 'config.json'
-    with open(config_path, 'w') as f:
-        json.dump({
-            'genotype': selected_genotype,
-            'legs': legs
-        }, f, indent=4)
+    # Get the data path using any leg name (all should point to the same file)
+    data_path = get_available_data_path(next(iter(legs.keys())))
+    print(f"\nUsing data path: {data_path}")
     
-    # Process each leg
-    for leg_prefix, leg_config in legs.items():
-        print(f"\n{'='*80}")
-        print(f"Processing {leg_prefix} leg")
-        print(f"{'='*80}")
-        
-        # Create experiment configuration
-        config = {
-            'data_path': base_data_path,
-            'batch_size': 64,
-            'learning_rate': 1e-3,
-            'num_epochs': 400,
-            'patience': 20,
-            'sequence_length': 50,
-            'kernel_size': 3,
-            'dropout': 0.2,
-            'num_channels': [64, 128, 256],
-            'input_features': [
-                'x_vel_ma5', 'y_vel_ma5', 'z_vel_ma5',
-                'x_vel_ma10', 'y_vel_ma10', 'z_vel_ma10',
-                'x_vel_ma20', 'y_vel_ma20', 'z_vel_ma20',
-                'x_vel', 'y_vel', 'z_vel',
-             #   leg_config['position']
-            ],
-            'output_features': leg_config['angles'],
-            'genotype': selected_genotype,
-            'leg_prefix': leg_prefix
+    # Load data once to create trial splits - using first leg as reference
+    print("\nLoading data once to generate consistent trial splits for all legs...")
+    first_leg = next(iter(legs.keys()))
+    print(f"Using {first_leg} as reference leg for trial split generation")
+    
+    # Load and prepare data once just to get the trial splits
+    # Note: These are temporary loaders and scalers that we'll discard
+    result = prepare_data_no_windows(
+        data_path=data_path,
+        input_features=['x_vel', 'y_vel', 'z_vel'],  # Minimal features just to get the splits
+        output_features=legs[first_leg]['angles'],
+        pred_len=base_config['pred_len'],
+        output_dir=results_dir,
+        leg_name="trial_splits_reference"
+    )
+    
+    # Get the trial splits and mapping - they are at indices 13 and 14 (0-indexed)
+    shared_trial_splits = result[13]
+    shared_filtered_to_original = result[14]
+    
+    # Save master trial splits to base directory
+    master_splits_file = results_dir / "master_trial_splits.json"
+    with open(master_splits_file, 'w') as f:
+        # Convert numpy arrays to lists for JSON serialization
+        serializable_splits = {
+            split: sorted(indices) 
+            for split, indices in shared_trial_splits.items()
         }
-        
-        # Run experiment
-        metrics = run_experiment(config)
-        all_results[leg_prefix] = metrics
+        json.dump(serializable_splits, f, indent=2)
     
-    # Create summary metrics and plots
-    create_genotype_summary(base_results_dir, all_results)
-    print("\nExperiment completed successfully!")
+    # Save master filtered to original mapping
+    master_mapping_file = results_dir / "master_filtered_to_original.json"
+    with open(master_mapping_file, 'w') as f:
+        # Convert keys to strings for JSON serialization
+        serializable_mapping = {
+            str(filtered_idx): original_idx 
+            for filtered_idx, original_idx in shared_filtered_to_original.items()
+        }
+        json.dump(serializable_mapping, f, indent=2)
+    
+    print(f"\nMaster trial splits saved to: {master_splits_file}")
+    print(f"Master filtered-to-original mapping saved to: {master_mapping_file}")
+    print("\nConsistent trial splits across legs:")
+    for split_name, indices in shared_trial_splits.items():
+        print(f"  {split_name.capitalize()}: {len(indices)} trials - {sorted(indices)[:10]}...")
+    
+    # Train model for each leg using the same trial splits
+    for leg_name, leg_info in legs.items():
+        try:
+            print(f"\n{'='*80}")
+            print(f"Training model for {leg_name} leg")
+            print(f"{'='*80}")
+            
+            # Create leg-specific directories
+            leg_dir = Path(f"tcn_results/{leg_name}")
+            leg_models_dir = leg_dir / "models"
+            leg_plots_dir = leg_dir / "plots"
+            
+            os.makedirs(leg_dir, exist_ok=True)
+            os.makedirs(leg_models_dir, exist_ok=True)
+            os.makedirs(leg_plots_dir, exist_ok=True)
+            
+            print(f"\nCreated directory structure for {leg_name}:")
+            print(f"- {leg_dir}")
+            print(f"- {leg_models_dir}")
+            print(f"- {leg_plots_dir}")
+            
+            # Get data path - same for all legs
+            data_path = get_available_data_path(leg_name)
+            
+            # Use leg-specific output features
+            output_features = leg_info['angles']
+            
+            # Define input features
+            input_features = [
+                'x_vel_ma5',    # Moving average velocities
+                'y_vel_ma5',
+                'z_vel_ma5',
+                'x_vel_ma10',
+                'y_vel_ma10',
+                'z_vel_ma10',
+                'x_vel_ma20',
+                'y_vel_ma20',
+                'z_vel_ma20',
+                'x_vel',        # Raw velocities
+                'y_vel',
+                'z_vel',
+                'x_acc_ma5',    # Acceleration
+                'y_acc_ma5',
+                'z_acc_ma5',
+                'x_acc_ma10',
+                'y_acc_ma10',
+                'z_acc_ma10',
+                'x_acc_ma20',
+                'y_acc_ma20',
+                'z_acc_ma20',
+                'x_acc',        # Raw acceleration
+                'y_acc',
+                'z_acc',
+                'vel_mag_ma5',  # Velocity magnitude
+                'vel_mag_ma10',
+                'vel_mag_ma20',
+                'vel_mag',      # Raw velocity magnitude
+                'acc_mag_ma5',  # Acceleration magnitude
+                'acc_mag_ma10',
+                'acc_mag_ma20',
+                'acc_mag',      # Raw acceleration magnitude
+                'x_vel_lag1',   # Lagged features
+                'y_vel_lag1',
+                'z_vel_lag1',
+                'x_vel_lag2',
+                'y_vel_lag2',
+                'z_vel_lag2',
+                'x_vel_lag3',
+                'y_vel_lag3',
+                'z_vel_lag3',
+                'x_vel_lag4',
+                'y_vel_lag4',
+                'z_vel_lag4',
+                'x_vel_lag5',
+                'y_vel_lag5',
+                'z_vel_lag5',
+                'x_vel_psd',    # Power Spectral Density features
+                'y_vel_psd',
+                'z_vel_psd'
+            ]
+            
+            print(f"\nFeatures for {leg_name}:")
+            print(f"Input features ({len(input_features)}):")
+            for feat in input_features:
+                print(f"  - {feat}")
+            print(f"\nOutput features ({len(output_features)}):")
+            for feat in output_features:
+                print(f"  - {feat}")
+            
+            print(f"\nUsing consistent trial splits across all legs:")
+            print(f"  Train: {len(shared_trial_splits['train'])} trials")
+            print(f"  Validation: {len(shared_trial_splits['val'])} trials")
+            print(f"  Test: {len(shared_trial_splits['test'])} trials")
+            
+            # Prepare data for this leg using no_window_data - reusing the shared trial splits
+            result = prepare_data_no_windows(
+                data_path=data_path,
+                input_features=input_features,
+                output_features=output_features,
+                pred_len=base_config['pred_len'],
+                output_dir=leg_dir,  # Pass the leg directory
+                leg_name=leg_name,   # Pass the leg name
+                fixed_trial_splits=shared_trial_splits,  # Pass the shared trial splits
+                fixed_filtered_to_original=shared_filtered_to_original  # Pass the shared mapping
+            )
+            
+            # Unpack the result
+            df, all_filtered_trials = result[0], result[1]
+            X_train, y_train = result[2], result[3]
+            X_val, y_val = result[4], result[5]
+            X_test, y_test = result[6], result[7]
+            train_loader, val_loader, test_loader = result[8], result[9], result[10]
+            X_scaler, y_scaler = result[11], result[12]
+            trial_splits, filtered_to_original = result[13], result[14]
+            
+            # Verify we're using the same trial splits
+            for split in ['train', 'val', 'test']:
+                if set(trial_splits[split]) != set(shared_trial_splits[split]):
+                    print(f"WARNING: {leg_name} {split} split doesn't match the master splits!")
+                    print(f"  Master: {sorted(shared_trial_splits[split])}")
+                    print(f"  {leg_name}: {sorted(trial_splits[split])}")
+            
+            # Save trial splits to text file
+            splits_file, mapping_file, trials_info_file = save_trial_splits_info(trial_splits, filtered_to_original, all_filtered_trials, leg_dir, leg_name)
+            
+            print(f"\nTrial splits saved to: {splits_file}")
+            print(f"Index mapping saved to: {mapping_file}")
+            print(f"Detailed trial info saved to: {trials_info_file}")
+            
+            # Check for NaN values in the dataset
+            print("\nChecking for NaN values in processed data...")
+            
+            # Sample a few batches from each loader to check for NaNs
+            for loader_name, loader in [("train", train_loader), ("validation", val_loader), ("test", test_loader)]:
+                nan_in_inputs = 0
+                nan_in_targets = 0
+                
+                for i, batch_data in enumerate(loader):
+                    if i >= 5:  # Check first 5 batches
+                        break
+                    
+                    # Unpack the batch data - now includes trial indices
+                    inputs, targets, _ = batch_data  # Ignore trial indices for NaN check
+                        
+                    if torch.isnan(inputs).any():
+                        nan_in_inputs += 1
+                    
+                    if torch.isnan(targets).any():
+                        nan_in_targets += 1
+                
+                if nan_in_inputs > 0 or nan_in_targets > 0:
+                    print(f"Warning: Found NaN values in {loader_name} loader:")
+                    print(f"  Batches with NaN inputs: {nan_in_inputs}/5")
+                    print(f"  Batches with NaN targets: {nan_in_targets}/5")
+            
+            # Set up device
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            print(f"\nUsing device: {device}")
+            
+            # Initialize Optuna study
+            study_name = f"{leg_name}_tcn_optimization"
+            storage_name = f"sqlite:///{leg_dir}/optuna.db"
+            
+            print(f"\nStarting hyperparameter optimization for {leg_name} with Optuna")
+            print(f"Study name: {study_name}")
+            print(f"Number of trials: {base_config['n_trials']}")
+            
+            # Create a new study or continue from a previous one
+            study = optuna.create_study(
+                study_name=study_name,
+                storage=storage_name,
+                load_if_exists=True,
+                direction="minimize",
+                pruner=optuna.pruners.MedianPruner()
+            )
+            
+            # Define the objective function for hyperparameter optimization
+            def optuna_objective(trial):
+                # Suggest hyperparameters specifically for TCN with whole-trial processing
+                config = {
+                    'hidden_size': trial.suggest_int('hidden_size', 32, 256, step=32),
+                    'num_levels': trial.suggest_int('num_levels', 4, 8),  # Minimum 4 levels for adequate receptive field
+                    'kernel_size': trial.suggest_categorical('kernel_size', [5, 7, 9, 11]),  # Larger kernel sizes for 100-frame context
+                    'dropout': trial.suggest_float('dropout', 0.1, 0.5, step=0.1),
+                    'learning_rate': trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True),
+                }
+                
+                # Create num_channels list - decreasing by a factor of 2 each level
+                num_channels = [config['hidden_size']]
+                for i in range(1, config['num_levels']):
+                    num_channels.append(num_channels[-1] // 2)
+                    if num_channels[-1] < 16:  # Ensure we don't go too small
+                        num_channels[-1] = 16
+                
+                # Calculate effective receptive field size
+                receptive_field = 1 + (config['kernel_size'] - 1) * sum(2**i for i in range(config['num_levels']))
+                print(f"\nTCN configuration: kernel_size={config['kernel_size']}, num_levels={config['num_levels']}")
+                print(f"Effective receptive field: {receptive_field} frames (needed for 100-frame context)")
+                
+                # Create model with suggested hyperparameters
+                model = TemporalConvNet(
+                    input_size=len(input_features),
+                    output_size=len(output_features),
+                    num_channels=num_channels,
+                    kernel_size=config['kernel_size'],
+                    dropout=config['dropout'],
+                    sequence_length=X_train.shape[1]  # Use actual sequence length from data
+                )
+                
+                # Use standard MAE loss
+                criterion = nn.L1Loss()
+                print(f"\nTrial {trial.number}: Using standard MAE loss")
+                optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
+                
+                # Train the model
+                best_model_state, best_val_loss = train_model(
+                    model,
+                    train_loader,
+                    val_loader,
+                    criterion,
+                    optimizer,
+                    num_epochs=100,  # Limited epochs for hyperparameter search
+                    device=device,
+                    patience=5      # Reduced patience for faster trials
+                )
+                
+                # Return the best validation loss
+                return best_val_loss
+            
+            # Run the optimization
+            study.optimize(
+                optuna_objective,
+                n_trials=base_config['n_trials']
+            )
+            
+            # Get the best trial
+            best_trial = study.best_trial
+            best_params = best_trial.params
+            
+            print(f"\nBest hyperparameters for {leg_name}:")
+            for param, value in best_params.items():
+                print(f"  {param}: {value}")
+            print(f"Best validation loss: {best_trial.value:.4f}")
+            
+            # Save hyperparameter optimization results
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            optuna_results_file = leg_dir / f"optuna_results_{timestamp}.json"
+            
+            # Prepare results for JSON serialization
+            optuna_results = {
+                "best_params": best_params,
+                "best_value": best_trial.value,
+                "study_name": study_name,
+                "timestamp": timestamp,
+                "trials": [
+                    {
+                        "number": t.number,
+                        "params": t.params,
+                        "value": t.value if t.value is not None else float('nan'),
+                        "state": t.state.name
+                    }
+                    for t in study.trials
+                ]
+            }
+            
+            with open(optuna_results_file, 'w') as f:
+                json.dump(optuna_results, f, indent=2, default=str)
+            
+            print(f"\nOptuna results saved to: {optuna_results_file}")
+            
+            # Generate optimization visualization plots
+            try:
+                # Create optimization history plot
+                fig = optuna.visualization.plot_optimization_history(study)
+                fig.write_image(str(leg_plots_dir / f"optuna_history_{timestamp}.png"))
+                
+                # Create parameter importance plot
+                param_imp_fig = optuna.visualization.plot_param_importances(study)
+                param_imp_fig.write_image(str(leg_plots_dir / f"optuna_param_importance_{timestamp}.png"))
+                
+                # Create parallel coordinate plot
+                parallel_fig = optuna.visualization.plot_parallel_coordinate(study)
+                parallel_fig.write_image(str(leg_plots_dir / f"optuna_parallel_coordinate_{timestamp}.png"))
+                
+                print(f"\nOptuna visualization plots saved to: {leg_plots_dir}")
+            except Exception as e:
+                print(f"Warning: Could not generate Optuna visualization plots: {str(e)}")
+            
+            # Train the best model with full epochs
+            print(f"\nTraining the best model for {leg_name} with full epochs...")
+            
+            # Create num_channels list based on best parameters
+            num_channels = [best_params['hidden_size']]
+            for i in range(1, best_params['num_levels']):
+                num_channels.append(num_channels[-1] // 2)
+                if num_channels[-1] < 16:  # Ensure we don't go too small
+                    num_channels[-1] = 16
+            
+            # Create model with best hyperparameters
+            best_model = TemporalConvNet(
+                input_size=len(input_features),
+                output_size=len(output_features),
+                num_channels=num_channels,
+                kernel_size=best_params['kernel_size'],
+                dropout=best_params['dropout'],
+                sequence_length=X_train.shape[1]  # Use actual sequence length from data
+            )
+            
+            # Use standard MAE loss
+            best_criterion = nn.L1Loss()
+            print(f"\nUsing standard MAE loss for final training")
+            
+            best_optimizer = optim.Adam(best_model.parameters(), lr=best_params['learning_rate'])
+            
+            # Train the best model with full epochs
+            best_model_state, best_val_loss = train_model(
+                best_model,
+                train_loader,
+                val_loader,
+                best_criterion,
+                best_optimizer,
+                base_config['num_epochs'],
+                device,
+                base_config['patience']
+            )
+            
+            print(f"\nFull training completed for {leg_name}. Best validation loss: {best_val_loss:.4f}")
+            
+            # Load best model
+            best_model.load_state_dict(best_model_state)
+            
+            # Evaluate model and save predictions
+            metrics = evaluate_model(
+                best_model,
+                test_loader,
+                best_criterion,
+                device,
+                output_features,
+                y_scaler,
+                leg_plots_dir,
+                trial_splits,
+                filtered_to_original
+            )
+            
+            # Save best model and results
+            model_save_path = leg_models_dir / f'{leg_name}_tcn_{timestamp}.pth'
+            
+            torch.save({
+                'model_state_dict': best_model_state,
+                'best_params': best_params,
+                'input_features': input_features,
+                'output_features': output_features,
+                'X_scaler': X_scaler,
+                'y_scaler': y_scaler,
+                'metrics': metrics,
+                'best_val_loss': best_val_loss,
+                'loss_type': 'MAE',
+                'model_type': 'TCN',
+                'trial_splits': trial_splits,
+                'filtered_to_original': filtered_to_original,
+                'optuna_study_name': study_name,
+                'optuna_best_trial': best_trial.number
+            }, model_save_path)
+            
+            print(f"\nBest TCN model and results saved to: {model_save_path}")
+            
+            # Log successful completion
+            with open(error_log, 'a') as f:
+                f.write(f"Successfully completed training for {leg_name} at {datetime.now()}\n")
+                f.write(f"Best validation loss: {best_val_loss:.4f}\n")
+                f.write(f"Best hyperparameters: {best_params}\n")
+                f.write("-" * 80 + "\n\n")
+                
+        except Exception as e:
+            # Log the error
+            with open(error_log, 'a') as f:
+                f.write(f"Error occurred while processing {leg_name} at {datetime.now()}\n")
+                f.write(f"Error type: {type(e).__name__}\n")
+                f.write(f"Error message: {str(e)}\n")
+                f.write("Traceback:\n")
+                f.write(traceback.format_exc())
+                f.write("-" * 80 + "\n\n")
+            
+            print(f"\nError occurred while processing {leg_name}. See {error_log} for details.")
+            print(f"Error: {str(e)}")
+            traceback.print_exc()  # Print full traceback for debugging
+            continue  # Continue with next leg
+    
+    print("\nTraining completed for all legs!")
+    print(f"Check {error_log} for any errors that occurred during training.")
 
 if __name__ == "__main__":
     main() 
